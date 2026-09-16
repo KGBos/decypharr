@@ -668,6 +668,10 @@ func (d *Downloader) processStrm(torrent *storage.Entry) error {
 	files := torrent.GetActiveFiles()
 	d.logger.Info().Msgf("Creating .strm for %d files ...", len(files))
 
+	if len(files) == 0 {
+		return fmt.Errorf("no active files found for torrent %s", torrent.Name)
+	}
+
 	torrentSymlinkPath := torrent.DownloadPath()
 
 	// Create symlink directory

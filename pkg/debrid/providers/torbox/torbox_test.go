@@ -12,7 +12,81 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/request"
+	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 )
+
+func TestGetTorboxStatusKeepsIncompleteDownloadsRetryable(t *testing.T) {
+	tb := &Torbox{}
+	if got := tb.getTorboxStatus("incomplete", false); got != debridTypes.TorrentStatusDownloading {
+		t.Fatalf("getTorboxStatus(incomplete) = %q, want downloading", got)
+	}
+}
+
+func TestUpdateTorrentTreatsPresentStalledDownloadAsCompleted(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"success":true,"data":{"id":17,"name":"Reacher.S02.mkv","size":100,"progress":1,"download_state":"stalled (no seeds)","download_finished":false,"download_present":true,"created_at":"2026-01-02T03:04:05Z","hash":"5004BCC4598206C7C7293353936708BC8288C034","files":[{"id":1,"name":"Reacher.S02.mkv","absolute_path":"Reacher.S02.mkv","size":100}]}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	torrent := &debridTypes.Torrent{Id: "17"}
+	if err := testTorbox(server.URL).UpdateTorrent(torrent); err != nil {
+		t.Fatalf("UpdateTorrent() error = %v", err)
+	}
+	if torrent.Status != debridTypes.TorrentStatusDownloaded {
+		t.Fatalf("Status = %q, want downloaded", torrent.Status)
+	}
+	file := torrent.Files["Reacher.S02.mkv"]
+	if file.Link != "torbox://17/1" {
+		t.Fatalf("file link = %q, want torbox://17/1", file.Link)
+	}
+}
+
+func TestUpdateTorrentDoesNotCompletePartialPresentDownload(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"success":true,"data":{"id":18,"name":"Partial.Release.mkv","size":100,"progress":0.5,"download_state":"downloading","download_finished":false,"download_present":true,"created_at":"2026-01-02T03:04:05Z","hash":"DDEEFF","files":[{"id":1,"name":"Partial.Release.mkv","absolute_path":"Partial.Release.mkv","size":100}]}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	torrent := &debridTypes.Torrent{Id: "18"}
+	if err := testTorbox(server.URL).UpdateTorrent(torrent); err != nil {
+		t.Fatalf("UpdateTorrent() error = %v", err)
+	}
+	if torrent.Status != debridTypes.TorrentStatusDownloading {
+		t.Fatalf("Status = %q, want downloading", torrent.Status)
+	}
+	if link := torrent.Files["Partial.Release.mkv"].Link; link != "" {
+		t.Fatalf("file link = %q, want empty until progress reaches 100%%", link)
+	}
+}
+
+func TestCheckStatusPreservesTorboxFailureContext(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"success":true,"data":{"id":23,"name":"Broken.Release.mkv","size":100,"progress":1,"download_state":"failed (processing)","download_finished":false,"download_present":false,"tracker_message":"storage unavailable","created_at":"2026-01-02T03:04:05Z","hash":"AABBCC","files":[]}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	torrent, err := testTorbox(server.URL).CheckStatus(&debridTypes.Torrent{Id: "23"})
+	if err == nil {
+		t.Fatal("CheckStatus() error = nil, want provider failure")
+	}
+	for _, want := range []string{"failed (processing)", "storage unavailable", "id 23", "hash AABBCC"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("CheckStatus() error = %q, want %q", err, want)
+		}
+	}
+	if torrent == nil || torrent.InfoHash != "AABBCC" {
+		t.Fatalf("CheckStatus() torrent = %#v, want returned provider hash", torrent)
+	}
+}
 
 func TestGetTorrentsBypassesTorboxCache(t *testing.T) {
 	config.SetConfigPath(t.TempDir())
