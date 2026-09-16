@@ -233,6 +233,20 @@ func (tb *Torbox) IsAvailable(hashes []string) map[string]bool {
 	return result
 }
 
+func (tb *Torbox) isCachedHash(hash string) (cached bool, ok bool) {
+	var res AvailableResponse
+	resp, err := tb.doGet("/api/torrents/checkcached", map[string]string{"hash": hash}, &res)
+	if err != nil || resp == nil || resp.StatusCode < 200 || resp.StatusCode >= 300 || res.Data == nil {
+		return false, false
+	}
+	for h, c := range *res.Data {
+		if strings.EqualFold(h, hash) && c.Size > 0 {
+			return true, true
+		}
+	}
+	return false, true
+}
+
 func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 	var data AddMagnetResponse
 
@@ -240,6 +254,23 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 		"magnet": torrent.Magnet.Link,
 	}
 	if !torrent.DownloadUncached {
+		hash := torrent.InfoHash
+		if hash == "" && torrent.Magnet != nil {
+			hash = torrent.Magnet.InfoHash
+		}
+		// Never spend TorBox's 60/hour uncached createtorrent budget on content
+		// we would not accept: check the cache first and skip the create call
+		// entirely when the hash is not cached. If the cache check itself
+		// cannot be completed, fall through to the guarded create call.
+		if hash != "" {
+			if cached, ok := tb.isCachedHash(hash); ok && !cached {
+				name := torrent.Name
+				if name == "" {
+					name = hash
+				}
+				return nil, fmt.Errorf("torrent %s is not cached; skipped without submitting (download_uncached=false)", name)
+			}
+		}
 		formData["add_only_if_cached"] = "true"
 	}
 
