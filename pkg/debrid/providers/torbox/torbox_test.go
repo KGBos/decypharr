@@ -333,3 +333,67 @@ func TestSubmitMagnetAcceptsObjectAndArrayResponses(t *testing.T) {
 		})
 	}
 }
+
+func TestSubmitMagnetSkipsUncachedWithoutSubmitting(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	var createCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "checkcached"):
+			_, _ = fmt.Fprint(w, `{"success":true,"data":{}}`)
+		case strings.Contains(r.URL.Path, "createtorrent"):
+			createCalls++
+			_, _ = fmt.Fprint(w, `{"success":true,"data":{"torrent_id":1,"hash":"AABBCC"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	torrent := &types.Torrent{
+		Name:     "Uncached.Release",
+		InfoHash: "AABBCC",
+		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+	}
+	_, err := testTorbox(server.URL).SubmitMagnet(torrent)
+	if err == nil || !strings.Contains(err.Error(), "not cached") {
+		t.Fatalf("SubmitMagnet() error = %v, want not-cached skip", err)
+	}
+	if createCalls != 0 {
+		t.Fatalf("createtorrent called %d times, want 0", createCalls)
+	}
+}
+
+func TestSubmitMagnetProceedsWhenCached(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	var createCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "checkcached"):
+			_, _ = fmt.Fprint(w, `{"success":true,"data":{"AABBCC":{"name":"Cached.Release","size":100,"hash":"AABBCC"}}}`)
+		case strings.Contains(r.URL.Path, "createtorrent"):
+			createCalls++
+			_, _ = fmt.Fprint(w, `{"success":true,"data":{"torrent_id":42,"hash":"AABBCC"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	torrent := &types.Torrent{
+		Name:     "Cached.Release",
+		InfoHash: "AABBCC",
+		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+	}
+	got, err := testTorbox(server.URL).SubmitMagnet(torrent)
+	if err != nil {
+		t.Fatalf("SubmitMagnet() error = %v", err)
+	}
+	if got.Id != "42" || createCalls != 1 {
+		t.Fatalf("id = %q, createCalls = %d; want 42 and 1", got.Id, createCalls)
+	}
+}
