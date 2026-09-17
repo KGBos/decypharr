@@ -181,7 +181,21 @@ func (tb *Torbox) doPostFormWithClient(client *request.Client, endpoint string, 
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	return client.DoJSON(req, result)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer request.DrainAndClose(resp.Body)
+
+	if result != nil && resp.ContentLength != 0 {
+		if err := request.DecodeJSON(resp, result); err != nil {
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return resp, err
+			}
+		}
+	}
+
+	return resp, nil
 }
 
 // doPostJSON performs a POST request with a JSON body.
@@ -294,7 +308,7 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("torbox API error: Status: %d", resp.StatusCode)
+		return nil, torboxAPIError(resp.StatusCode, data.Error, data.Detail)
 	}
 	// An array response can list several torrents; take the one for this hash.
 	var id int
@@ -312,6 +326,30 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 	torrent.Added = time.Now()
 
 	return torrent, nil
+}
+
+func torboxAPIError(status int, apiError any, detail string) error {
+	parts := make([]string, 0, 2)
+	if value := sanitizeTorboxMessage(fmt.Sprint(apiError)); value != "" && value != "<nil>" {
+		parts = append(parts, "error="+strconv.Quote(value))
+	}
+	if value := sanitizeTorboxMessage(detail); value != "" {
+		parts = append(parts, "detail="+strconv.Quote(value))
+	}
+	if len(parts) == 0 {
+		return fmt.Errorf("torbox API error: Status: %d", status)
+	}
+	return fmt.Errorf("torbox API error: Status: %d (%s)", status, strings.Join(parts, ", "))
+}
+
+func sanitizeTorboxMessage(value string) string {
+	value = strings.TrimSpace(value)
+	value = regexp.MustCompile(`(?i)magnet:\?[^\s\"']+`).ReplaceAllString(value, "[redacted magnet]")
+	const maxMessageLength = 512
+	if len(value) > maxMessageLength {
+		value = value[:maxMessageLength] + "..."
+	}
+	return value
 }
 
 func (tb *Torbox) getTorboxStatus(status string, available bool) types.TorrentStatus {
