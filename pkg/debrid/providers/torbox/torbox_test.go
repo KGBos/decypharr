@@ -16,6 +16,33 @@ import (
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 )
 
+func TestSubmitMagnetIncludesSanitizedProviderError(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprint(w, `{"success":false,"error":"BAD_REQUEST","detail":"magnet:?xt=urn:btih:SECRET is invalid","data":null}`)
+	}))
+	t.Cleanup(server.Close)
+
+	torrent := &debridTypes.Torrent{
+		InfoHash: "AABBCC",
+		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+	}
+	_, err := testTorbox(server.URL).SubmitMagnet(torrent)
+	if err == nil {
+		t.Fatal("SubmitMagnet() error = nil, want provider error")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "BAD_REQUEST") || !strings.Contains(message, "[redacted magnet]") {
+		t.Fatalf("SubmitMagnet() error = %q, want sanitized provider fields", message)
+	}
+	if strings.Contains(message, "SECRET") || strings.Contains(message, "magnet:?") {
+		t.Fatalf("SubmitMagnet() error leaked submitted magnet data: %q", message)
+	}
+}
+
 func TestGetTorboxStatusKeepsIncompleteDownloadsRetryable(t *testing.T) {
 	tb := &Torbox{}
 	if got := tb.getTorboxStatus("incomplete", false); got != debridTypes.TorrentStatusDownloading {

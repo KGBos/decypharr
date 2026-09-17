@@ -161,7 +161,7 @@ func (tb *Torbox) doPostForm(endpoint string, formData map[string]string, result
 	}
 	defer request.DrainAndClose(resp.Body)
 
-	if result != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && resp.ContentLength != 0 {
+	if result != nil && resp.ContentLength != 0 {
 		if err := json.ConfigDefault.NewDecoder(resp.Body).Decode(result); err != nil {
 			return resp, err
 		}
@@ -280,7 +280,7 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("torbox API error: Status: %d", resp.StatusCode)
+		return nil, torboxAPIError(resp.StatusCode, data.Error, data.Detail)
 	}
 	if data.Data == nil {
 		return nil, fmt.Errorf("error adding torrent")
@@ -299,6 +299,30 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 	torrent.Added = time.Now()
 
 	return torrent, nil
+}
+
+func torboxAPIError(status int, apiError any, detail string) error {
+	parts := make([]string, 0, 2)
+	if value := sanitizeTorboxMessage(fmt.Sprint(apiError)); value != "" && value != "<nil>" {
+		parts = append(parts, "error="+strconv.Quote(value))
+	}
+	if value := sanitizeTorboxMessage(detail); value != "" {
+		parts = append(parts, "detail="+strconv.Quote(value))
+	}
+	if len(parts) == 0 {
+		return fmt.Errorf("torbox API error: Status: %d", status)
+	}
+	return fmt.Errorf("torbox API error: Status: %d (%s)", status, strings.Join(parts, ", "))
+}
+
+func sanitizeTorboxMessage(value string) string {
+	value = strings.TrimSpace(value)
+	value = regexp.MustCompile(`(?i)magnet:\?[^\s\"']+`).ReplaceAllString(value, "[redacted magnet]")
+	const maxMessageLength = 512
+	if len(value) > maxMessageLength {
+		value = value[:maxMessageLength] + "..."
+	}
+	return value
 }
 
 func parseAddMagnetData(raw stdjson.RawMessage, expectedHash string) (int, error) {
