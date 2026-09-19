@@ -187,10 +187,13 @@ func (tb *Torbox) doPostFormWithClient(client *request.Client, endpoint string, 
 	}
 	defer request.DrainAndClose(resp.Body)
 
-	if result != nil && resp.ContentLength != 0 {
-		if err := request.DecodeJSON(resp, result); err != nil {
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				return resp, err
+	if result != nil {
+		bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if readErr == nil && len(bodyBytes) > 0 {
+			if err := json.ConfigDefault.Unmarshal(bodyBytes, result); err != nil {
+				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					return resp, err
+				}
 			}
 		}
 	}
@@ -308,7 +311,7 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, torboxAPIError(resp.StatusCode, data.Error, data.Detail)
+		return nil, torboxAPIError(resp, data.Error, data.Detail)
 	}
 	// An array response can list several torrents; take the one for this hash.
 	var id int
@@ -328,8 +331,14 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 	return torrent, nil
 }
 
-func torboxAPIError(status int, apiError any, detail string) error {
-	parts := make([]string, 0, 2)
+func torboxAPIError(resp *http.Response, apiError any, detail string) error {
+	status := 0
+	var header http.Header
+	if resp != nil {
+		status = resp.StatusCode
+		header = resp.Header
+	}
+	parts := make([]string, 0, 4)
 	if value := sanitizeTorboxMessage(fmt.Sprint(apiError)); value != "" && value != "<nil>" {
 		parts = append(parts, "error="+strconv.Quote(value))
 	}
@@ -337,7 +346,15 @@ func torboxAPIError(status int, apiError any, detail string) error {
 		parts = append(parts, "detail="+strconv.Quote(value))
 	}
 	if len(parts) == 0 {
-		return fmt.Errorf("torbox API error: Status: %d", status)
+		parts = append(parts, "no body returned")
+	}
+	if header != nil {
+		if attempts := header.Get("X-Decypharr-Attempts"); attempts != "" {
+			parts = append(parts, "attempts="+attempts)
+		}
+		if ra := header.Get("Retry-After"); ra != "" {
+			parts = append(parts, "retry-after="+strconv.Quote(ra))
+		}
 	}
 	return fmt.Errorf("torbox API error: Status: %d (%s)", status, strings.Join(parts, ", "))
 }
