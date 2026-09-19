@@ -35,11 +35,21 @@ type Client struct {
 	headers         map[string]string
 	headersMu       sync.RWMutex
 	maxRetries      int
+	retryWaitMin    time.Duration
+	retryWaitMax    time.Duration
 	timeout         time.Duration
 	skipTLSVerify   bool
 	retryableStatus map[int]struct{}
 	logger          zerolog.Logger
 	proxy           string
+}
+
+// WithRetryWait sets the retry wait range
+func WithRetryWait(min, max time.Duration) ClientOption {
+	return func(c *Client) {
+		c.retryWaitMin = min
+		c.retryWaitMax = max
+	}
 }
 
 // WithMaxRetries sets the maximum number of retry attempts
@@ -263,10 +273,32 @@ func New(options ...ClientOption) *Client {
 	retryClient := retryablehttp.NewClient()
 	retryClient.HTTPClient = client.httpClient
 	retryClient.RetryMax = client.maxRetries
-	retryClient.RetryWaitMin = 1 * time.Second
-	retryClient.RetryWaitMax = 30 * time.Second
+	if client.retryWaitMin > 0 {
+		retryClient.RetryWaitMin = client.retryWaitMin
+	} else {
+		retryClient.RetryWaitMin = 1 * time.Second
+	}
+	if client.retryWaitMax > 0 {
+		retryClient.RetryWaitMax = client.retryWaitMax
+	} else {
+		retryClient.RetryWaitMax = 30 * time.Second
+	}
 	retryClient.Logger = nil
 	retryClient.Backoff = retryAfterBackoff
+
+	// Preserve the final HTTP response on exhausted retries instead of discarding it.
+	retryClient.ErrorHandler = func(resp *http.Response, err error, numTries int) (*http.Response, error) {
+		if resp != nil {
+			if resp.Header != nil && numTries > 0 {
+				resp.Header.Set("X-Decypharr-Attempts", strconv.Itoa(numTries))
+			}
+			return resp, err
+		}
+		if err == nil {
+			return nil, fmt.Errorf("giving up after %d attempt(s)", numTries)
+		}
+		return nil, fmt.Errorf("giving up after %d attempt(s): %w", numTries, err)
+	}
 
 	// Custom retry policy based on retryable status codes
 	retryClient.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {

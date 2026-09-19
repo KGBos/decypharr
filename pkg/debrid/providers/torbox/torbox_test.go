@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
@@ -40,6 +41,113 @@ func TestSubmitMagnetIncludesSanitizedProviderError(t *testing.T) {
 	}
 	if strings.Contains(message, "SECRET") || strings.Contains(message, "magnet:?") {
 		t.Fatalf("SubmitMagnet() error leaked submitted magnet data: %q", message)
+	}
+}
+
+func TestSubmitMagnetPreservesStatusAndBodyOnExhaustedRetries(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprint(w, `{"success":false,"error":"RATE_LIMITED","detail":"Rate limit exceeded","data":null}`)
+	}))
+	t.Cleanup(server.Close)
+
+	tb := &Torbox{
+		Host: server.URL,
+		client: request.New(
+			request.WithMaxRetries(2),
+			request.WithRetryWait(time.Millisecond, 2*time.Millisecond),
+			request.WithRetryableStatus(http.StatusTooManyRequests),
+		),
+		logger: zerolog.Nop(),
+		config: config.Debrid{Name: "torbox"},
+	}
+
+	torrent := &debridTypes.Torrent{
+		InfoHash:         "AABBCC",
+		Magnet:           &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+		DownloadUncached: true,
+	}
+	_, err := tb.SubmitMagnet(torrent)
+	if err == nil {
+		t.Fatal("SubmitMagnet() error = nil, want rate limit error after retries")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "Status: 429") {
+		t.Fatalf("SubmitMagnet() error = %q, want Status: 429", message)
+	}
+	if !strings.Contains(message, "RATE_LIMITED") || !strings.Contains(message, "Rate limit exceeded") {
+		t.Fatalf("SubmitMagnet() error = %q, want provider error details", message)
+	}
+	if !strings.Contains(message, "attempts=3") {
+		t.Fatalf("SubmitMagnet() error = %q, want attempts=3", message)
+	}
+	if !strings.Contains(message, "retry-after=\"5\"") {
+		t.Fatalf("SubmitMagnet() error = %q, want retry-after=\"5\"", message)
+	}
+	if strings.Contains(message, "giving up after") {
+		t.Fatalf("SubmitMagnet() error = %q, should not contain retryablehttp generic giving up message", message)
+	}
+	if attempts != 3 {
+		t.Fatalf("server received %d attempts, want 3", attempts)
+	}
+}
+
+func TestSubmitMagnetHandlesChunkedErrorResponse(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		if flusher, ok := w.(http.Flusher); ok {
+			_, _ = fmt.Fprint(w, `{"success":false,"error":"BAD_REQUEST","detail":"chunked error body"}`)
+			flusher.Flush()
+		} else {
+			_, _ = fmt.Fprint(w, `{"success":false,"error":"BAD_REQUEST","detail":"chunked error body"}`)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	tb := testTorbox(server.URL)
+	torrent := &debridTypes.Torrent{
+		InfoHash: "AABBCC",
+		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+	}
+	_, err := tb.SubmitMagnet(torrent)
+	if err == nil {
+		t.Fatal("SubmitMagnet() error = nil, want error")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "BAD_REQUEST") || !strings.Contains(message, "chunked error body") {
+		t.Fatalf("SubmitMagnet() error = %q, want chunked provider details", message)
+	}
+}
+
+func TestSubmitMagnetHandlesEmptyBodyErrorResponse(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(server.Close)
+
+	tb := testTorbox(server.URL)
+	torrent := &debridTypes.Torrent{
+		InfoHash: "AABBCC",
+		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+	}
+	_, err := tb.SubmitMagnet(torrent)
+	if err == nil {
+		t.Fatal("SubmitMagnet() error = nil, want error")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "Status: 502") || !strings.Contains(message, "no body returned") {
+		t.Fatalf("SubmitMagnet() error = %q, want Status: 502 with no body returned", message)
 	}
 }
 
