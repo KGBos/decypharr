@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -35,6 +36,7 @@ type Client struct {
 	headers         map[string]string
 	headersMu       sync.RWMutex
 	maxRetries      int
+	throttle        *Throttle
 	retryWaitMin    time.Duration
 	retryWaitMax    time.Duration
 	timeout         time.Duration
@@ -128,7 +130,7 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	c.headersMu.RUnlock()
 
 	// Apply rate limiting
-	if c.rateLimiter != nil {
+	if c.rateLimiter != nil && c.throttle == nil {
 		select {
 		case <-req.Context().Done():
 			return nil, req.Context().Err()
@@ -188,30 +190,50 @@ func (z zerologAdapter) Printf(format string, args ...interface{}) {
 	z.log.Debug().Msgf(format, args...)
 }
 
-// retryAfterBackoff extends DefaultBackoff with Retry-After header support.
-// When a 429 response carries a Retry-After header decypharr waits exactly as
-// long as the server requests instead of using jittered exponential backoff.
+// retryAfterBackoff uses the WithRetryWait ceiling, including Retry-After.
+// TorBox raises that ceiling to minutes; other clients retain their defaults.
 func retryAfterBackoff(min, max time.Duration, attemptNum int, resp *http.Response) time.Duration {
-	if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
-		if ra := resp.Header.Get("Retry-After"); ra != "" {
-			if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
-				wait := time.Duration(secs) * time.Second
-				if wait > max {
-					return max
-				}
-				return wait
-			}
-			if t, err := http.ParseTime(ra); err == nil {
-				if wait := time.Until(t); wait > 0 {
-					if wait > max {
-						return max
-					}
-					return wait
-				}
-			}
+	if resp == nil || resp.StatusCode != http.StatusTooManyRequests {
+		return retryablehttp.DefaultBackoff(min, max, attemptNum, resp)
+	}
+	ra := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if secs, err := strconv.ParseUint(ra, 10, 64); err == nil && secs > 0 {
+		if secs > uint64(max/time.Second) {
+			return max
+		}
+		return minDuration(max, time.Duration(secs)*time.Second)
+	}
+	if at, err := http.ParseTime(ra); err == nil {
+		if wait := time.Until(at); wait > 0 {
+			return minDuration(max, wait)
 		}
 	}
-	return retryablehttp.DefaultBackoff(min, max, attemptNum, resp)
+	// Equal jitter retains exponential growth and never exceeds the ceiling.
+	ceiling := min
+	for i := 0; i < attemptNum && ceiling < max; i++ {
+		if ceiling > max/2 {
+			ceiling = max
+			break
+		}
+		ceiling *= 2
+	}
+	if ceiling > max {
+		ceiling = max
+	}
+	if ceiling <= 0 {
+		return 0
+	}
+	half := ceiling / 2
+	return half + time.Duration(rand.Int64N(int64(ceiling-half)+1))
+}
+func minDuration(ceiling, wait time.Duration) time.Duration {
+	if wait < 0 {
+		return 0
+	}
+	if wait > ceiling {
+		return ceiling
+	}
+	return wait
 }
 
 // New creates a new HTTP client with the specified options
@@ -269,6 +291,10 @@ func New(options ...ClientOption) *Client {
 		client.httpClient.Transport = transport
 	}
 
+	if client.throttle != nil {
+		client.httpClient.Transport = &throttleTransport{next: client.httpClient.Transport, throttle: client.throttle, limiter: client.rateLimiter}
+	}
+
 	// Create retryablehttp client
 	retryClient := retryablehttp.NewClient()
 	retryClient.HTTPClient = client.httpClient
@@ -285,6 +311,14 @@ func New(options ...ClientOption) *Client {
 	}
 	retryClient.Logger = nil
 	retryClient.Backoff = retryAfterBackoff
+	if client.throttle != nil {
+		retryClient.Backoff = func(min, max time.Duration, attempt int, resp *http.Response) time.Duration {
+			if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+				return client.throttle.Remaining()
+			}
+			return retryAfterBackoff(min, max, attempt, resp)
+		}
+	}
 
 	// Preserve the final HTTP response on exhausted retries instead of discarding it.
 	retryClient.ErrorHandler = func(resp *http.Response, err error, numTries int) (*http.Response, error) {
@@ -305,6 +339,13 @@ func New(options ...ClientOption) *Client {
 		// Don't retry on context errors
 		if ctx.Err() != nil {
 			return false, ctx.Err()
+		}
+
+		if e := BackpressureError(err); e != nil {
+			return false, e
+		}
+		if client.throttle != nil && client.throttle.isOpen() {
+			return false, err
 		}
 
 		// First use the default retry policy for error handling

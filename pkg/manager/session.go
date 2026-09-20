@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/request"
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/manager/link"
 	"github.com/sirrobot01/decypharr/pkg/storage"
@@ -349,9 +350,10 @@ func (s *session) idleFired() {
 
 // httpTransport serves debrid links over HTTP with link refresh on failure.
 type httpTransport struct {
-	client  *http.Client
-	getLink func(ctx context.Context) (types.DownloadLink, error)
-	refresh func(ctx context.Context, bad types.DownloadLink) (types.DownloadLink, error)
+	client   *http.Client
+	throttle *request.Throttle
+	getLink  func(ctx context.Context) (types.DownloadLink, error)
+	refresh  func(ctx context.Context, bad types.DownloadLink) (types.DownloadLink, error)
 
 	// base/limit map file-relative session offsets onto the link target when
 	// the file is a byte-ranged slice of a larger download: the served bytes
@@ -388,8 +390,16 @@ func (t *httpTransport) open(ctx context.Context, pos int64) (io.ReadCloser, err
 	}
 	req.Header.Set("Accept-Encoding", "identity")
 
-	resp, err := t.client.Do(req)
+	var resp *http.Response
+	if t.throttle != nil {
+		resp, err = t.throttle.Do(t.client, req)
+	} else {
+		resp, err = t.client.Do(req)
+	}
 	if err != nil {
+		if e := request.BackpressureError(err); e != nil {
+			return nil, e
+		}
 		return nil, link.ClassifyTransportError(err)
 	}
 	switch {
@@ -420,6 +430,9 @@ func (t *httpTransport) open(ctx context.Context, pos int64) (io.ReadCloser, err
 }
 
 func (t *httpTransport) recover(ctx context.Context, err error, attempt int) error {
+	if e := request.BackpressureError(err); e != nil {
+		return e
+	}
 	lerr := link.GetLinkError(err)
 	if lerr == nil {
 		lerr = link.ClassifyTransportError(err)
@@ -578,6 +591,11 @@ func (m *Manager) openSession(ctx context.Context, entry *storage.Entry, filenam
 			refresh: func(ctx context.Context, bad types.DownloadLink) (types.DownloadLink, error) {
 				return m.linkService.Refresh(ctx, entry, bad)
 			},
+		}
+		if provider, ok := m.clients.Load(entry.ActiveProvider); ok {
+			if p, ok := provider.(request.ThrottleProvider); ok {
+				ht.throttle = p.RequestThrottle()
+			}
 		}
 		if br := file.ByteRange; br != nil {
 			ht.base = br[0]
