@@ -10,6 +10,7 @@ import (
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/customerror"
+	"github.com/sirrobot01/decypharr/internal/request"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
@@ -141,6 +142,10 @@ func (s *Service) fetchAndValidate(ctx context.Context, entry *storage.Entry, fi
 
 	// Validate the link
 	validationErr := s.validateLink(ctx, &link)
+	// Backpressure is transient provider state, never a cached link failure.
+	if e := request.BackpressureError(validationErr); e != nil {
+		return emptyDownloadLink, e
+	}
 
 	if validationErr != nil {
 		// Handle link error categories
@@ -385,8 +390,20 @@ func (s *Service) validateLink(ctx context.Context, link *types.DownloadLink) er
 		)
 	}
 
-	resp, err := s.httpClient.Do(req)
+	var resp *http.Response
+	if provider, ok := s.clients.Load(link.Debrid); ok {
+		if p, ok := provider.(request.ThrottleProvider); ok && p.RequestThrottle() != nil {
+			resp, err = p.RequestThrottle().Do(s.httpClient, req)
+		} else {
+			resp, err = s.httpClient.Do(req)
+		}
+	} else {
+		resp, err = s.httpClient.Do(req)
+	}
 	if err != nil {
+		if e := request.BackpressureError(err); e != nil {
+			return e
+		}
 		return NewRetryableError(
 			fmt.Errorf("HEAD request failed: %w", err),
 			"network_error",

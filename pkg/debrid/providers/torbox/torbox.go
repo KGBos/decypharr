@@ -44,6 +44,7 @@ type Torbox struct {
 	autoExpiresLinksAfter time.Duration
 	client                *request.Client
 	submitClient          *request.Client
+	throttle              *request.Throttle
 	logger                zerolog.Logger
 	Profile               *types.Profile
 	config                config.Debrid
@@ -54,6 +55,10 @@ type Torbox struct {
 
 func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, error) {
 	cfg := config.Get()
+	backoffMax, cooldown, threshold, err := throttleConfig(dc)
+	if err != nil {
+		return nil, err
+	}
 	headers := map[string]string{
 		"Authorization": fmt.Sprintf("Bearer %s", dc.APIKey),
 	}
@@ -63,13 +68,14 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 		headers["User-Agent"] = fmt.Sprintf("Decypharr/%s (%s; %s)", version.GetInfo(), runtime.GOOS, runtime.GOARCH)
 	}
 	_log := logger.New(dc.Name)
+	throttle := request.NewThrottle(threshold, cooldown, backoffMax, _log)
 
 	// TorBox enforces a hard cap of 300 req/min per API key, applied
 	// synchronously across all servers since v8.4 (Feb 2026, GAP-002).
 	// Default to that limit if the user has not configured one explicitly.
 	mainRL := ratelimits["main"]
 	if mainRL == nil {
-		mainRL = ratelimit.New(300, ratelimit.Per(time.Minute), ratelimit.WithSlack(30))
+		mainRL = ratelimit.New(300, ratelimit.Per(time.Minute), ratelimit.WithoutSlack)
 	}
 	// The cap counts per key, not per workload, so list traffic and submit
 	// traffic authenticated with the same key have to share one bucket. Giving
@@ -90,6 +96,8 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 			request.WithRateLimiter(rateLimiter),
 			request.WithMaxRetries(cfg.Retries),
 			request.WithRetryableStatus(http.StatusTooManyRequests, http.StatusBadGateway),
+			request.WithRetryWait(time.Second, backoffMax),
+			request.WithThrottle(throttle),
 			request.WithLogger(_log),
 		}
 		if dc.Proxy != "" {
@@ -106,11 +114,12 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 	tb := &Torbox{
 		Host:                  "https://api.torbox.app/v1",
 		APIKey:                dc.APIKey,
-		accountsManager:       account.NewManager(dc, submitRL, _log),
+		accountsManager:       account.NewManager(dc, submitRL, _log, request.WithThrottle(throttle), request.WithRetryWait(time.Second, backoffMax)),
 		config:                dc,
 		autoExpiresLinksAfter: autoExpiresLinksAfter,
 		client:                newClient(mainRL),
 		submitClient:          newClient(submitRL),
+		throttle:              throttle,
 		logger:                _log,
 	}
 	return tb, nil
@@ -125,6 +134,37 @@ func onlyUsesKey(downloadKeys []string, apiKey string) bool {
 		}
 	}
 	return true
+}
+
+// RequestThrottle exposes the same provider gate to manager GET/HEAD reads.
+func (tb *Torbox) RequestThrottle() *request.Throttle { return tb.throttle }
+
+// Durations are capped at 15 minutes to bound even malformed server advice.
+func throttleConfig(dc config.Debrid) (time.Duration, time.Duration, int, error) {
+	backoffMax, cooldown, threshold := 5*time.Minute, time.Minute, 3
+	for _, item := range []struct {
+		name, value string
+		dest        *time.Duration
+	}{
+		{"torbox_backoff_max", dc.TorboxBackoffMax, &backoffMax},
+		{"torbox_breaker_cooldown", dc.TorboxBreakerCooldown, &cooldown},
+	} {
+		if item.value == "" {
+			continue
+		}
+		d, err := time.ParseDuration(item.value)
+		if err != nil || d <= 0 || d > 15*time.Minute {
+			return 0, 0, 0, fmt.Errorf("%s must be a positive duration no greater than 15m", item.name)
+		}
+		*item.dest = d
+	}
+	if dc.TorboxBreakerThreshold != 0 {
+		threshold = dc.TorboxBreakerThreshold
+	}
+	if threshold < 1 || threshold > 100 {
+		return 0, 0, 0, fmt.Errorf("torbox_breaker_threshold must be between 1 and 100")
+	}
+	return backoffMax, cooldown, threshold, nil
 }
 
 func (tb *Torbox) Config() config.Debrid {

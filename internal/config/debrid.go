@@ -7,6 +7,9 @@ import (
 )
 
 type Debrid struct {
+	TorboxBackoffMax             string   `json:"torbox_backoff_max,omitempty"`
+	TorboxBreakerThreshold       int      `json:"torbox_breaker_threshold,omitempty"`
+	TorboxBreakerCooldown        string   `json:"torbox_breaker_cooldown,omitempty"`
 	Provider                     string   `json:"provider,omitempty"` // realdebrid, alldebrid, debridlink, torbox, premiumize
 	Name                         string   `json:"name,omitempty"`
 	APIKey                       string   `json:"api_key,omitempty"`

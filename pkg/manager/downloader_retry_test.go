@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/rs/zerolog"
+	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 )
 
 func TestLocalDownloaderRetriesServiceUnavailable(t *testing.T) {
@@ -40,7 +41,7 @@ func TestLocalDownloaderRetriesServiceUnavailable(t *testing.T) {
 		},
 		logger: zerolog.Nop(),
 	}
-	if err := d.localDownloader(server.URL, destination, nil, func(delta, _ int64) {
+	if err := d.localDownloader(types.DownloadLink{DownloadLink: server.URL}, destination, nil, func(delta, _ int64) {
 		downloaded.Add(delta)
 	}); err != nil {
 		t.Fatalf("localDownloader() error = %v", err)
@@ -114,7 +115,7 @@ func TestLocalDownloaderResumesAfterUnexpectedEOF(t *testing.T) {
 		},
 		logger: zerolog.Nop(),
 	}
-	if err := d.localDownloader("https://cdn.example/release.mkv", destination, nil, func(delta, _ int64) {
+	if err := d.localDownloader(types.DownloadLink{DownloadLink: "https://cdn.example/release.mkv"}, destination, nil, func(delta, _ int64) {
 		downloaded.Add(delta)
 	}); err != nil {
 		t.Fatalf("localDownloader() error = %v", err)

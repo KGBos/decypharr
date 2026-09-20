@@ -18,6 +18,7 @@ import (
 	grab "github.com/cavaliergopher/grab/v3"
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/request"
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/manager/link"
 	"github.com/sirrobot01/decypharr/pkg/notifications"
@@ -505,7 +506,7 @@ func (d *Downloader) processTorrentDownload(entry *storage.Entry) error {
 	// Resolve download links before spawning goroutines
 	type downloadTask struct {
 		file *storage.File
-		link string
+		link types.DownloadLink
 	}
 	var tasks []downloadTask
 	for _, file := range files {
@@ -517,7 +518,7 @@ func (d *Downloader) processTorrentDownload(entry *storage.Entry) error {
 			// completed.
 			return fmt.Errorf("resolve download link for %s: %w", file.Name, err)
 		}
-		tasks = append(tasks, downloadTask{file: file, link: downloadLink.DownloadLink})
+		tasks = append(tasks, downloadTask{file: file, link: downloadLink})
 	}
 
 	// If no valid download links were obtained, return error instead of panic
@@ -568,6 +569,9 @@ func (d *Downloader) resolveLinkWithRetry(ctx context.Context, entry *storage.En
 			return dl, nil
 		}
 		lastErr = err
+		if e := request.BackpressureError(err); e != nil {
+			return types.DownloadLink{}, e
+		}
 		// Permanent errors won't improve with retries — surface immediately.
 		if linkErr := link.GetLinkError(err); linkErr != nil && !linkErr.IsRetryable() {
 			return types.DownloadLink{}, err
@@ -707,17 +711,28 @@ func (d *Downloader) detectMultiSeason(torrent *storage.Entry) (bool, []SeasonIn
 	return true, seasons
 }
 
+// grab accepts an HTTPClient interface; preserve its resume behavior while
+// gating every HEAD/GET (and redirect) through the same provider circuit.
+type throttledDownloadClient struct {
+	client *http.Client
+	gate   *request.Throttle
+}
+
+func (c throttledDownloadClient) Do(req *http.Request) (*http.Response, error) {
+	return c.gate.Do(c.client, req)
+}
+
 // localDownloader downloads a file with grab and retries transient failures.
 // Each attempt observes the same destination, allowing grab to resume from the
 // partial file instead of restarting a large transfer after a CDN interruption.
-func (d *Downloader) localDownloader(downloadURL, filename string, byterange *[2]int64, progressCallback func(int64, int64)) error {
+func (d *Downloader) localDownloader(download types.DownloadLink, filename string, byterange *[2]int64, progressCallback func(int64, int64)) error {
 	ctx := d.operationContext()
 	delay := config.DefaultRetryDelay
 	reported := int64(0)
 	var lastErr error
 
 	for attempt := 1; attempt <= localDownloadMaxAttempts; attempt++ {
-		err := d.localDownloadAttempt(downloadURL, filename, byterange, func(completed, speed int64) {
+		err := d.localDownloadAttempt(download, filename, byterange, func(completed, speed int64) {
 			if progressCallback != nil && completed != reported {
 				progressCallback(completed-reported, speed)
 			}
@@ -727,6 +742,9 @@ func (d *Downloader) localDownloader(downloadURL, filename string, byterange *[2
 			return nil
 		}
 		lastErr = err
+		if request.BackpressureError(err) != nil {
+			break
+		}
 		if attempt == localDownloadMaxAttempts || !isRetryableDownloadError(err) {
 			break
 		}
@@ -749,8 +767,9 @@ func (d *Downloader) localDownloader(downloadURL, filename string, byterange *[2
 	return fmt.Errorf("local download failed after retries: %w", lastErr)
 }
 
-func (d *Downloader) localDownloadAttempt(downloadURL, filename string, byterange *[2]int64, progressCallback func(int64, int64)) error {
+func (d *Downloader) localDownloadAttempt(download types.DownloadLink, filename string, byterange *[2]int64, progressCallback func(int64, int64)) error {
 	startTime := time.Now()
+	downloadURL := download.DownloadLink
 	requestedRange := "full"
 	req, err := grab.NewRequest(filename, downloadURL)
 	if err != nil {
@@ -771,6 +790,11 @@ func (d *Downloader) localDownloadAttempt(downloadURL, filename string, byterang
 	client := grab.NewClient()
 	client.BufferSize = 1 << 20
 	client.HTTPClient = d.manager.streamClient
+	if provider, ok := d.manager.clients.Load(download.Debrid); ok {
+		if p, ok := provider.(request.ThrottleProvider); ok && p.RequestThrottle() != nil {
+			client.HTTPClient = throttledDownloadClient{client: d.manager.streamClient, gate: p.RequestThrottle()}
+		}
+	}
 
 	resp := client.Do(req)
 	if resp == nil {
@@ -804,6 +828,12 @@ func (d *Downloader) localDownloadAttempt(downloadURL, filename string, byterang
 				}
 			}
 			if err := resp.Err(); err != nil {
+				if e := request.BackpressureError(err); e != nil {
+					return e
+				}
+				if grab.IsStatusCodeError(err) && resp.HTTPResponse != nil {
+					return fmt.Errorf("unexpected status %d for %s", resp.HTTPResponse.StatusCode, downloadURL)
+				}
 				return err
 			}
 			return nil
