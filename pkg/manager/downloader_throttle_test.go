@@ -55,8 +55,11 @@ func TestLocalDownloadSharesProviderGate(t *testing.T) {
 	}
 	before := calls.Load()
 	err = d.localDownloader(dl, destination, nil, nil)
-	if request.BackpressureError(err) == nil || calls.Load() != before {
-		t.Fatalf("local download bypassed open gate: %v", err)
+	// A short cooldown is now waited out on the read path, so this re-enters
+	// the provider (proving it shares the gate rather than bypassing it) and
+	// reports the fresh 429 while the server is still failing.
+	if request.BackpressureError(err) == nil || calls.Load() == before {
+		t.Fatalf("short cooldown did not wait then re-enter the gate: %v calls=%d", err, calls.Load())
 	}
 	time.Sleep(30 * time.Millisecond)
 	fail.Store(false)
