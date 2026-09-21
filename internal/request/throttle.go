@@ -401,8 +401,9 @@ func (t *throttleTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	resp, err := t.next.RoundTrip(req)
 	t.throttle.Observe(resp, t.read)
 	if limiter != nil {
-		// Mirror the breaker's honored cooldown (Retry-After bounded by the
-		// configured max) so the budget and the breaker freeze together.
+		// The bucket bounds the raw server Retry-After itself (its own
+		// requestdl_freeze_max); the breaker's remaining cooldown is passed as
+		// a floor so an escalated breaker wait also holds the bucket.
 		limiter.Observe(resp, class, t.throttle.Remaining())
 	}
 	if t.read && resp != nil && resp.StatusCode == http.StatusTooManyRequests {

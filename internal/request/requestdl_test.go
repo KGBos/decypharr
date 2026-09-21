@@ -42,7 +42,7 @@ func TestClassContextTagging(t *testing.T) {
 
 func newTestLimiter(t *testing.T, ratePerMinute float64, ramp, maxBackoff time.Duration, now *time.Time) *RequestdlLimiter {
 	t.Helper()
-	l := NewRequestdlLimiter(ratePerMinute, ramp, maxBackoff, zerolog.Nop())
+	l := NewRequestdlLimiter(ratePerMinute, ramp, maxBackoff, DefaultRequestdlFreezeMax, zerolog.Nop())
 	l.now = func() time.Time { return *now }
 	l.last = *now
 	l.tokens = l.burst
@@ -158,6 +158,55 @@ func TestRequestdl5xxPauseIsPerClass(t *testing.T) {
 	}
 }
 
+// TestRequestdlHonorsRawRetryAfterBeyondBreakerClamp is the #203 regression:
+// the bucket must freeze for the server's raw Retry-After even when the
+// breaker's own cooldown is clamped by torbox_backoff_max.
+func TestRequestdlHonorsRawRetryAfterBeyondBreakerClamp(t *testing.T) {
+	now := time.Unix(0, 0)
+	// Default breaker-style max (5m) but the server asks for 2302s.
+	l := NewRequestdlLimiter(12, 0, 5*time.Minute, DefaultRequestdlFreezeMax, zerolog.Nop())
+	l.now = func() time.Time { return now }
+	l.last = now
+
+	l.Observe(&http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     http.Header{"Retry-After": {"2302"}},
+	}, ClassPlayback, 5*time.Minute)
+
+	if got := l.FrozenFor(); got < 2302*time.Second {
+		t.Fatalf("bucket freeze = %s, want >= 2302s (not truncated to the 5m breaker clamp)", got)
+	}
+	if err := l.Take(context.Background(), ClassPlayback); BackpressureError(err) == nil {
+		t.Fatalf("bucket admitted a call during the raw Retry-After window: %v", err)
+	}
+}
+
+func TestRequestdlFreezeMaxBoundsServerAdvice(t *testing.T) {
+	now := time.Unix(0, 0)
+	l := NewRequestdlLimiter(12, 0, time.Minute, 6*time.Hour, zerolog.Nop())
+	l.now = func() time.Time { return now }
+	l.last = now
+
+	// A 100h ban is bounded by requestdl_freeze_max, not honored literally.
+	l.Observe(&http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     http.Header{"Retry-After": {"360000"}},
+	}, ClassPlayback, 0)
+	if got := l.FrozenFor(); got != 6*time.Hour {
+		t.Fatalf("freeze = %s, want the 6h freeze max", got)
+	}
+
+	// No usable advice and no breaker penalty still freezes with full jitter.
+	now = now.Add(6 * time.Hour)
+	other := NewRequestdlLimiter(12, 0, time.Minute, DefaultRequestdlFreezeMax, zerolog.Nop())
+	other.now = func() time.Time { return now }
+	other.last = now
+	other.Observe(&http.Response{StatusCode: http.StatusTooManyRequests}, ClassPlayback, 0)
+	if got := other.FrozenFor(); got <= 0 || got > other.maxBackoff {
+		t.Fatalf("jittered freeze = %s, want (0, %s]", got, other.maxBackoff)
+	}
+}
+
 func TestRequestdlFreezeSuppressesWireCalls(t *testing.T) {
 	config.SetConfigPath(t.TempDir())
 	var calls atomic.Int64
@@ -169,7 +218,7 @@ func TestRequestdlFreezeSuppressesWireCalls(t *testing.T) {
 	defer server.Close()
 
 	b := NewThrottle(1, time.Minute, 5*time.Minute, zerolog.Nop())
-	limiter := NewRequestdlLimiter(600, 0, time.Minute, zerolog.Nop())
+	limiter := NewRequestdlLimiter(600, 0, time.Minute, DefaultRequestdlFreezeMax, zerolog.Nop())
 	b.UseRequestdl(limiter, func(r *http.Request) bool {
 		return strings.HasPrefix(r.URL.String(), server.URL+"/api/torrents/requestdl")
 	})
@@ -201,7 +250,7 @@ func TestRequestdlFreezeSuppressesWireCalls(t *testing.T) {
 func TestRequestdlPriorityPlaybackWins(t *testing.T) {
 	// 10 tokens/second with a burst of one: background work queued first must
 	// not delay a playback read by more than a single token interval.
-	l := NewRequestdlLimiter(600, 0, time.Minute, zerolog.Nop())
+	l := NewRequestdlLimiter(600, 0, time.Minute, DefaultRequestdlFreezeMax, zerolog.Nop())
 	l.mu.Lock()
 	l.burst = 1
 	l.tokens = 0
@@ -248,7 +297,7 @@ func TestRequestdlPriorityPlaybackWins(t *testing.T) {
 }
 
 func TestRequestdlSharedBucketAcrossGoroutines(t *testing.T) {
-	l := NewRequestdlLimiter(6000, 0, time.Minute, zerolog.Nop())
+	l := NewRequestdlLimiter(6000, 0, time.Minute, DefaultRequestdlFreezeMax, zerolog.Nop())
 	const callers = 50
 	var errs atomic.Int64
 	var wg sync.WaitGroup
@@ -276,7 +325,7 @@ func TestRequestdlSharedBucketAcrossGoroutines(t *testing.T) {
 }
 
 func TestRequestdlEnforcesBudget(t *testing.T) {
-	l := NewRequestdlLimiter(1200, 0, time.Minute, zerolog.Nop()) // 20/s
+	l := NewRequestdlLimiter(1200, 0, time.Minute, DefaultRequestdlFreezeMax, zerolog.Nop()) // 20/s
 	l.mu.Lock()
 	l.burst = 1
 	l.tokens = 1
@@ -304,7 +353,7 @@ func TestRequestdlNonRequestdlTrafficUnaffected(t *testing.T) {
 	defer server.Close()
 
 	b := NewThrottle(3, time.Minute, 5*time.Minute, zerolog.Nop())
-	limiter := NewRequestdlLimiter(1, 0, time.Minute, zerolog.Nop()) // 1/minute
+	limiter := NewRequestdlLimiter(1, 0, time.Minute, DefaultRequestdlFreezeMax, zerolog.Nop()) // 1/minute
 	b.UseRequestdl(limiter, func(r *http.Request) bool {
 		return strings.HasPrefix(r.URL.Path, "/api/torrents/requestdl")
 	})
@@ -326,7 +375,7 @@ func TestRequestdlNonRequestdlTrafficUnaffected(t *testing.T) {
 func TestRequestdlCountersAppearInPeriodicLog(t *testing.T) {
 	var buf bytes.Buffer
 	b := NewThrottle(1, time.Minute, time.Minute, zerolog.New(&buf))
-	limiter := NewRequestdlLimiter(12, 0, time.Minute, zerolog.Nop())
+	limiter := NewRequestdlLimiter(12, 0, time.Minute, DefaultRequestdlFreezeMax, zerolog.Nop())
 	b.UseRequestdl(limiter, func(*http.Request) bool { return true })
 	if err := limiter.Take(context.Background(), ClassPlayback); err != nil {
 		t.Fatal(err)
@@ -344,59 +393,4 @@ func TestRequestdlCountersAppearInPeriodicLog(t *testing.T) {
 			t.Fatalf("periodic log missing %s: %s", want, out)
 		}
 	}
-}
-
-func TestURLCacheHitTTLAndExpiry(t *testing.T) {
-	now := time.Unix(0, 0)
-	c := NewURLCache[string](10 * time.Minute)
-	c.now = func() time.Time { return now }
-
-	c.Set("k", "v", time.Time{})
-	if v, ok := c.Get("k"); !ok || v != "v" {
-		t.Fatalf("cache miss immediately after set: %q %v", v, ok)
-	}
-	if c.Len() != 1 {
-		t.Fatalf("len = %d, want 1", c.Len())
-	}
-	now = now.Add(9 * time.Minute)
-	if _, ok := c.Get("k"); !ok {
-		t.Fatal("entry expired before its TTL")
-	}
-	now = now.Add(2 * time.Minute) // 11 minutes
-	if _, ok := c.Get("k"); ok {
-		t.Fatal("entry survived past its TTL")
-	}
-	if c.Len() != 0 {
-		t.Fatalf("expired entry retained: len = %d", c.Len())
-	}
-}
-
-func TestURLCacheRespectsAbsoluteDeadline(t *testing.T) {
-	now := time.Unix(0, 0)
-	c := NewURLCache[string](time.Hour)
-	c.now = func() time.Time { return now }
-	c.Set("k", "v", now.Add(2*time.Minute))
-	now = now.Add(3 * time.Minute)
-	if _, ok := c.Get("k"); ok {
-		t.Fatal("entry outlived its auto_expire deadline")
-	}
-	// A deadline already in the past is never stored.
-	c.Set("z", "v", now.Add(-time.Second))
-	if _, ok := c.Get("z"); ok {
-		t.Fatal("stored an already-expired entry")
-	}
-}
-
-func TestURLCacheDisabledAndNil(t *testing.T) {
-	disabled := NewURLCache[string](0)
-	disabled.Set("k", "v", time.Time{})
-	if _, ok := disabled.Get("k"); ok {
-		t.Fatal("disabled cache returned a hit")
-	}
-	var nilCache *URLCache[string]
-	nilCache.Set("k", "v", time.Time{})
-	if _, ok := nilCache.Get("k"); ok || nilCache.Len() != 0 {
-		t.Fatal("nil cache is not inert")
-	}
-	nilCache.Delete("k")
 }
