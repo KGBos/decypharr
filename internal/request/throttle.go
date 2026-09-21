@@ -71,6 +71,12 @@ type Throttle struct {
 	now                                 func() time.Time
 	sleep                               func(context.Context, time.Duration) error
 	logger                              zerolog.Logger
+
+	// requestdl is the shared /requestdl budget; requestdlMatch selects the
+	// requests it applies to. Both are set once at provider startup via
+	// UseRequestdl and nil for providers that do not use it.
+	requestdl      *RequestdlLimiter
+	requestdlMatch func(*http.Request) bool
 }
 
 func NewThrottle(threshold int, cooldown, backoffMax time.Duration, log zerolog.Logger) *Throttle {
@@ -92,6 +98,45 @@ func (b *Throttle) WithReadWait(d time.Duration) *Throttle {
 		b.readWait = d
 	}
 	return b
+}
+
+// UseRequestdl attaches the shared /requestdl budget and the predicate that
+// selects the requests it governs. It is set once at provider construction
+// before any request is served.
+func (b *Throttle) UseRequestdl(limiter *RequestdlLimiter, match func(*http.Request) bool) {
+	b.mu.Lock()
+	b.requestdl = limiter
+	b.requestdlMatch = match
+	b.mu.Unlock()
+}
+
+// requestdlFor returns the shared budget when req is a governed /requestdl
+// call, otherwise nil.
+func (b *Throttle) requestdlFor(req *http.Request) *RequestdlLimiter {
+	if b == nil {
+		return nil
+	}
+	b.mu.Lock()
+	limiter, match := b.requestdl, b.requestdlMatch
+	b.mu.Unlock()
+	if limiter == nil || match == nil || !match(req) {
+		return nil
+	}
+	return limiter
+}
+
+// RequestdlStats exposes the shared budget snapshot for the local API.
+func (b *Throttle) RequestdlStats() RequestdlStats {
+	if b == nil {
+		return RequestdlStats{}
+	}
+	b.mu.Lock()
+	limiter := b.requestdl
+	b.mu.Unlock()
+	if limiter == nil {
+		return RequestdlStats{}
+	}
+	return limiter.Snapshot()
 }
 func (b *Throttle) Before() error {
 	b.mu.Lock()
@@ -247,13 +292,15 @@ func (b *Throttle) runCounterLog(ctx context.Context, ticks <-chan time.Time) {
 func (b *Throttle) LogCounters() {
 	b.mu.Lock()
 	requests, throttled, reads, read429 := b.requests, b.throttled, b.reads, b.read429
+	limiter := b.requestdl
 	b.mu.Unlock()
-	b.logger.Info().
+	event := b.logger.Info().
 		Uint64("requests", requests).
 		Uint64("429s", throttled).
 		Uint64("read_requests", reads).
-		Uint64("read_429s", read429).
-		Msg("TorBox throttle counters")
+		Uint64("read_429s", read429)
+	limiter.requestdlLogFields(event)
+	event.Msg("TorBox throttle counters")
 }
 
 // retryAfterWait returns the server's unbounded Retry-After advice for logging.
@@ -331,6 +378,20 @@ func (t *throttleTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	if err := gate(); err != nil {
 		return nil, err
 	}
+	// The shared /requestdl budget is a separate, provider-wide layer on top
+	// of the circuit: it rate-limits and prioritizes only requestdl calls, and
+	// the final gate re-check means a penalty that starts while this call waits
+	// for a token still results in zero wire calls.
+	limiter := t.throttle.requestdlFor(req)
+	class := ClassOf(ctx)
+	if limiter != nil {
+		if err := limiter.Take(ctx, class); err != nil {
+			return nil, err
+		}
+		if err := gate(); err != nil {
+			return nil, err
+		}
+	}
 	t.throttle.mu.Lock()
 	t.throttle.requests++
 	if t.read {
@@ -339,6 +400,11 @@ func (t *throttleTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	t.throttle.mu.Unlock()
 	resp, err := t.next.RoundTrip(req)
 	t.throttle.Observe(resp, t.read)
+	if limiter != nil {
+		// Mirror the breaker's honored cooldown (Retry-After bounded by the
+		// configured max) so the budget and the breaker freeze together.
+		limiter.Observe(resp, class, t.throttle.Remaining())
+	}
 	if t.read && resp != nil && resp.StatusCode == http.StatusTooManyRequests {
 		// Never drain a rate-limit body: even that can stall the read.
 		resp.Body.Close()
