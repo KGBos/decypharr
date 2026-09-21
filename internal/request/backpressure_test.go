@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -376,6 +377,221 @@ func TestNetworkFailureWhileAnotherRequestOpensCircuit(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("network failure did not return")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func okResponse(r *http.Request) *http.Response {
+	return &http.Response{
+		StatusCode: 200,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader("ok")),
+		Request:    r,
+	}
+}
+
+// A read blocked by a short remaining cooldown waits it out and then succeeds,
+// instead of failing the FUSE read. The wait uses the injectable sleep so the
+// test never touches the wall clock.
+func TestReadWaitsOutShortCooldownThenSucceeds(t *testing.T) {
+	now := time.Now()
+	b := NewThrottle(1, time.Minute, 5*time.Minute, zerolog.Nop()).WithReadWait(90 * time.Second)
+	b.now = func() time.Time { return now }
+	var slept []time.Duration
+	b.sleep = func(ctx context.Context, d time.Duration) error {
+		slept = append(slept, d)
+		now = now.Add(d)
+		return nil
+	}
+	b.Observe(&http.Response{StatusCode: 429, Header: make(http.Header)}, false)
+	if got := b.Remaining(); got != time.Minute {
+		t.Fatalf("cooldown: %s", got)
+	}
+	var calls atomic.Int64
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return okResponse(r), nil
+	})}
+	req, _ := http.NewRequest("GET", "http://torbox.invalid/file", nil)
+	resp, err := b.Do(client, req)
+	if err != nil {
+		t.Fatalf("read did not survive the short cooldown: %v", err)
+	}
+	resp.Body.Close()
+	if calls.Load() != 1 {
+		t.Fatalf("upstream not called after wait: %d", calls.Load())
+	}
+	if len(slept) != 1 || slept[0] != time.Minute {
+		t.Fatalf("did not wait the remainder: %v", slept)
+	}
+	if b.isOpen() {
+		t.Fatal("breaker still open after the read waited")
+	}
+}
+
+// A long remaining cooldown keeps fail-fast: the read must not block and the
+// upstream must not be dialed.
+func TestReadFailsFastOnLongCooldown(t *testing.T) {
+	now := time.Now()
+	b := NewThrottle(1, time.Minute, 24*time.Hour, zerolog.Nop()).WithReadWait(90 * time.Second)
+	b.now = func() time.Time { return now }
+	slept := false
+	b.sleep = func(ctx context.Context, d time.Duration) error { slept = true; return nil }
+	b.Observe(&http.Response{StatusCode: 429, Header: http.Header{"Retry-After": {"600"}}}, false)
+	var calls atomic.Int64
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return okResponse(r), nil
+	})}
+	req, _ := http.NewRequest("GET", "http://torbox.invalid/file", nil)
+	_, err := b.Do(client, req)
+	backpressure := BackpressureError(err)
+	if backpressure == nil {
+		t.Fatalf("long cooldown did not fail fast: %v", err)
+	}
+	if backpressure.RetryAfter != 10*time.Minute {
+		t.Fatalf("retry-after: %s", backpressure.RetryAfter)
+	}
+	if slept || calls.Load() != 0 {
+		t.Fatalf("long cooldown slept=%v upstream_calls=%d", slept, calls.Load())
+	}
+}
+
+// The blocking wait must honor request cancellation.
+func TestReadWaitInterruptedByContext(t *testing.T) {
+	b := NewThrottle(1, time.Minute, 5*time.Minute, zerolog.Nop()).WithReadWait(90 * time.Second)
+	b.Observe(&http.Response{StatusCode: 429, Header: make(http.Header)}, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	b.sleep = func(sleepCtx context.Context, d time.Duration) error {
+		cancel()
+		return sleepCtx.Err()
+	}
+	if err := b.WaitRead(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel did not interrupt the wait: %v", err)
+	}
+}
+
+// API calls keep the pre-#166 fail-fast behavior even for a short cooldown;
+// only the read path waits.
+func TestAPITransportStillFailsFast(t *testing.T) {
+	b := NewThrottle(1, time.Minute, 5*time.Minute, zerolog.Nop()).WithReadWait(90 * time.Second)
+	b.Observe(&http.Response{StatusCode: 429, Header: make(http.Header)}, false)
+	var calls atomic.Int64
+	transport := &throttleTransport{
+		next:     roundTripFunc(func(r *http.Request) (*http.Response, error) { calls.Add(1); return okResponse(r), nil }),
+		throttle: b,
+	}
+	req, _ := http.NewRequest("GET", "http://torbox.invalid/api", nil)
+	_, err := transport.RoundTrip(req)
+	if BackpressureError(err) == nil {
+		t.Fatalf("API call did not fail fast: %v", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("upstream called while circuit open: %d", calls.Load())
+	}
+}
+
+// Concurrent reads and breaker transitions must not deadlock or race.
+func TestConcurrentReadersAndBreakerTransitions(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+	var upstream atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstream.Add(1)
+		w.WriteHeader(200)
+	}))
+	defer server.Close()
+	b := NewThrottle(2, time.Millisecond, time.Millisecond, zerolog.Nop()).WithReadWait(50 * time.Millisecond)
+	client := server.Client()
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 40; j++ {
+				req, _ := http.NewRequest("GET", server.URL, nil)
+				resp, err := b.Do(client, req)
+				if resp != nil {
+					resp.Body.Close()
+				}
+				if err != nil && BackpressureError(err) == nil {
+					t.Errorf("unexpected read error: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 40; j++ {
+				b.Observe(&http.Response{StatusCode: 429, Header: make(http.Header)}, true)
+				if j%2 == 0 {
+					_ = b.Before()
+				}
+			}
+		}()
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("concurrent readers and breaker transitions deadlocked")
+	}
+}
+
+type captureWriter struct{ lines chan string }
+
+func (w *captureWriter) Write(p []byte) (int, error) {
+	select {
+	case w.lines <- string(append([]byte(nil), p...)):
+	default:
+	}
+	return len(p), nil
+}
+
+// The periodic counter line is emitted from an injectable tick source, so the
+// test drives the interval directly and verifies the goroutine shuts down.
+func TestPeriodicCounterLog(t *testing.T) {
+	w := &captureWriter{lines: make(chan string, 8)}
+	b := NewThrottle(3, time.Minute, 5*time.Minute, zerolog.New(w))
+	b.mu.Lock()
+	b.requests, b.throttled, b.reads, b.read429 = 41, 7, 12, 3
+	b.mu.Unlock()
+	ticks := make(chan time.Time)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.runCounterLog(ctx, ticks)
+	}()
+	ticks <- time.Now()
+	select {
+	case line := <-w.lines:
+		for _, field := range []string{`"requests":41`, `"429s":7`, `"read_requests":12`, `"read_429s":3`, "TorBox throttle counters"} {
+			if !strings.Contains(line, field) {
+				t.Fatalf("counter log missing %s: %s", field, line)
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no periodic counter log emitted")
+	}
+	// The interval repeats, not just once.
+	ticks <- time.Now()
+	select {
+	case <-w.lines:
+	case <-time.After(2 * time.Second):
+		t.Fatal("periodic counter log did not repeat")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("counter logger goroutine leaked after cancel")
 	}
 }
 

@@ -2,21 +2,24 @@ package torbox
 
 import (
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/request"
 	"testing"
 	"time"
 )
 
 func TestThrottleConfiguration(t *testing.T) {
-	backoff, cooldown, threshold, err := throttleConfig(config.Debrid{})
-	if err != nil || backoff != 5*time.Minute || cooldown != time.Minute || threshold != 3 {
+	backoff, cooldown, readWait, threshold, err := throttleConfig(config.Debrid{})
+	if err != nil || backoff != 5*time.Minute || cooldown != time.Minute || threshold != 3 || readWait != request.DefaultReadWait {
 		t.Fatal("unsafe defaults")
 	}
 	for _, dc := range []config.Debrid{
 		{TorboxBackoffMax: "-1s"}, {TorboxBackoffMax: "invalid"},
 		{TorboxBreakerCooldown: "0s"}, {TorboxBreakerThreshold: -1}, {TorboxBreakerThreshold: 101},
 		{TorboxBackoffMax: "49h"}, {TorboxBreakerCooldown: "49h"},
+		{TorboxReadWaitMax: "0s"}, {TorboxReadWaitMax: "invalid"},
+		{TorboxReadWaitMax: "500ms"}, {TorboxReadWaitMax: "6m"},
 	} {
-		if _, _, _, err := throttleConfig(dc); err == nil {
+		if _, _, _, _, err := throttleConfig(dc); err == nil {
 			t.Fatalf("accepted invalid config: %+v", dc)
 		}
 	}
@@ -25,12 +28,25 @@ func TestThrottleConfiguration(t *testing.T) {
 	for _, dc := range []config.Debrid{
 		{TorboxBackoffMax: "24h"}, {TorboxBackoffMax: "48h"}, {TorboxBreakerCooldown: "24h"}, {TorboxBreakerCooldown: "48h"},
 	} {
-		if _, _, _, err := throttleConfig(dc); err != nil {
+		if _, _, _, _, err := throttleConfig(dc); err != nil {
 			t.Fatalf("rejected long bound %+v: %v", dc, err)
 		}
 	}
-	backoff, cooldown, _, err = throttleConfig(config.Debrid{TorboxBackoffMax: "24h", TorboxBreakerCooldown: "24h"})
+	// The read wait is deliberately bounded much lower than a ban: at most how
+	// long a read may block.
+	for _, dc := range []config.Debrid{
+		{TorboxReadWaitMax: "1s"}, {TorboxReadWaitMax: "90s"}, {TorboxReadWaitMax: "5m"},
+	} {
+		if _, _, _, _, err := throttleConfig(dc); err != nil {
+			t.Fatalf("rejected read wait %+v: %v", dc, err)
+		}
+	}
+	backoff, cooldown, _, _, err = throttleConfig(config.Debrid{TorboxBackoffMax: "24h", TorboxBreakerCooldown: "24h"})
 	if err != nil || backoff != 24*time.Hour || cooldown != 24*time.Hour {
 		t.Fatalf("long bounds round-trip: %v %s %s", err, backoff, cooldown)
+	}
+	_, _, readWait, _, err = throttleConfig(config.Debrid{TorboxReadWaitMax: "2m"})
+	if err != nil || readWait != 2*time.Minute {
+		t.Fatalf("read wait round-trip: %v %s", err, readWait)
 	}
 }

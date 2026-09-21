@@ -1,6 +1,7 @@
 package request
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -24,6 +25,19 @@ const (
 	// escalationQuietPeriod drops a stale escalation level once the provider
 	// has gone a full day without a 429.
 	escalationQuietPeriod = 24 * time.Hour
+
+	// DefaultReadWait is the longest remaining cooldown a read will wait out
+	// instead of failing fast. A read that would block longer keeps today's
+	// ThrottleError so a FUSE read cannot hang for minutes.
+	DefaultReadWait = 90 * time.Second
+	// MinReadWait is the smallest configurable read-wait threshold.
+	MinReadWait = time.Second
+	// MaxReadWait bounds the configurable read-wait threshold so a
+	// misconfiguration can still only block a read for a short ban.
+	MaxReadWait = 5 * time.Minute
+
+	// CounterLogInterval is how often the periodic counter line is emitted.
+	CounterLogInterval = 5 * time.Minute
 )
 
 // ThrottleError ends the current read/chunk attempt without poisoning the file.
@@ -53,12 +67,31 @@ type Throttle struct {
 	last429                             time.Time
 	open                                bool
 	requests, throttled, reads, read429 uint64
+	readWait                            time.Duration
 	now                                 func() time.Time
+	sleep                               func(context.Context, time.Duration) error
 	logger                              zerolog.Logger
 }
 
 func NewThrottle(threshold int, cooldown, backoffMax time.Duration, log zerolog.Logger) *Throttle {
-	return &Throttle{threshold: threshold, cooldown: cooldown, backoffMax: backoffMax, now: time.Now, logger: log}
+	return &Throttle{
+		threshold:  threshold,
+		cooldown:   cooldown,
+		backoffMax: backoffMax,
+		readWait:   DefaultReadWait,
+		now:        time.Now,
+		sleep:      sleepContext,
+		logger:     log,
+	}
+}
+
+// WithReadWait sets the longest remaining cooldown a read waits out before it
+// proceeds. Non-positive values disable the wait (reads always fail fast).
+func (b *Throttle) WithReadWait(d time.Duration) *Throttle {
+	if d > 0 {
+		b.readWait = d
+	}
+	return b
 }
 func (b *Throttle) Before() error {
 	b.mu.Lock()
@@ -78,6 +111,55 @@ func (b *Throttle) Remaining() time.Duration {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return max(0, b.until.Sub(b.now()))
+}
+
+// WaitRead admits a read through an open circuit. When the remaining cooldown
+// is at most the read-wait threshold it blocks for the remainder, re-checking
+// state (never holding the lock while asleep) and honoring ctx, then proceeds.
+// Longer cooldowns return the same ThrottleError as before so a long ban still
+// fails fast. The total wait is bounded by one threshold.
+func (b *Throttle) WaitRead(ctx context.Context) error {
+	return b.waitRead(ctx, b.now().Add(b.readWait))
+}
+
+func (b *Throttle) waitRead(ctx context.Context, deadline time.Time) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := b.Before()
+		if err == nil {
+			return nil
+		}
+		var throttleErr *ThrottleError
+		if !errors.As(err, &throttleErr) {
+			return err
+		}
+		wait := throttleErr.RetryAfter
+		if wait <= 0 || wait > b.readWait {
+			return err
+		}
+		if b.now().Add(wait).After(deadline) {
+			return err
+		}
+		if err := b.sleep(ctx, wait); err != nil {
+			return err
+		}
+	}
+}
+
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 func (b *Throttle) Observe(resp *http.Response, read bool) {
 	b.mu.Lock()
@@ -133,6 +215,47 @@ func (b *Throttle) Observe(resp *http.Response, read bool) {
 }
 func (b *Throttle) isOpen() bool { b.mu.Lock(); defer b.mu.Unlock(); return b.open }
 
+// StartCounterLogging emits the throttle counters every interval until ctx is
+// done. It is safe to leave running for the provider's lifetime; callers that
+// need to stop it (tests) cancel ctx.
+func (b *Throttle) StartCounterLogging(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		b.runCounterLog(ctx, ticker.C)
+	}()
+}
+
+// runCounterLog is the injectable core of StartCounterLogging: tests drive it
+// with a synthetic tick channel instead of a wall-clock ticker.
+func (b *Throttle) runCounterLog(ctx context.Context, ticks <-chan time.Time) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticks:
+			b.LogCounters()
+		}
+	}
+}
+
+// LogCounters reports the cumulative counters once. Exported so the periodic
+// line and any on-demand diagnostics share one format.
+func (b *Throttle) LogCounters() {
+	b.mu.Lock()
+	requests, throttled, reads, read429 := b.requests, b.throttled, b.reads, b.read429
+	b.mu.Unlock()
+	b.logger.Info().
+		Uint64("requests", requests).
+		Uint64("429s", throttled).
+		Uint64("read_requests", reads).
+		Uint64("read_429s", read429).
+		Msg("TorBox throttle counters")
+}
+
 // retryAfterWait returns the server's unbounded Retry-After advice for logging.
 // The second result is false when the header is absent, invalid, or in the past.
 func retryAfterWait(resp *http.Response) (time.Duration, bool) {
@@ -184,19 +307,28 @@ type throttleTransport struct {
 }
 
 func (t *throttleTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if err := req.Context().Err(); err != nil {
+	ctx := req.Context()
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := t.throttle.Before(); err != nil {
+	// Reads wait out short cooldowns (bounded, interruptible); API calls keep
+	// failing fast exactly as before. Both gate checks in one attempt share a
+	// single deadline so the total wait cannot exceed the threshold.
+	gate := func() error { return t.throttle.Before() }
+	if t.read {
+		deadline := t.throttle.now().Add(t.throttle.readWait)
+		gate = func() error { return t.throttle.waitRead(ctx, deadline) }
+	}
+	if err := gate(); err != nil {
 		return nil, err
 	}
 	if t.limiter != nil {
 		t.limiter.Take()
 	}
-	if err := req.Context().Err(); err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := t.throttle.Before(); err != nil {
+	if err := gate(); err != nil {
 		return nil, err
 	}
 	t.throttle.mu.Lock()

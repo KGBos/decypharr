@@ -54,7 +54,7 @@ type Torbox struct {
 
 func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, error) {
 	cfg := config.Get()
-	backoffMax, cooldown, threshold, err := throttleConfig(dc)
+	backoffMax, cooldown, readWait, threshold, err := throttleConfig(dc)
 	if err != nil {
 		return nil, err
 	}
@@ -67,7 +67,10 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 		headers["User-Agent"] = fmt.Sprintf("Decypharr/%s (%s; %s)", version.GetInfo(), runtime.GOOS, runtime.GOARCH)
 	}
 	_log := logger.New(dc.Name)
-	throttle := request.NewThrottle(threshold, cooldown, backoffMax, _log)
+	throttle := request.NewThrottle(threshold, cooldown, backoffMax, _log).WithReadWait(readWait)
+	// One ticker per configured provider for the provider's process lifetime;
+	// it exits with the process, so there is nothing to leak per request.
+	throttle.StartCounterLogging(context.Background(), request.CounterLogInterval)
 
 	// TorBox enforces a hard cap of 300 req/min per API key, applied
 	// synchronously across all servers since v8.4 (Feb 2026, GAP-002).
@@ -117,32 +120,38 @@ func (tb *Torbox) RequestThrottle() *request.Throttle { return tb.throttle }
 const maxThrottleDuration = 48 * time.Hour
 
 // Durations may be configured up to 48h so a long ban can be honored rather
-// than truncated to the previous 15m ceiling.
-func throttleConfig(dc config.Debrid) (time.Duration, time.Duration, int, error) {
+// than truncated to the previous 15m ceiling. The read-wait threshold is
+// bounded much lower: it is how long a read blocks, not how long a ban lasts.
+func throttleConfig(dc config.Debrid) (time.Duration, time.Duration, time.Duration, int, error) {
 	backoffMax, cooldown, threshold := 5*time.Minute, time.Minute, 3
+	readWait := request.DefaultReadWait
 	for _, item := range []struct {
 		name, value string
 		dest        *time.Duration
 	}{
 		{"torbox_backoff_max", dc.TorboxBackoffMax, &backoffMax},
 		{"torbox_breaker_cooldown", dc.TorboxBreakerCooldown, &cooldown},
+		{"torbox_read_wait_max", dc.TorboxReadWaitMax, &readWait},
 	} {
 		if item.value == "" {
 			continue
 		}
 		d, err := time.ParseDuration(item.value)
 		if err != nil || d <= 0 || d > maxThrottleDuration {
-			return 0, 0, 0, fmt.Errorf("%s must be a positive duration no greater than 48h", item.name)
+			return 0, 0, 0, 0, fmt.Errorf("%s must be a positive duration no greater than 48h", item.name)
 		}
 		*item.dest = d
+	}
+	if readWait < request.MinReadWait || readWait > request.MaxReadWait {
+		return 0, 0, 0, 0, fmt.Errorf("torbox_read_wait_max must be between 1s and 5m")
 	}
 	if dc.TorboxBreakerThreshold != 0 {
 		threshold = dc.TorboxBreakerThreshold
 	}
 	if threshold < 1 || threshold > 100 {
-		return 0, 0, 0, fmt.Errorf("torbox_breaker_threshold must be between 1 and 100")
+		return 0, 0, 0, 0, fmt.Errorf("torbox_breaker_threshold must be between 1 and 100")
 	}
-	return backoffMax, cooldown, threshold, nil
+	return backoffMax, cooldown, readWait, threshold, nil
 }
 
 func (tb *Torbox) Config() config.Debrid {
