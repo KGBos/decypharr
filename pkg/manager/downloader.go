@@ -766,7 +766,8 @@ func (d *Downloader) localDownloader(download types.DownloadLink, filename strin
 	if err != nil {
 		return err
 	}
-	req = req.WithContext(d.manager.ctx)
+	// Bulk download work runs in the low lane: it never blocks a playback read.
+	req = req.WithContext(request.WithClass(d.manager.ctx, request.ClassBackground))
 	req.BufferSize = 1 << 20
 	req.HTTPRequest.Header.Set("User-Agent", "Decypharr[QBitTorrent]")
 	req.HTTPRequest.Header.Set("Accept", "*/*")

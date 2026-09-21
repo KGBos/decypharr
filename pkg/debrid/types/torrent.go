@@ -134,6 +134,9 @@ type Stats struct {
 	Library         LibraryStats     `json:"library"`
 	Accounts        []map[string]any `json:"accounts"`
 	SpeedTestResult *SpeedTestResult `json:"speed_test_result,omitempty"`
+	// Requestdl is the shared /requestdl budget snapshot for providers that
+	// expose one (per-class counts, current rate, queue depth, penalties).
+	Requestdl any `json:"requestdl,omitempty"`
 }
 
 type Profile struct {

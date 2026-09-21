@@ -19,6 +19,7 @@ import (
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/customerror"
+	"github.com/sirrobot01/decypharr/internal/request"
 	"github.com/sirrobot01/decypharr/pkg/arr"
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
@@ -84,6 +85,9 @@ type fileResult struct {
 
 // executeSweep is the body of a sweep: enumerate, filter due, probe, repair.
 func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts RepairRunOptions, stopState *repairStopState) {
+	// Repair probes are background work: the shared /requestdl budget serves
+	// them only from leftover capacity, never ahead of playback.
+	ctx = request.WithClass(ctx, request.ClassProbe)
 	cfg := r.cfg()
 	log := r.logger.With().Str("run_id", run.ID).Logger()
 

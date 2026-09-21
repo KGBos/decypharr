@@ -3,6 +3,7 @@ package torbox
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	stdjson "encoding/json"
 	"fmt"
 	"io"
@@ -44,6 +45,7 @@ type Torbox struct {
 	autoExpiresLinksAfter time.Duration
 	client                *request.Client
 	throttle              *request.Throttle
+	requestdlCache        *request.URLCache[types.DownloadLink]
 	logger                zerolog.Logger
 	Profile               *types.Profile
 	config                config.Debrid
@@ -51,6 +53,11 @@ type Torbox struct {
 	downloadPresentMu     sync.Mutex
 	downloadPresentLoaded bool
 }
+
+// requestdlPath is the TorBox endpoint that resolves a file into a
+// short-lived CDN URL. It has a much tighter practical ceiling than the rest
+// of the API, so every call to it shares one provider-wide budget.
+const requestdlPath = "/api/torrents/requestdl"
 
 func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, error) {
 	cfg := config.Get()
@@ -109,7 +116,68 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 		throttle:              throttle,
 		logger:                _log,
 	}
+
+	// One shared /requestdl budget per configured provider, used by every
+	// client and worker (API client, download accounts, streaming reads). The
+	// matcher keys on this provider's host so redirect hops to the CDN and
+	// unrelated API calls never consume the budget.
+	limiter, urlCacheTTL := requestdlOptions(dc, backoffMax, _log)
+	throttle.UseRequestdl(limiter, func(r *http.Request) bool {
+		return strings.HasPrefix(r.URL.String(), tb.Host+requestdlPath)
+	})
+	if urlCacheTTL > 0 {
+		tb.requestdlCache = request.NewURLCache[types.DownloadLink](urlCacheTTL)
+	}
+
 	return tb, nil
+}
+
+// requestdlOptions parses the shared-budget settings, falling back to safe
+// defaults (with a warning) when a value is missing or invalid, so a typo can
+// never remove the limit. It returns the limiter and the resolved-URL cache
+// TTL; a TTL of zero disables the cache.
+func requestdlOptions(dc config.Debrid, maxBackoff time.Duration, log zerolog.Logger) (*request.RequestdlLimiter, time.Duration) {
+	rate := request.DefaultRequestdlBudgetPerMinute
+	if dc.RequestdlBudget != "" {
+		if v, ok := utils.ParseRateValue(dc.RequestdlBudget); ok && v > 0 {
+			rate = v
+		} else {
+			log.Warn().Str("requestdl_budget", dc.RequestdlBudget).Msg("invalid requestdl_budget; using the default")
+		}
+	}
+	if rate > request.MaxRequestdlBudgetPerMinute {
+		log.Warn().Float64("requestdl_budget_per_minute", rate).Float64("max", request.MaxRequestdlBudgetPerMinute).Msg("requestdl_budget capped")
+		rate = request.MaxRequestdlBudgetPerMinute
+	}
+
+	rampSeconds := dc.RequestdlRampSeconds
+	if rampSeconds <= 0 || rampSeconds > 86400 {
+		if dc.RequestdlRampSeconds != 0 {
+			log.Warn().Int("requestdl_ramp_seconds", dc.RequestdlRampSeconds).Msg("invalid requestdl_ramp_seconds; using the default")
+		}
+		rampSeconds = request.DefaultRequestdlRampSeconds
+	}
+
+	urlCacheTTL := request.DefaultRequestdlURLCacheTTL
+	if dc.RequestdlURLCacheTTL != "" {
+		if d, err := utils.ParseDuration(dc.RequestdlURLCacheTTL); err == nil && d >= 0 && d <= 48*time.Hour {
+			urlCacheTTL = d
+		} else {
+			log.Warn().Str("requestdl_url_cache_ttl", dc.RequestdlURLCacheTTL).Msg("invalid requestdl_url_cache_ttl; using the default")
+		}
+	}
+
+	limiter := request.NewRequestdlLimiter(rate, time.Duration(rampSeconds)*time.Second, maxBackoff, log)
+	return limiter, urlCacheTTL
+}
+
+// RequestdlStats exposes the shared /requestdl budget for the local API.
+func (tb *Torbox) RequestdlStats() any {
+	stats := tb.throttle.RequestdlStats()
+	if tb.requestdlCache != nil {
+		stats.CachedURLs = tb.requestdlCache.Len()
+	}
+	return stats
 }
 
 // RequestThrottle exposes the same provider gate to manager GET/HEAD reads.
@@ -669,13 +737,21 @@ func (tb *Torbox) GetDownloadLink(id string, file *types.File) (types.DownloadLi
 }
 
 func (tb *Torbox) fetchDownloadLink(account *account.Account, id string, file *types.File) (types.DownloadLink, error) {
+	cacheKey := ""
+	if tb.requestdlCache != nil && account != nil {
+		cacheKey = requestdlCacheKey(account.Token, id, file.Id)
+		if cached, ok := tb.requestdlCache.Get(cacheKey); ok {
+			return cached, nil
+		}
+	}
+
 	query := url.Values{}
 	query.Set("token", account.Token)
 	query.Set("torrent_id", id)
 	query.Set("file_id", file.Id)
 	query.Set("redirect", "true")
 
-	downloadURL := fmt.Sprintf("%s/api/torrents/requestdl?%s", tb.Host, query.Encode())
+	downloadURL := fmt.Sprintf("%s%s?%s", tb.Host, requestdlPath, query.Encode())
 
 	now := time.Now()
 
@@ -691,7 +767,19 @@ func (tb *Torbox) fetchDownloadLink(account *account.Account, id string, file *t
 		Generated:    now,
 		ExpiresAt:    now.Add(tb.autoExpiresLinksAfter),
 	}
+	if cacheKey != "" {
+		// The cache never outlives the link's own auto_expire deadline.
+		tb.requestdlCache.Set(cacheKey, dl, dl.ExpiresAt)
+	}
 	return dl, nil
+}
+
+// requestdlCacheKey identifies a resolved URL by account, torrent, and file.
+// The account token is hashed so a cache dump cannot expose it; the same file
+// on a different account resolves to a different URL.
+func requestdlCacheKey(token, torrentID, fileID string) string {
+	sum := sha256.Sum256([]byte(token))
+	return fmt.Sprintf("%x:%s:%s", sum[:8], torrentID, fileID)
 }
 
 func (tb *Torbox) GetTorrents() ([]*types.Torrent, error) {
@@ -909,6 +997,10 @@ func (tb *Torbox) DeleteLink(downloadLink types.DownloadLink) error {
 
 // SpeedTest measures API latency and download speed using cached links
 func (tb *Torbox) SpeedTest(ctx context.Context) types.SpeedTestResult {
+	// Speed probes are the lowest priority lane: they must never consume
+	// capacity a playback read needs, and they are suppressed entirely during
+	// a penalty window by the shared budget.
+	ctx = request.WithClass(ctx, request.ClassProbe)
 	result := types.SpeedTestResult{
 		Provider: tb.config.Name,
 		TestedAt: time.Now(),

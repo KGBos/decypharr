@@ -557,6 +557,9 @@ func (m *Manager) OpenStreamForFile(ctx context.Context, info *FileInfo, offset 
 }
 
 func (m *Manager) openSession(ctx context.Context, entry *storage.Entry, filename string, offset int64) (*session, string, string, error) {
+	// Every stream opening serves a media reader, so it is tagged playback:
+	// the shared /requestdl budget admits it ahead of background work.
+	ctx = request.WithClass(ctx, request.ClassPlayback)
 	file, ok := entry.Files[filename]
 	if !ok {
 		return nil, "", "", fmt.Errorf("file %s not found in entry %s", filename, entry.Name)
