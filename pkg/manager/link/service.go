@@ -404,8 +404,10 @@ func (s *Service) validateLink(ctx context.Context, link *types.DownloadLink) er
 		if e := request.BackpressureError(err); e != nil {
 			return e
 		}
+		// Strip the URL credentials (the requestdl token query parameter)
+		// before the error is logged anywhere.
 		return NewRetryableError(
-			fmt.Errorf("HEAD request failed: %w", err),
+			fmt.Errorf("HEAD request failed: %w", request.RedactURLError(err)),
 			"network_error",
 		)
 	}
@@ -427,7 +429,9 @@ func (s *Service) validateLink(ctx context.Context, link *types.DownloadLink) er
 // shared throttle and returns the final CDN URL. Callers that hand a link to an
 // out-of-process consumer (for example the /api/browse download redirect) use
 // it so the requestdl call is charged to the shared budget instead of leaking
-// past Decypharr.
+// past Decypharr. It is deliberately provider-agnostic (not TorBox-only):
+// validateLink already HEADs the same URL for every provider, so this adds one
+// hop only on the /api/browse download route, after validation has succeeded.
 func (s *Service) Resolve(ctx context.Context, link types.DownloadLink) (string, error) {
 	if link.Empty() {
 		return "", NewPermanentError(ErrEmptyLink, "empty_link")
@@ -457,13 +461,19 @@ func (s *Service) finalURL(resp *http.Response, err error) (string, error) {
 		if e := request.BackpressureError(err); e != nil {
 			return "", e
 		}
-		return "", NewRetryableError(fmt.Errorf("resolve request failed: %w", err), "network_error")
+		// Strip the requestdl token query parameter before this can be logged.
+		return "", NewRetryableError(
+			fmt.Errorf("resolve request failed: %w", request.RedactURLError(err)),
+			"network_error",
+		)
 	}
 	if resp == nil {
 		return "", NewRetryableError(fmt.Errorf("resolve returned no response"), "network_error")
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Require a followed 2xx: an un-followed 3xx would otherwise hand back
+		// the token-bearing requestdl URL as the "resolved" target.
 		errorCode := resp.Header.Get("X-Error")
 		if errorCode == "" {
 			errorCode = strconv.Itoa(resp.StatusCode)
