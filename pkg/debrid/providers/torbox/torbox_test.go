@@ -17,6 +17,69 @@ import (
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 )
 
+func TestSubmitMagnetAcceptsDocumentedObjectResponse(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"success":true,"detail":"Torrent Added Successfully","data":{"torrent_id":41,"hash":"AABBCC"}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	torrent := &debridTypes.Torrent{
+		InfoHash: "AABBCC",
+		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+	}
+	got, err := testTorbox(server.URL).SubmitMagnet(torrent)
+	if err != nil {
+		t.Fatalf("SubmitMagnet() error = %v", err)
+	}
+	if got.Id != "41" {
+		t.Fatalf("SubmitMagnet() id = %q, want 41", got.Id)
+	}
+}
+
+func TestSubmitMagnetSelectsMatchingTorrentFromArrayResponse(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"success":true,"detail":"Torrent Added Successfully","data":[{"id":7,"hash":"UNRELATED"},{"id":42,"hash":"aabbcc"}]}`)
+	}))
+	t.Cleanup(server.Close)
+
+	torrent := &debridTypes.Torrent{
+		InfoHash: "AABBCC",
+		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+	}
+	got, err := testTorbox(server.URL).SubmitMagnet(torrent)
+	if err != nil {
+		t.Fatalf("SubmitMagnet() error = %v", err)
+	}
+	if got.Id != "42" {
+		t.Fatalf("SubmitMagnet() id = %q, want matching torrent 42", got.Id)
+	}
+}
+
+func TestSubmitMagnetRejectsArrayWithoutMatchingHash(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"success":true,"detail":"Torrent Added Successfully","data":[{"id":7,"hash":"UNRELATED"}]}`)
+	}))
+	t.Cleanup(server.Close)
+
+	torrent := &debridTypes.Torrent{
+		InfoHash: "AABBCC",
+		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+	}
+	_, err := testTorbox(server.URL).SubmitMagnet(torrent)
+	if err == nil || !strings.Contains(err.Error(), "no torrent matching submitted hash") {
+		t.Fatalf("SubmitMagnet() error = %v, want safe no-match error", err)
+	}
+}
+
 func TestSubmitMagnetIncludesSanitizedProviderError(t *testing.T) {
 	config.SetConfigPath(t.TempDir())
 
@@ -69,9 +132,8 @@ func TestSubmitMagnetPreservesStatusAndBodyOnExhaustedRetries(t *testing.T) {
 	}
 
 	torrent := &debridTypes.Torrent{
-		InfoHash:         "AABBCC",
-		Magnet:           &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
-		DownloadUncached: true,
+		InfoHash: "AABBCC",
+		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
 	}
 	_, err := tb.SubmitMagnet(torrent)
 	if err == nil {
@@ -296,69 +358,5 @@ func testTorbox(host string) *Torbox {
 		client: request.New(request.WithMaxRetries(0)),
 		logger: zerolog.Nop(),
 		config: config.Debrid{Name: "torbox"},
-	}
-}
-
-func TestSubmitMagnetSkipsUncachedWithoutSubmitting(t *testing.T) {
-	config.SetConfigPath(t.TempDir())
-
-	var createCalls int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case strings.Contains(r.URL.Path, "checkcached"):
-			_, _ = fmt.Fprint(w, `{"success":true,"data":{}}`)
-		case strings.Contains(r.URL.Path, "createtorrent"):
-			createCalls++
-			_, _ = fmt.Fprint(w, `{"success":true,"data":{"torrent_id":1,"hash":"AABBCC"}}`)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(server.Close)
-
-	torrent := &debridTypes.Torrent{
-		Name:     "Uncached.Release",
-		InfoHash: "AABBCC",
-		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
-	}
-	_, err := testTorbox(server.URL).SubmitMagnet(torrent)
-	if err == nil || !strings.Contains(err.Error(), "not cached") {
-		t.Fatalf("SubmitMagnet() error = %v, want not-cached skip", err)
-	}
-	if createCalls != 0 {
-		t.Fatalf("createtorrent called %d times, want 0", createCalls)
-	}
-}
-
-func TestSubmitMagnetProceedsWhenCached(t *testing.T) {
-	config.SetConfigPath(t.TempDir())
-
-	var createCalls int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case strings.Contains(r.URL.Path, "checkcached"):
-			_, _ = fmt.Fprint(w, `{"success":true,"data":{"AABBCC":{"name":"Cached.Release","size":100,"hash":"AABBCC"}}}`)
-		case strings.Contains(r.URL.Path, "createtorrent"):
-			createCalls++
-			_, _ = fmt.Fprint(w, `{"success":true,"data":{"torrent_id":42,"hash":"AABBCC"}}`)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(server.Close)
-
-	torrent := &debridTypes.Torrent{
-		Name:     "Cached.Release",
-		InfoHash: "AABBCC",
-		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
-	}
-	got, err := testTorbox(server.URL).SubmitMagnet(torrent)
-	if err != nil {
-		t.Fatalf("SubmitMagnet() error = %v", err)
-	}
-	if got.Id != "42" || createCalls != 1 {
-		t.Fatalf("id = %q, createCalls = %d; want 42 and 1", got.Id, createCalls)
 	}
 }

@@ -1,6 +1,7 @@
 package request
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -74,14 +76,114 @@ func TestThrottleOpensAndRecovers(t *testing.T) {
 	if err := b.Before(); err != nil {
 		t.Fatal(err)
 	}
-	if b.open || b.consecutive != 0 {
+	if b.open {
 		t.Fatal("breaker did not close after cooldown")
 	}
-	b.Observe(resp, true)
-	now = now.Add(10 * time.Second)
+	// Consecutive 429s survive cooldown so a re-trip can tell there was no
+	// success in between.
+	if b.consecutive != 3 {
+		t.Fatalf("cooldown reset consecutive: %d", b.consecutive)
+	}
 	b.Observe(&http.Response{StatusCode: 200}, false)
-	if b.consecutive != 0 {
-		t.Fatal("success must reset consecutive 429s")
+	if b.consecutive != 0 || b.escalation != 0 {
+		t.Fatalf("success must reset consecutive and escalation: %d/%d", b.consecutive, b.escalation)
+	}
+}
+
+func TestRetryAfterLongBanBoundaries(t *testing.T) {
+	resp := &http.Response{StatusCode: 429, Header: http.Header{"Retry-After": {"86400"}}}
+	// Exactly 24h is honored at a 24h ceiling, not truncated to the old 5m/15m.
+	if got := retryAfterBackoff(time.Second, 24*time.Hour, 0, resp); got != 24*time.Hour {
+		t.Fatalf("86400s truncated at 24h ceiling: %s", got)
+	}
+	if got := retryAfterBackoff(time.Second, 25*time.Hour, 0, resp); got != 24*time.Hour {
+		t.Fatalf("86400s truncated below server advice: %s", got)
+	}
+	if got := retryAfterBackoff(time.Second, time.Hour, 0, resp); got != time.Hour {
+		t.Fatalf("ceiling not applied: %s", got)
+	}
+}
+
+func TestThrottleHonorsLongRetryAfter(t *testing.T) {
+	now := time.Now()
+	b := NewThrottle(1, time.Minute, 24*time.Hour, zerolog.Nop())
+	b.now = func() time.Time { return now }
+	b.Observe(&http.Response{StatusCode: 429, Header: http.Header{"Retry-After": {"86400"}}}, false)
+	if got := b.until.Sub(now); got != 24*time.Hour {
+		t.Fatalf("long ban truncated: %s", got)
+	}
+	if b.Before() == nil {
+		t.Fatal("24h ban did not hold the breaker")
+	}
+}
+
+func TestThrottleEscalatesOnRetrip(t *testing.T) {
+	now := time.Now()
+	b := NewThrottle(1, time.Minute, 24*time.Hour, zerolog.Nop())
+	b.now = func() time.Time { return now }
+	resp := &http.Response{StatusCode: 429, Header: http.Header{"Retry-After": {"600"}}}
+	b.Observe(resp, false)
+	if got := b.until.Sub(now); got != 10*time.Minute {
+		t.Fatalf("first open: %s", got)
+	}
+	now = now.Add(10 * time.Minute)
+	if err := b.Before(); err != nil {
+		t.Fatal(err)
+	}
+	b.Observe(resp, false)
+	if got := b.until.Sub(now); got != 20*time.Minute {
+		t.Fatalf("re-trip did not double: %s", got)
+	}
+	now = now.Add(20 * time.Minute)
+	if err := b.Before(); err != nil {
+		t.Fatal(err)
+	}
+	b.Observe(resp, false)
+	if got := b.until.Sub(now); got != 40*time.Minute {
+		t.Fatalf("second re-trip did not double: %s", got)
+	}
+}
+
+func TestThrottleEscalationResetsOnSuccess(t *testing.T) {
+	now := time.Now()
+	b := NewThrottle(1, time.Minute, 24*time.Hour, zerolog.Nop())
+	b.now = func() time.Time { return now }
+	resp := &http.Response{StatusCode: 429, Header: http.Header{"Retry-After": {"600"}}}
+	b.Observe(resp, false)
+	now = now.Add(10 * time.Minute)
+	if err := b.Before(); err != nil {
+		t.Fatal(err)
+	}
+	b.Observe(resp, false)
+	now = now.Add(20 * time.Minute)
+	if err := b.Before(); err != nil {
+		t.Fatal(err)
+	}
+	b.Observe(&http.Response{StatusCode: 200}, false)
+	if b.escalation != 0 || b.consecutive != 0 {
+		t.Fatalf("success did not reset: escalation=%d consecutive=%d", b.escalation, b.consecutive)
+	}
+	b.Observe(resp, false)
+	if got := b.until.Sub(now); got != 10*time.Minute {
+		t.Fatalf("post-success wait not reset to base: %s", got)
+	}
+}
+
+func TestThrottleLogsLongBanDistinctly(t *testing.T) {
+	now := time.Now()
+	var long bytes.Buffer
+	b := NewThrottle(1, time.Minute, 24*time.Hour, zerolog.New(&long))
+	b.now = func() time.Time { return now }
+	b.Observe(&http.Response{StatusCode: 429, Header: http.Header{"Retry-After": {"86400"}}}, false)
+	if !strings.Contains(long.String(), "TorBox long ban: retry-after=86400s") {
+		t.Fatalf("long ban not logged distinctly: %s", long.String())
+	}
+	var short bytes.Buffer
+	s := NewThrottle(1, time.Minute, 24*time.Hour, zerolog.New(&short))
+	s.now = func() time.Time { return now }
+	s.Observe(&http.Response{StatusCode: 429, Header: http.Header{"Retry-After": {"600"}}}, false)
+	if strings.Contains(short.String(), "long ban") {
+		t.Fatalf("short ban logged as long: %s", short.String())
 	}
 }
 

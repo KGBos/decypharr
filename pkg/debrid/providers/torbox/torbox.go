@@ -1,9 +1,9 @@
 package torbox
 
 import (
-	stdjson "encoding/json"
 	"bytes"
 	"context"
+	stdjson "encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -112,7 +112,12 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 // RequestThrottle exposes the same provider gate to manager GET/HEAD reads.
 func (tb *Torbox) RequestThrottle() *request.Throttle { return tb.throttle }
 
-// Durations are capped at 15 minutes to bound even malformed server advice.
+// maxThrottleDuration bounds even malformed server advice while allowing a
+// genuine multi-hour TorBox ban (observed up to >24h) to be honored.
+const maxThrottleDuration = 48 * time.Hour
+
+// Durations may be configured up to 48h so a long ban can be honored rather
+// than truncated to the previous 15m ceiling.
 func throttleConfig(dc config.Debrid) (time.Duration, time.Duration, int, error) {
 	backoffMax, cooldown, threshold := 5*time.Minute, time.Minute, 3
 	for _, item := range []struct {
@@ -126,8 +131,8 @@ func throttleConfig(dc config.Debrid) (time.Duration, time.Duration, int, error)
 			continue
 		}
 		d, err := time.ParseDuration(item.value)
-		if err != nil || d <= 0 || d > 15*time.Minute {
-			return 0, 0, 0, fmt.Errorf("%s must be a positive duration no greater than 15m", item.name)
+		if err != nil || d <= 0 || d > maxThrottleDuration {
+			return 0, 0, 0, fmt.Errorf("%s must be a positive duration no greater than 48h", item.name)
 		}
 		*item.dest = d
 	}
@@ -279,20 +284,6 @@ func (tb *Torbox) IsAvailable(hashes []string) map[string]bool {
 	return result
 }
 
-func (tb *Torbox) isCachedHash(hash string) (cached bool, ok bool) {
-	var res AvailableResponse
-	resp, err := tb.doGet("/api/torrents/checkcached", map[string]string{"hash": hash}, &res)
-	if err != nil || resp == nil || resp.StatusCode < 200 || resp.StatusCode >= 300 || res.Data == nil {
-		return false, false
-	}
-	for h, c := range *res.Data {
-		if strings.EqualFold(h, hash) && c.Size > 0 {
-			return true, true
-		}
-	}
-	return false, true
-}
-
 func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 	var data AddMagnetResponse
 
@@ -300,23 +291,6 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 		"magnet": torrent.Magnet.Link,
 	}
 	if !torrent.DownloadUncached {
-		hash := torrent.InfoHash
-		if hash == "" && torrent.Magnet != nil {
-			hash = torrent.Magnet.InfoHash
-		}
-		// Never spend TorBox's 60/hour uncached createtorrent budget on content
-		// we would not accept: check the cache first and skip the create call
-		// entirely when the hash is not cached. If the cache check itself
-		// cannot be completed, fall through to the guarded create call.
-		if hash != "" {
-			if cached, ok := tb.isCachedHash(hash); ok && !cached {
-				name := torrent.Name
-				if name == "" {
-					name = hash
-				}
-				return nil, fmt.Errorf("torrent %s is not cached; skipped without submitting (download_uncached=false)", name)
-			}
-		}
 		formData["add_only_if_cached"] = "true"
 	}
 
@@ -390,6 +364,7 @@ func parseAddMagnetData(raw stdjson.RawMessage, expectedHash string) (int, error
 	if len(raw) == 0 {
 		return 0, fmt.Errorf("TorBox create torrent response contained empty data")
 	}
+
 	if raw[0] == '{' {
 		var data addMagnetData
 		if err := stdjson.Unmarshal(raw, &data); err != nil {
@@ -400,12 +375,14 @@ func parseAddMagnetData(raw stdjson.RawMessage, expectedHash string) (int, error
 		}
 		return data.torrentId(), nil
 	}
+
 	if raw[0] != '[' {
 		return 0, fmt.Errorf("TorBox create torrent response contained unsupported data")
 	}
 	if expectedHash == "" {
 		return 0, fmt.Errorf("cannot select TorBox torrent from array response without submitted hash")
 	}
+
 	var torrents []addMagnetData
 	if err := stdjson.Unmarshal(raw, &torrents); err != nil {
 		return 0, fmt.Errorf("decode TorBox create torrent array: %w", err)
@@ -415,6 +392,7 @@ func parseAddMagnetData(raw stdjson.RawMessage, expectedHash string) (int, error
 			return candidate.torrentId(), nil
 		}
 	}
+
 	return 0, fmt.Errorf("TorBox create torrent array contained no torrent matching submitted hash")
 }
 
