@@ -18,6 +18,69 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 )
 
+func TestSubmitMagnetAcceptsDocumentedObjectResponse(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"success":true,"detail":"Torrent Added Successfully","data":{"torrent_id":41,"hash":"AABBCC"}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	torrent := &types.Torrent{
+		InfoHash: "AABBCC",
+		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+	}
+	got, err := testTorbox(server.URL).SubmitMagnet(torrent)
+	if err != nil {
+		t.Fatalf("SubmitMagnet() error = %v", err)
+	}
+	if got.Id != "41" {
+		t.Fatalf("SubmitMagnet() id = %q, want 41", got.Id)
+	}
+}
+
+func TestSubmitMagnetSelectsMatchingTorrentFromArrayResponse(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"success":true,"detail":"Torrent Added Successfully","data":[{"id":7,"hash":"UNRELATED"},{"id":42,"hash":"aabbcc"}]}`)
+	}))
+	t.Cleanup(server.Close)
+
+	torrent := &types.Torrent{
+		InfoHash: "AABBCC",
+		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+	}
+	got, err := testTorbox(server.URL).SubmitMagnet(torrent)
+	if err != nil {
+		t.Fatalf("SubmitMagnet() error = %v", err)
+	}
+	if got.Id != "42" {
+		t.Fatalf("SubmitMagnet() id = %q, want matching torrent 42", got.Id)
+	}
+}
+
+func TestSubmitMagnetRejectsArrayWithoutMatchingHash(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"success":true,"detail":"Torrent Added Successfully","data":[{"id":7,"hash":"UNRELATED"}]}`)
+	}))
+	t.Cleanup(server.Close)
+
+	torrent := &types.Torrent{
+		InfoHash: "AABBCC",
+		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+	}
+	_, err := testTorbox(server.URL).SubmitMagnet(torrent)
+	if err == nil || !strings.Contains(err.Error(), "no torrent matching submitted hash") {
+		t.Fatalf("SubmitMagnet() error = %v, want safe no-match error", err)
+	}
+}
+
 func TestSubmitMagnetIncludesSanitizedProviderError(t *testing.T) {
 	config.SetConfigPath(t.TempDir())
 
