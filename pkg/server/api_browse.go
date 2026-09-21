@@ -412,9 +412,19 @@ func (s *Server) handleTorrentDownload(w http.ResponseWriter, r *http.Request, e
 		return
 	}
 
-	w.Header().Set("X-Accel-Redirect", link.DownloadLink)
+	// Resolve the requestdl redirect server-side so the requestdl call is
+	// charged to the shared budget; the client is then sent straight to the
+	// CDN URL and never calls /requestdl itself.
+	resolved, err := s.manager.ResolveRequestdlURL(ctx, link)
+	if err != nil || resolved == "" {
+		s.logger.Error().Err(err).Str("torrent", entry.Name).Str("file", file.Name).Msg("Failed to resolve download link")
+		http.Error(w, "Could not resolve download link", http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("X-Accel-Redirect", resolved)
 	w.Header().Set("X-Accel-Buffering", "no")
-	http.Redirect(w, r, link.DownloadLink, http.StatusFound)
+	http.Redirect(w, r, resolved, http.StatusFound)
 }
 
 func (s *Server) handleUsenetDownload(w http.ResponseWriter, r *http.Request, entryName string, file *storage.File) {
