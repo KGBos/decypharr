@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -84,5 +85,52 @@ func TestResolveRejectsEmptyLink(t *testing.T) {
 	service := New(xsync.NewMap[string, debrid.Client](), nil, nil, nil, &http.Client{Timeout: time.Second}, 1, zerolog.Nop())
 	if _, err := service.Resolve(context.Background(), types.DownloadLink{}); GetLinkError(err) == nil {
 		t.Fatalf("Resolve() error = %v, want a typed link error", err)
+	}
+}
+
+// TestResolveRedactsTokenFromError is the AGENTS.md §5.5 regression: a
+// connection failure on the requestdl URL must not put the download-account
+// token into the wrapped error that /api/browse logs.
+func TestResolveRedactsTokenFromError(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+	service := New(xsync.NewMap[string, debrid.Client](), nil, nil, nil, &http.Client{Timeout: 2 * time.Second}, 1, zerolog.Nop())
+	dl := types.DownloadLink{
+		Debrid:       "torbox",
+		Filename:     "movie.mkv",
+		Link:         "torbox://1/2",
+		DownloadLink: "http://127.0.0.1:1/api/torrents/requestdl?token=SUPERSECRETTOKEN&torrent_id=1&file_id=2&redirect=true",
+	}
+	_, err := service.Resolve(context.Background(), dl)
+	if err == nil {
+		t.Fatal("Resolve() error = nil, want a transport error")
+	}
+	if strings.Contains(err.Error(), "SUPERSECRETTOKEN") || strings.Contains(err.Error(), "token=") {
+		t.Fatalf("Resolve() error leaked the account token: %v", err)
+	}
+	if GetLinkError(err) == nil {
+		t.Fatalf("Resolve() error = %v, want a typed link error", err)
+	}
+}
+
+// TestValidateLinkRedactsTokenFromError covers the pre-existing validateLink
+// path the new resolve reuses.
+func TestValidateLinkRedactsTokenFromError(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+	service := New(xsync.NewMap[string, debrid.Client](), nil, nil, nil, &http.Client{Timeout: 2 * time.Second}, 1, zerolog.Nop())
+	dl := types.DownloadLink{
+		Debrid:       "torbox",
+		Filename:     "movie.mkv",
+		Link:         "torbox://1/2",
+		DownloadLink: "http://127.0.0.1:1/api/torrents/requestdl?token=SUPERSECRETTOKEN&torrent_id=1&file_id=2&redirect=true",
+	}
+	err := service.validateLink(context.Background(), &dl)
+	if err == nil {
+		t.Fatal("validateLink() error = nil, want a transport error")
+	}
+	if strings.Contains(err.Error(), "SUPERSECRETTOKEN") || strings.Contains(err.Error(), "token=") {
+		t.Fatalf("validateLink() error leaked the account token: %v", err)
+	}
+	if GetLinkError(err) == nil {
+		t.Fatalf("validateLink() error = %v, want a typed link error", err)
 	}
 }
