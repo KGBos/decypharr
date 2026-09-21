@@ -11,7 +11,10 @@ type Debrid struct {
 	TorboxBreakerThreshold       int      `json:"torbox_breaker_threshold,omitempty"`
 	TorboxBreakerCooldown        string   `json:"torbox_breaker_cooldown,omitempty"`
 	TorboxReadWaitMax            string   `json:"torbox_read_wait_max,omitempty"`
-	Provider                     string   `json:"provider,omitempty"` // realdebrid, alldebrid, debridlink, torbox, premiumize
+	RequestdlBudget              string   `json:"requestdl_budget,omitempty"`        // e.g. 12/minute
+	RequestdlRampSeconds         int      `json:"requestdl_ramp_seconds,omitempty"`  // post-penalty ramp, default 300
+	RequestdlURLCacheTTL         string   `json:"requestdl_url_cache_ttl,omitempty"` // resolved-URL TTL, default 10m
+	Provider                     string   `json:"provider,omitempty"`                // realdebrid, alldebrid, debridlink, torbox, premiumize
 	Name                         string   `json:"name,omitempty"`
 	APIKey                       string   `json:"api_key,omitempty"`
 	DownloadAPIKeys              []string `json:"download_api_keys,omitempty"`
