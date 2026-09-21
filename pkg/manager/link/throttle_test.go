@@ -32,7 +32,10 @@ func TestTorboxHEADBackpressureIsNotCached(t *testing.T) {
 		w.WriteHeader(200)
 	}))
 	defer server.Close()
-	tb, err := torbox.New(config.Debrid{Name: "torbox-test", Provider: "torbox", APIKey: "test", DownloadAPIKeys: []string{"test"}, TorboxBackoffMax: "20ms", TorboxBreakerThreshold: 1, TorboxBreakerCooldown: "20ms"}, nil)
+	// The bucket honors the raw Retry-After independently of
+	// torbox_backoff_max; pin requestdl_freeze_max low here too so this test
+	// keeps exercising recovery instead of a 120s freeze.
+	tb, err := torbox.New(config.Debrid{Name: "torbox-test", Provider: "torbox", APIKey: "test", DownloadAPIKeys: []string{"test"}, TorboxBackoffMax: "20ms", TorboxBreakerThreshold: 1, TorboxBreakerCooldown: "20ms", RequestdlFreezeMax: "20ms"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

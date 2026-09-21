@@ -3,7 +3,6 @@ package torbox
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	stdjson "encoding/json"
 	"fmt"
 	"io"
@@ -45,7 +44,6 @@ type Torbox struct {
 	autoExpiresLinksAfter time.Duration
 	client                *request.Client
 	throttle              *request.Throttle
-	requestdlCache        *request.URLCache[types.DownloadLink]
 	logger                zerolog.Logger
 	Profile               *types.Profile
 	config                config.Debrid
@@ -119,24 +117,51 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 
 	// One shared /requestdl budget per configured provider, used by every
 	// client and worker (API client, download accounts, streaming reads). The
-	// matcher keys on this provider's host so redirect hops to the CDN and
-	// unrelated API calls never consume the budget.
-	limiter, urlCacheTTL := requestdlOptions(dc, backoffMax, _log)
-	throttle.UseRequestdl(limiter, func(r *http.Request) bool {
-		return strings.HasPrefix(r.URL.String(), tb.Host+requestdlPath)
-	})
-	if urlCacheTTL > 0 {
-		tb.requestdlCache = request.NewURLCache[types.DownloadLink](urlCacheTTL)
-	}
+	// matcher keys on this provider's host and exact endpoint path so lookalike
+	// paths, redirect hops to the CDN, and unrelated API calls never consume
+	// the budget.
+	limiter := requestdlOptions(dc, backoffMax, _log)
+	throttle.UseRequestdl(limiter, requestdlMatcher(func() string { return tb.Host }))
 
 	return tb, nil
 }
 
+// requestdlMatcher reports whether a request targets this provider's
+// /requestdl endpoint. Scheme, host, and the full path must match exactly, so
+// a lookalike path (for example "/api/torrents/requestdlX") is not gated and
+// redirect hops to the CDN are never charged to the budget. The host is read
+// through a getter because tests point Host at a local server.
+func requestdlMatcher(host func() string) func(*http.Request) bool {
+	var mu sync.Mutex
+	var lastHost, wantScheme, wantHost, wantPath string
+	resolve := func() (string, string, string) {
+		mu.Lock()
+		defer mu.Unlock()
+		h := host()
+		if h != lastHost || wantPath == "" {
+			lastHost = h
+			if u, err := url.Parse(h); err == nil {
+				wantScheme, wantHost = u.Scheme, u.Host
+				wantPath = strings.TrimSuffix(u.Path, "/") + requestdlPath
+			} else {
+				wantScheme, wantHost, wantPath = "", "", ""
+			}
+		}
+		return wantScheme, wantHost, wantPath
+	}
+	return func(r *http.Request) bool {
+		scheme, matchHost, path := resolve()
+		if path == "" || r.URL == nil {
+			return false
+		}
+		return r.URL.Scheme == scheme && r.URL.Host == matchHost && r.URL.Path == path
+	}
+}
+
 // requestdlOptions parses the shared-budget settings, falling back to safe
 // defaults (with a warning) when a value is missing or invalid, so a typo can
-// never remove the limit. It returns the limiter and the resolved-URL cache
-// TTL; a TTL of zero disables the cache.
-func requestdlOptions(dc config.Debrid, maxBackoff time.Duration, log zerolog.Logger) (*request.RequestdlLimiter, time.Duration) {
+// never remove the limit.
+func requestdlOptions(dc config.Debrid, maxBackoff time.Duration, log zerolog.Logger) *request.RequestdlLimiter {
 	rate := request.DefaultRequestdlBudgetPerMinute
 	if dc.RequestdlBudget != "" {
 		if v, ok := utils.ParseRateValue(dc.RequestdlBudget); ok && v > 0 {
@@ -158,26 +183,21 @@ func requestdlOptions(dc config.Debrid, maxBackoff time.Duration, log zerolog.Lo
 		rampSeconds = request.DefaultRequestdlRampSeconds
 	}
 
-	urlCacheTTL := request.DefaultRequestdlURLCacheTTL
-	if dc.RequestdlURLCacheTTL != "" {
-		if d, err := utils.ParseDuration(dc.RequestdlURLCacheTTL); err == nil && d >= 0 && d <= 48*time.Hour {
-			urlCacheTTL = d
+	freezeMax := request.DefaultRequestdlFreezeMax
+	if dc.RequestdlFreezeMax != "" {
+		if d, err := utils.ParseDuration(dc.RequestdlFreezeMax); err == nil && d > 0 && d <= 48*time.Hour {
+			freezeMax = d
 		} else {
-			log.Warn().Str("requestdl_url_cache_ttl", dc.RequestdlURLCacheTTL).Msg("invalid requestdl_url_cache_ttl; using the default")
+			log.Warn().Str("requestdl_freeze_max", dc.RequestdlFreezeMax).Msg("invalid requestdl_freeze_max; using the default")
 		}
 	}
 
-	limiter := request.NewRequestdlLimiter(rate, time.Duration(rampSeconds)*time.Second, maxBackoff, log)
-	return limiter, urlCacheTTL
+	return request.NewRequestdlLimiter(rate, time.Duration(rampSeconds)*time.Second, maxBackoff, freezeMax, log)
 }
 
 // RequestdlStats exposes the shared /requestdl budget for the local API.
 func (tb *Torbox) RequestdlStats() any {
-	stats := tb.throttle.RequestdlStats()
-	if tb.requestdlCache != nil {
-		stats.CachedURLs = tb.requestdlCache.Len()
-	}
-	return stats
+	return tb.throttle.RequestdlStats()
 }
 
 // RequestThrottle exposes the same provider gate to manager GET/HEAD reads.
@@ -737,14 +757,6 @@ func (tb *Torbox) GetDownloadLink(id string, file *types.File) (types.DownloadLi
 }
 
 func (tb *Torbox) fetchDownloadLink(account *account.Account, id string, file *types.File) (types.DownloadLink, error) {
-	cacheKey := ""
-	if tb.requestdlCache != nil && account != nil {
-		cacheKey = requestdlCacheKey(account.Token, id, file.Id)
-		if cached, ok := tb.requestdlCache.Get(cacheKey); ok {
-			return cached, nil
-		}
-	}
-
 	query := url.Values{}
 	query.Set("token", account.Token)
 	query.Set("torrent_id", id)
@@ -767,19 +779,7 @@ func (tb *Torbox) fetchDownloadLink(account *account.Account, id string, file *t
 		Generated:    now,
 		ExpiresAt:    now.Add(tb.autoExpiresLinksAfter),
 	}
-	if cacheKey != "" {
-		// The cache never outlives the link's own auto_expire deadline.
-		tb.requestdlCache.Set(cacheKey, dl, dl.ExpiresAt)
-	}
 	return dl, nil
-}
-
-// requestdlCacheKey identifies a resolved URL by account, torrent, and file.
-// The account token is hashed so a cache dump cannot expose it; the same file
-// on a different account resolves to a different URL.
-func requestdlCacheKey(token, torrentID, fileID string) string {
-	sum := sha256.Sum256([]byte(token))
-	return fmt.Sprintf("%x:%s:%s", sum[:8], torrentID, fileID)
 }
 
 func (tb *Torbox) GetTorrents() ([]*types.Torrent, error) {

@@ -17,7 +17,11 @@ import (
 const (
 	DefaultRequestdlBudgetPerMinute = 12.0
 	DefaultRequestdlRampSeconds     = 300
-	DefaultRequestdlURLCacheTTL     = 10 * time.Minute
+	// DefaultRequestdlFreezeMax bounds the raw server Retry-After the bucket
+	// honors. It is deliberately independent of torbox_backoff_max so a long
+	// ban freezes the bucket for the full server window even when the breaker
+	// clamps its own cooldown.
+	DefaultRequestdlFreezeMax = 48 * time.Hour
 
 	// MaxRequestdlBudgetPerMinute bounds a misconfigured budget so a typo
 	// cannot remove the limit entirely.
@@ -31,8 +35,6 @@ const (
 	// playback is waiting, so background work cannot hold a token playback
 	// needs.
 	requestdlPriorityPoll = 25 * time.Millisecond
-	// requestdlCacheEntries caps the resolved-URL cache.
-	requestdlCacheEntries = 16384
 )
 
 // Class is the priority lane a /requestdl request belongs to. Playback is the
@@ -105,7 +107,6 @@ type RequestdlStats struct {
 	Denials              uint64    `json:"denials"`
 	PenaltyWindows       uint64    `json:"penalty_windows"`
 	PenaltyUntil         time.Time `json:"penalty_until,omitempty"`
-	CachedURLs           int       `json:"cached_urls"`
 }
 
 // RequestdlLimiter is a process-wide token bucket for one provider's
@@ -135,6 +136,7 @@ type RequestdlLimiter struct {
 	classPause [3]time.Time
 	classFails [3]int
 	maxBackoff time.Duration
+	freezeMax  time.Duration
 
 	waiting   [3]int
 	counts    [3]uint64
@@ -147,8 +149,10 @@ type RequestdlLimiter struct {
 }
 
 // NewRequestdlLimiter builds the shared bucket. Zero or invalid values fall
-// back to safe defaults rather than failing provider construction.
-func NewRequestdlLimiter(ratePerMinute float64, rampPeriod, maxBackoff time.Duration, log zerolog.Logger) *RequestdlLimiter {
+// back to safe defaults rather than failing provider construction. maxBackoff
+// bounds the per-class 5xx jitter; freezeMax bounds the raw server Retry-After
+// the bucket honors for a 429.
+func NewRequestdlLimiter(ratePerMinute float64, rampPeriod, maxBackoff, freezeMax time.Duration, log zerolog.Logger) *RequestdlLimiter {
 	if !(ratePerMinute > 0) || math.IsInf(ratePerMinute, 0) || math.IsNaN(ratePerMinute) {
 		ratePerMinute = DefaultRequestdlBudgetPerMinute
 	}
@@ -161,10 +165,14 @@ func NewRequestdlLimiter(ratePerMinute float64, rampPeriod, maxBackoff time.Dura
 	if maxBackoff <= 0 {
 		maxBackoff = 5 * time.Minute
 	}
+	if freezeMax <= 0 {
+		freezeMax = DefaultRequestdlFreezeMax
+	}
 	l := &RequestdlLimiter{
 		ratePerSec: ratePerMinute / 60,
 		rampPeriod: rampPeriod,
 		maxBackoff: maxBackoff,
+		freezeMax:  freezeMax,
 		log:        log,
 		now:        time.Now,
 		sleep:      sleepContext,
@@ -189,6 +197,16 @@ func (l *RequestdlLimiter) RampPeriod() time.Duration {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.rampPeriod
+}
+
+// FreezeMax is the ceiling on the raw server Retry-After the bucket honors.
+func (l *RequestdlLimiter) FreezeMax() time.Duration {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.freezeMax
 }
 
 // CurrentRatePerMinute is the ramped rate in effect right now.
@@ -326,11 +344,11 @@ func (l *RequestdlLimiter) rateNowLocked(now time.Time) float64 {
 }
 
 // Observe records a /requestdl response. A 429 freezes the whole bucket for
-// the penalty window the circuit breaker is already honoring (the server's
-// Retry-After, possibly bounded by torbox_backoff_max) and arms the post-window
-// ramp; 5xx pauses only the request's class with a bounded full-jitter backoff.
-// penalty is the breaker's remaining cooldown; zero falls back to this
-// limiter's own Retry-After/jitter handling.
+// the server's raw Retry-After (bounded only by requestdl_freeze_max), never
+// for the breaker's clamped cooldown, and arms the post-window ramp; 5xx pauses
+// only the request's class with a bounded full-jitter backoff. penalty is the
+// breaker's remaining cooldown and is used as a floor, so an escalated breaker
+// wait still holds the bucket even without server advice.
 func (l *RequestdlLimiter) Observe(resp *http.Response, class Class, penalty time.Duration) {
 	if l == nil || resp == nil {
 		return
@@ -344,12 +362,14 @@ func (l *RequestdlLimiter) Observe(resp *http.Response, class Class, penalty tim
 		l.penalties++
 		l.classFails[class]++
 		wait := penalty
-		if wait <= 0 {
-			if serverWait, ok := retryAfterWait(resp); ok && serverWait > 0 {
-				wait = serverWait
-			} else {
-				wait = l.fullJitterLocked(class)
+		if serverWait, ok := retryAfterWait(resp); ok && serverWait > 0 {
+			if serverWait > l.freezeMax {
+				serverWait = l.freezeMax
 			}
+			wait = max(wait, serverWait)
+		}
+		if wait <= 0 {
+			wait = l.fullJitterLocked(class)
 		}
 		if until := now.Add(wait); until.After(l.penaltyUntil) {
 			l.penaltyUntil = until
@@ -451,116 +471,4 @@ func (l *RequestdlLimiter) requestdlLogFields(ev *zerolog.Event) {
 		Uint64("requestdl_probe", stats.RequestsProbe).
 		Uint64("requestdl_denials", stats.Denials).
 		Uint64("requestdl_penalty_windows", stats.PenaltyWindows)
-}
-
-// URLCache is a TTL cache of resolved download URLs keyed by torrent+file. It
-// is safe for concurrent use and tolerates a nil receiver so callers can leave
-// it disabled ("requestdl_url_cache_ttl": "0s").
-type URLCache[T any] struct {
-	mu      sync.Mutex
-	ttl     time.Duration
-	max     int
-	entries map[string]urlCacheEntry[T]
-	now     func() time.Time
-}
-
-type urlCacheEntry[T any] struct {
-	value   T
-	expires time.Time
-}
-
-// NewURLCache builds a cache with the given TTL. A non-positive TTL disables
-// it, in which case Get always misses.
-func NewURLCache[T any](ttl time.Duration) *URLCache[T] {
-	return &URLCache[T]{
-		ttl:     ttl,
-		max:     requestdlCacheEntries,
-		entries: make(map[string]urlCacheEntry[T]),
-		now:     time.Now,
-	}
-}
-
-// Get returns the cached value for key when it is still within the TTL and
-// before the caller-supplied absolute deadline.
-func (c *URLCache[T]) Get(key string) (T, bool) {
-	var zero T
-	if c == nil || c.ttl <= 0 {
-		return zero, false
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	entry, ok := c.entries[key]
-	if !ok {
-		return zero, false
-	}
-	if !c.now().Before(entry.expires) {
-		delete(c.entries, key)
-		return zero, false
-	}
-	return entry.value, true
-}
-
-// Set stores value for key. notAfter caps the entry lifetime (for example the
-// link's auto_expire deadline); a zero value means the TTL is the only cap.
-func (c *URLCache[T]) Set(key string, value T, notAfter time.Time) {
-	if c == nil || c.ttl <= 0 {
-		return
-	}
-	now := c.now()
-	expires := now.Add(c.ttl)
-	if !notAfter.IsZero() && notAfter.Before(expires) {
-		expires = notAfter
-	}
-	if !now.Before(expires) {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.entries[key]; !ok && len(c.entries) >= c.max {
-		c.pruneLocked(now)
-	}
-	c.entries[key] = urlCacheEntry[T]{value: value, expires: expires}
-}
-
-// Len reports the number of unexpired entries.
-func (c *URLCache[T]) Len() int {
-	if c == nil {
-		return 0
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := c.now()
-	count := 0
-	for key, entry := range c.entries {
-		if now.Before(entry.expires) {
-			count++
-		} else {
-			delete(c.entries, key)
-		}
-	}
-	return count
-}
-
-// Delete drops one key; used when a link is invalidated.
-func (c *URLCache[T]) Delete(key string) {
-	if c == nil {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.entries, key)
-}
-
-func (c *URLCache[T]) pruneLocked(now time.Time) {
-	for key, entry := range c.entries {
-		if !now.Before(entry.expires) {
-			delete(c.entries, key)
-		}
-	}
-	for key := range c.entries {
-		if len(c.entries) < c.max {
-			break
-		}
-		delete(c.entries, key)
-	}
 }

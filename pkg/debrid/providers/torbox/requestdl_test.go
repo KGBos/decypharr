@@ -10,28 +10,26 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/request"
-	"github.com/sirrobot01/decypharr/pkg/debrid/account"
-	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 )
 
 func TestRequestdlOptionsDefaults(t *testing.T) {
-	limiter, ttl := requestdlOptions(config.Debrid{}, 5*time.Minute, zerolog.Nop())
+	limiter := requestdlOptions(config.Debrid{}, 5*time.Minute, zerolog.Nop())
 	if got := limiter.BudgetPerMinute(); got != request.DefaultRequestdlBudgetPerMinute {
 		t.Fatalf("budget = %v, want %v", got, request.DefaultRequestdlBudgetPerMinute)
-	}
-	if ttl != request.DefaultRequestdlURLCacheTTL {
-		t.Fatalf("url cache ttl = %s, want %s", ttl, request.DefaultRequestdlURLCacheTTL)
 	}
 	if got := limiter.RampPeriod(); got != time.Duration(request.DefaultRequestdlRampSeconds)*time.Second {
 		t.Fatalf("ramp = %s, want %ds", got, request.DefaultRequestdlRampSeconds)
 	}
+	if got := limiter.FreezeMax(); got != request.DefaultRequestdlFreezeMax {
+		t.Fatalf("freeze max = %s, want %s", got, request.DefaultRequestdlFreezeMax)
+	}
 }
 
 func TestRequestdlOptionsOverrides(t *testing.T) {
-	limiter, ttl := requestdlOptions(config.Debrid{
+	limiter := requestdlOptions(config.Debrid{
 		RequestdlBudget:      "120/minute",
 		RequestdlRampSeconds: 60,
-		RequestdlURLCacheTTL: "2m",
+		RequestdlFreezeMax:   "2h",
 	}, 5*time.Minute, zerolog.Nop())
 	if got := limiter.BudgetPerMinute(); got != 120 {
 		t.Fatalf("budget = %v, want 120", got)
@@ -39,16 +37,16 @@ func TestRequestdlOptionsOverrides(t *testing.T) {
 	if got := limiter.RampPeriod(); got != time.Minute {
 		t.Fatalf("ramp = %s, want 1m", got)
 	}
-	if ttl != 2*time.Minute {
-		t.Fatalf("url cache ttl = %s, want 2m", ttl)
+	if got := limiter.FreezeMax(); got != 2*time.Hour {
+		t.Fatalf("freeze max = %s, want 2h", got)
 	}
 }
 
 func TestRequestdlOptionsInvalidFallBackToDefaults(t *testing.T) {
-	limiter, ttl := requestdlOptions(config.Debrid{
+	limiter := requestdlOptions(config.Debrid{
 		RequestdlBudget:      "bogus",
 		RequestdlRampSeconds: -5,
-		RequestdlURLCacheTTL: "not-a-duration",
+		RequestdlFreezeMax:   "not-a-duration",
 	}, 5*time.Minute, zerolog.Nop())
 	if got := limiter.BudgetPerMinute(); got != request.DefaultRequestdlBudgetPerMinute {
 		t.Fatalf("invalid budget = %v, want the default", got)
@@ -56,104 +54,85 @@ func TestRequestdlOptionsInvalidFallBackToDefaults(t *testing.T) {
 	if got := limiter.RampPeriod(); got != time.Duration(request.DefaultRequestdlRampSeconds)*time.Second {
 		t.Fatalf("invalid ramp = %s, want the default", got)
 	}
-	if ttl != request.DefaultRequestdlURLCacheTTL {
-		t.Fatalf("invalid ttl = %s, want the default", ttl)
+	if got := limiter.FreezeMax(); got != request.DefaultRequestdlFreezeMax {
+		t.Fatalf("invalid freeze max = %s, want the default", got)
+	}
+
+	// A freeze max above the 48h ceiling is rejected rather than applied.
+	over := requestdlOptions(config.Debrid{RequestdlFreezeMax: "72h"}, time.Minute, zerolog.Nop())
+	if got := over.FreezeMax(); got != request.DefaultRequestdlFreezeMax {
+		t.Fatalf("72h freeze max = %s, want the default", got)
 	}
 }
 
 func TestRequestdlOptionsCapsRunawayBudget(t *testing.T) {
-	limiter, _ := requestdlOptions(config.Debrid{RequestdlBudget: "100000/minute"}, time.Minute, zerolog.Nop())
+	limiter := requestdlOptions(config.Debrid{RequestdlBudget: "100000/minute"}, time.Minute, zerolog.Nop())
 	if got := limiter.BudgetPerMinute(); got != request.MaxRequestdlBudgetPerMinute {
 		t.Fatalf("runaway budget = %v, want the cap %v", got, request.MaxRequestdlBudgetPerMinute)
 	}
 }
 
-func TestRequestdlOptionsCanDisableURLCache(t *testing.T) {
-	_, ttl := requestdlOptions(config.Debrid{RequestdlURLCacheTTL: "0s"}, time.Minute, zerolog.Nop())
-	if ttl != 0 {
-		t.Fatalf("explicit 0s ttl = %s, want disabled", ttl)
+func TestRequestdlMatcherRequiresExactPath(t *testing.T) {
+	matcher := requestdlMatcher(func() string { return "https://api.torbox.app/v1" })
+	cases := []struct {
+		url   string
+		match bool
+	}{
+		{"https://api.torbox.app/v1/api/torrents/requestdl?token=x", true},
+		{"https://api.torbox.app/v1/api/torrents/requestdl", true},
+		// Lookalike path must not match.
+		{"https://api.torbox.app/v1/api/torrents/requestdlX", false},
+		{"https://api.torbox.app/v1/api/torrents/requestdl/extra", false},
+		// Same path on a different host (a CDN redirect target) must not match.
+		{"https://cdn.torbox.app/v1/api/torrents/requestdl?token=x", false},
+		// Unrelated API traffic must not match.
+		{"https://api.torbox.app/v1/api/torrents/mylist", false},
+	}
+	for _, tc := range cases {
+		req, err := http.NewRequest(http.MethodGet, tc.url, nil)
+		if err != nil {
+			t.Fatalf("bad test URL %q: %v", tc.url, err)
+		}
+		if got := matcher(req); got != tc.match {
+			t.Errorf("matcher(%q) = %v, want %v", tc.url, got, tc.match)
+		}
 	}
 }
 
-func testTorboxWithCache(autoExpire, cacheTTL time.Duration) *Torbox {
-	return &Torbox{
-		Host:                  "https://api.torbox.app/v1",
-		logger:                zerolog.Nop(),
-		config:                config.Debrid{Name: "torbox"},
-		autoExpiresLinksAfter: autoExpire,
-		requestdlCache:        request.NewURLCache[types.DownloadLink](cacheTTL),
-	}
-}
+func TestRequestdlFreezeHonorsRawRetryAfterThroughTransport(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "2302")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
 
-func TestFetchDownloadLinkCachesWithinTTL(t *testing.T) {
-	tb := testTorboxWithCache(time.Hour, time.Minute)
-	acc := &account.Account{Token: "token-a", Debrid: "torbox"}
-	file := &types.File{Id: "2", Name: "movie.mkv", Size: 10, Link: "torbox://1/2"}
+	// The breaker's own cooldown is clamped to 1s; the bucket must not inherit
+	// that clamp for the raw 2302s server window.
+	tb, err := New(config.Debrid{
+		Name:                   "torbox-test",
+		Provider:               "torbox",
+		APIKey:                 "test",
+		DownloadAPIKeys:        []string{"test"},
+		TorboxBackoffMax:       "1s",
+		TorboxBreakerThreshold: 1,
+		TorboxBreakerCooldown:  "1s",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb.Host = server.URL
 
-	first, err := tb.fetchDownloadLink(acc, "1", file)
-	if err != nil {
-		t.Fatal(err)
+	req, _ := http.NewRequest(http.MethodGet, server.URL+"/api/torrents/requestdl?token=test", nil)
+	if _, err := tb.throttle.Do(server.Client(), req); request.BackpressureError(err) == nil {
+		t.Fatalf("expected backpressure, got %v", err)
 	}
-	second, err := tb.fetchDownloadLink(acc, "1", file)
-	if err != nil {
-		t.Fatal(err)
+	if breaker := tb.throttle.Remaining(); breaker > 2*time.Second {
+		t.Fatalf("breaker clamp changed: %s", breaker)
 	}
-	if !first.Generated.Equal(second.Generated) || first.DownloadLink != second.DownloadLink {
-		t.Fatal("repeat resolution was not served from the URL cache")
-	}
-
-	// The key includes the file and the account, so neither reuses the entry.
-	otherFile, err := tb.fetchDownloadLink(acc, "1", &types.File{Id: "3", Name: "other.mkv", Size: 10, Link: "torbox://1/3"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if otherFile.DownloadLink == first.DownloadLink {
-		t.Fatal("cache key ignored the file id")
-	}
-	otherAccount, err := tb.fetchDownloadLink(&account.Account{Token: "token-b", Debrid: "torbox"}, "1", file)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if otherAccount.DownloadLink == first.DownloadLink {
-		t.Fatal("cache key ignored the account")
-	}
-}
-
-func TestFetchDownloadLinkCacheExpires(t *testing.T) {
-	tb := testTorboxWithCache(time.Hour, time.Millisecond)
-	acc := &account.Account{Token: "token-a", Debrid: "torbox"}
-	file := &types.File{Id: "2", Name: "movie.mkv", Size: 10, Link: "torbox://1/2"}
-
-	first, err := tb.fetchDownloadLink(acc, "1", file)
-	if err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(5 * time.Millisecond)
-	second, err := tb.fetchDownloadLink(acc, "1", file)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first.Generated.Equal(second.Generated) {
-		t.Fatal("entry survived past its TTL")
-	}
-}
-
-func TestFetchDownloadLinkRespectsAutoExpire(t *testing.T) {
-	tb := testTorboxWithCache(2*time.Millisecond, time.Hour)
-	acc := &account.Account{Token: "token-a", Debrid: "torbox"}
-	file := &types.File{Id: "2", Name: "movie.mkv", Size: 10, Link: "torbox://1/2"}
-
-	first, err := tb.fetchDownloadLink(acc, "1", file)
-	if err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(6 * time.Millisecond)
-	second, err := tb.fetchDownloadLink(acc, "1", file)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first.Generated.Equal(second.Generated) {
-		t.Fatal("URL cache outlived auto_expire_links_after")
+	stats := tb.RequestdlStats().(request.RequestdlStats)
+	if remaining := time.Until(stats.PenaltyUntil); remaining < 2300*time.Second {
+		t.Fatalf("bucket freeze = %s, want >= 2300s (raw Retry-After, not the 1s breaker clamp)", remaining)
 	}
 }
 
@@ -199,31 +178,21 @@ func TestRequestdlBudgetGovernsOnlyRequestdl(t *testing.T) {
 		t.Fatalf("requestdl call not counted: %+v", stats)
 	}
 
-	// A plain API call must not consume the /requestdl budget or create a
-	// resolved-URL cache entry.
-	req, _ = http.NewRequest(http.MethodGet, server.URL+"/api/torrents/mylist", nil)
-	resp, err = tb.throttle.Do(server.Client(), req)
-	if err != nil {
-		t.Fatal(err)
+	// A plain API call must not consume the /requestdl budget, nor must a
+	// lookalike path.
+	for _, path := range []string{"/api/torrents/mylist", "/api/torrents/requestdlX"} {
+		req, _ = http.NewRequest(http.MethodGet, server.URL+path, nil)
+		resp, err = tb.throttle.Do(server.Client(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
 	}
-	resp.Body.Close()
 	stats = tb.RequestdlStats().(request.RequestdlStats)
-	if stats.RequestsBackground != 1 || stats.CachedURLs != 0 {
+	if stats.RequestsBackground != 1 {
 		t.Fatalf("non-requestdl traffic consumed the budget: %+v", stats)
 	}
-	if calls.Load() != 2 {
-		t.Fatalf("wire calls = %d, want 2", calls.Load())
-	}
-}
-
-func TestRequestdlStatsReportsCachedURLs(t *testing.T) {
-	tb := testTorboxWithCache(time.Hour, time.Minute)
-	acc := &account.Account{Token: "token-a", Debrid: "torbox"}
-	if _, err := tb.fetchDownloadLink(acc, "1", &types.File{Id: "2", Name: "movie.mkv", Size: 10, Link: "torbox://1/2"}); err != nil {
-		t.Fatal(err)
-	}
-	stats := tb.RequestdlStats().(request.RequestdlStats)
-	if stats.CachedURLs != 1 {
-		t.Fatalf("cached urls = %d, want 1", stats.CachedURLs)
+	if calls.Load() != 3 {
+		t.Fatalf("wire calls = %d, want 3", calls.Load())
 	}
 }
