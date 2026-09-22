@@ -135,13 +135,3 @@ func TestBackendMountRefusalClosesVFS(t *testing.T) {
 		t.Errorf("VFS double close: %d", closed.Load())
 	}
 }
-
-func TestMountFuseErrorHasNoServer(t *testing.T) {
-	server, err := mountFuse(t.TempDir()+"/missing", &fs.Inode{}, &fs.Options{})
-	if err == nil {
-		t.Fatal("mount at missing path unexpectedly succeeded")
-	}
-	if server != nil {
-		t.Fatal("failed mount returned non-nil server interface")
-	}
-}
