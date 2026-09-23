@@ -59,6 +59,10 @@ func BackpressureError(err error) *ThrottleError {
 // Throttle is shared by a configured provider's API and streaming clients.
 // Only actual responses count; rejected requests do not extend the cooldown.
 type Throttle struct {
+	// wireMu serializes response-header round trips and their observations.
+	// A caller that acquires it after a 429 cannot start a wire request before
+	// the same gate has recorded the server deadline.
+	wireMu                              sync.Mutex
 	mu                                  sync.Mutex
 	threshold, consecutive              int
 	escalation                          int
@@ -233,6 +237,11 @@ func (b *Throttle) Observe(resp *http.Response, read bool) {
 	b.consecutive++
 	serverWait, hasServerWait := retryAfterWait(resp)
 	wait := retryAfterBackoff(time.Second, b.backoffMax, b.consecutive-1, resp)
+	// Retry-After is a provider deadline, not a suggested backoff. The local
+	// backoff ceiling applies only when the provider gives no usable deadline.
+	if hasServerWait {
+		wait = serverWait
+	}
 	opening := !b.open && b.consecutive >= b.threshold
 	if b.consecutive >= b.threshold {
 		// A re-trip (consecutive beyond the threshold, no success since the
@@ -388,9 +397,16 @@ func (t *throttleTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		if err := limiter.Take(ctx, class); err != nil {
 			return nil, err
 		}
-		if err := gate(); err != nil {
-			return nil, err
-		}
+	}
+	t.throttle.wireMu.Lock()
+	defer t.throttle.wireMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// This admission and the response observation are serialized. Earlier
+	// checks avoid waiting for the wire lock while an existing ban is known.
+	if err := t.throttle.Before(); err != nil {
+		return nil, err
 	}
 	t.throttle.mu.Lock()
 	t.throttle.requests++

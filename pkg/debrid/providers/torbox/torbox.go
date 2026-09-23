@@ -3,6 +3,7 @@ package torbox
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	stdjson "encoding/json"
 	"fmt"
 	"io"
@@ -37,6 +38,19 @@ var planSlots = map[string]int{
 	"pro":       10,
 }
 
+// A manager reload may construct a second TorBox client while old workers are
+// still alive. Keep their gate (and requestdl budget) shared for the process
+// lifetime so a new client cannot forget an active provider ban.
+var sharedThrottle = struct {
+	sync.Mutex
+	byProvider map[throttleKey]*request.Throttle
+}{byProvider: make(map[throttleKey]*request.Throttle)}
+
+type throttleKey struct {
+	configPath string
+	apiKeyHash [sha256.Size]byte
+}
+
 type Torbox struct {
 	Host                  string `json:"host"`
 	APIKey                string
@@ -63,6 +77,9 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 	if err != nil {
 		return nil, err
 	}
+	key := throttleKey{config.GetMainPath(), sha256.Sum256([]byte(dc.APIKey))}
+	sharedThrottle.Lock()
+	defer sharedThrottle.Unlock()
 	headers := map[string]string{
 		"Authorization": fmt.Sprintf("Bearer %s", dc.APIKey),
 	}
@@ -72,10 +89,10 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 		headers["User-Agent"] = fmt.Sprintf("Decypharr/%s (%s; %s)", version.GetInfo(), runtime.GOOS, runtime.GOARCH)
 	}
 	_log := logger.New(dc.Name)
-	throttle := request.NewThrottle(threshold, cooldown, backoffMax, _log).WithReadWait(readWait)
-	// One ticker per configured provider for the provider's process lifetime;
-	// it exits with the process, so there is nothing to leak per request.
-	throttle.StartCounterLogging(context.Background(), request.CounterLogInterval)
+	throttle, existing := sharedThrottle.byProvider[key]
+	if !existing {
+		throttle = request.NewThrottle(threshold, cooldown, backoffMax, _log).WithReadWait(readWait)
+	}
 
 	// TorBox enforces a hard cap of 300 req/min per API key, applied
 	// synchronously across all servers since v8.4 (Feb 2026, GAP-002).
@@ -120,8 +137,13 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 	// matcher keys on this provider's host and exact endpoint path so lookalike
 	// paths, redirect hops to the CDN, and unrelated API calls never consume
 	// the budget.
-	limiter := requestdlOptions(dc, backoffMax, _log)
-	throttle.UseRequestdl(limiter, requestdlMatcher(func() string { return tb.Host }))
+	if !existing {
+		limiter := requestdlOptions(dc, backoffMax, _log)
+		throttle.UseRequestdl(limiter, requestdlMatcher(func() string { return tb.Host }))
+		// One ticker per provider gate, including across manager reloads.
+		throttle.StartCounterLogging(context.Background(), request.CounterLogInterval)
+		sharedThrottle.byProvider[key] = throttle
+	}
 
 	return tb, nil
 }

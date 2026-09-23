@@ -32,7 +32,7 @@ func TestTorboxHEADBackpressureIsNotCached(t *testing.T) {
 			return
 		}
 		if calls.Add(1) == 1 {
-			w.Header().Set("Retry-After", "120")
+			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(429)
 			return
 		}
@@ -59,7 +59,7 @@ func TestTorboxHEADBackpressureIsNotCached(t *testing.T) {
 	if tb.AccountManager().Current().Disabled.Load() {
 		t.Fatal("throttle disabled account")
 	}
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(1100 * time.Millisecond)
 	dl, err := service.GetLink(context.Background(), entry, "file")
 	if err != nil || dl.Empty() || calls.Load() != 2 {
 		t.Fatalf("HEAD did not recover automatically: %v, calls=%d", err, calls.Load())
