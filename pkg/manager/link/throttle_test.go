@@ -20,16 +20,24 @@ import (
 func TestTorboxHEADBackpressureIsNotCached(t *testing.T) {
 	config.SetConfigPath(t.TempDir())
 	var calls atomic.Int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "HEAD" {
-			t.Errorf("unexpected %s", r.Method)
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/cdn" && r.Method == http.MethodHead {
+			w.WriteHeader(200)
+			return
+		}
+		if r.URL.Path != "/api/torrents/requestdl" || r.Method != http.MethodGet {
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(404)
+			return
 		}
 		if calls.Add(1) == 1 {
 			w.Header().Set("Retry-After", "120")
 			w.WriteHeader(429)
 			return
 		}
-		w.WriteHeader(200)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"data":"` + server.URL + `/cdn"}`))
 	}))
 	defer server.Close()
 	// The bucket honors the raw Retry-After independently of
@@ -55,5 +63,8 @@ func TestTorboxHEADBackpressureIsNotCached(t *testing.T) {
 	dl, err := service.GetLink(context.Background(), entry, "file")
 	if err != nil || dl.Empty() || calls.Load() != 2 {
 		t.Fatalf("HEAD did not recover automatically: %v, calls=%d", err, calls.Load())
+	}
+	if stats := tb.RequestdlStats().(request.RequestdlStats); stats.RequestsPlayback != 2 {
+		t.Fatalf("requestdl was not charged to playback: %+v", stats)
 	}
 }
