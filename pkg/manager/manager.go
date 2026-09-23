@@ -438,7 +438,7 @@ func (m *Manager) Stop() error {
 	if m.mountManager != nil {
 		m.logger.Info().Msg("Stopping mount manager")
 		if err := m.mountManager.Stop(); err != nil {
-			m.logger.Warn().Err(err).Msg("Failed to stop mount manager")
+			return fmt.Errorf("failed to stop mount manager: %w", err)
 		}
 	}
 
@@ -490,7 +490,7 @@ func (m *Manager) Reset() error {
 
 	// Stop resources before resetting
 	if err := m.Stop(); err != nil {
-		m.logger.Warn().Err(err).Msg("Failed to stop manager during reset")
+		return fmt.Errorf("failed to stop manager during reset: %w", err)
 	}
 
 	// Reopen storage database (it was closed by Stop)
