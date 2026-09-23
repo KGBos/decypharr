@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
@@ -128,6 +129,13 @@ func (s *Service) fetchAndValidate(ctx context.Context, entry *storage.Entry, fi
 	// Check if we've already validated this link
 	if validationErr, exists := s.validated.Load(link.DownloadLink); exists {
 		if validationErr == nil {
+			// Re-fetch if the cached CDN URL has passed its declared expiry.
+			// Without this check a 3-hour TorBox CDN URL would be served from
+			// s.validated forever — bypassing the HEAD validation that would
+			// otherwise catch the expired URL.
+			if !link.ExpiresAt.IsZero() && time.Now().After(link.ExpiresAt) {
+				return s.invalidateAndRefetch(ctx, entry, link, attempt)
+			}
 			return link, nil // Already validated successfully
 		}
 		// Previous validation failed - check if we should retry
@@ -278,8 +286,16 @@ func (s *Service) fetchLink(ctx context.Context, entry *storage.Entry, filename 
 		Deleted:   file.Deleted,
 	}
 
-	// This uses account-level caching internally
-	downloadLink, err := client.GetDownloadLink(placement.ID, debridFile)
+	// TorBox resolves its requestdl placeholder with the caller's playback
+	// context. Its plain GetDownloadLink remains free of network calls for repair.
+	var downloadLink types.DownloadLink
+	if playback, ok := client.(interface {
+		GetDownloadLinkForPlayback(context.Context, string, *types.File) (types.DownloadLink, error)
+	}); ok {
+		downloadLink, err = playback.GetDownloadLinkForPlayback(request.WithClass(ctx, request.ClassPlayback), placement.ID, debridFile)
+	} else {
+		downloadLink, err = client.GetDownloadLink(placement.ID, debridFile)
+	}
 	if err != nil {
 		return downloadLink, err
 	}

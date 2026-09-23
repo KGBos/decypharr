@@ -756,6 +756,73 @@ func (tb *Torbox) GetDownloadLink(id string, file *types.File) (types.DownloadLi
 	return tb.accountsManager.GetDownloadLink(id, file, tb.fetchDownloadLink)
 }
 
+// GetDownloadLinkForPlayback resolves the CDN URL only when a consumer will
+// read the file. Repair probes continue to use the network-free GetDownloadLink.
+func (tb *Torbox) GetDownloadLinkForPlayback(ctx context.Context, id string, file *types.File) (types.DownloadLink, error) {
+	dl, err := tb.GetDownloadLink(id, file)
+	if err != nil || dl.Empty() {
+		return dl, err
+	}
+	if !strings.HasPrefix(dl.DownloadLink, tb.Host+requestdlPath+"?") && (dl.ExpiresAt.IsZero() || time.Now().Before(dl.ExpiresAt)) {
+		return dl, nil
+	}
+	account, err := tb.accountsManager.GetAccount(dl.Token)
+	if err != nil {
+		return types.DownloadLink{}, err
+	}
+	resolved, err := tb.resolveDownloadLink(ctx, account, id, file)
+	if err != nil {
+		// Never leave a requestdl placeholder (or expired CDN URL) in the
+		// account cache after resolution failed.
+		_ = tb.DeleteLink(dl)
+		return types.DownloadLink{}, err
+	}
+	// A repair probe may have cached the cheap placeholder. Replace it only
+	// after a complete, successful response; failures leave no CDN URL stored.
+	tb.accountsManager.StoreDownloadLink(resolved)
+	return resolved, nil
+}
+
+func (tb *Torbox) resolveDownloadLink(ctx context.Context, account *account.Account, id string, file *types.File) (types.DownloadLink, error) {
+	query := url.Values{}
+	query.Set("token", account.Token)
+	query.Set("torrent_id", id)
+	query.Set("file_id", file.Id)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tb.Host+requestdlPath+"?"+query.Encode(), nil)
+	if err != nil {
+		return types.DownloadLink{}, request.RedactURLError(err)
+	}
+	resp, err := tb.client.DoOnce(req)
+	if err != nil {
+		return types.DownloadLink{}, request.RedactURLError(err)
+	}
+	defer request.DrainAndClose(resp.Body)
+	if resp.StatusCode == http.StatusTooManyRequests && tb.throttle != nil {
+		return types.DownloadLink{}, &request.ThrottleError{RetryAfter: tb.throttle.Remaining()}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return types.DownloadLink{}, fmt.Errorf("torbox requestdl error: HTTP %d", resp.StatusCode)
+	}
+	var result DownloadLinksResponse
+	if err := json.ConfigDefault.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return types.DownloadLink{}, fmt.Errorf("torbox requestdl response: %w", err)
+	}
+	if !result.Success || result.Data == nil || *result.Data == "" {
+		return types.DownloadLink{}, fmt.Errorf("torbox requestdl returned no CDN URL")
+	}
+	expiry := 3 * time.Hour
+	if tb.autoExpiresLinksAfter > 0 && tb.autoExpiresLinksAfter < expiry {
+		expiry = tb.autoExpiresLinksAfter
+	}
+	now := time.Now()
+	dl := types.DownloadLink{Filename: file.Name, Size: file.Size, Token: account.Token, Link: file.Link,
+		DownloadLink: *result.Data, Debrid: tb.config.Name, Id: file.Id, Generated: now, ExpiresAt: now.Add(expiry)}
+	if err := dl.Valid(); err != nil {
+		return types.DownloadLink{}, fmt.Errorf("torbox requestdl returned invalid CDN URL: %w", err)
+	}
+	return dl, nil
+}
+
 func (tb *Torbox) fetchDownloadLink(account *account.Account, id string, file *types.File) (types.DownloadLink, error) {
 	query := url.Values{}
 	query.Set("token", account.Token)
@@ -771,7 +838,7 @@ func (tb *Torbox) fetchDownloadLink(account *account.Account, id string, file *t
 	dl := types.DownloadLink{
 		Filename:     file.Name,
 		Size:         file.Size,
-		Token:        tb.APIKey,
+		Token:        account.Token,
 		Link:         file.Link,
 		DownloadLink: downloadURL,
 		Debrid:       tb.config.Name,
