@@ -52,10 +52,12 @@ func TestThrottleOpensAndRecovers(t *testing.T) {
 	now := time.Now()
 	b := NewThrottle(3, time.Minute, 5*time.Minute, zerolog.Nop())
 	b.now = func() time.Time { return now }
-	resp := &http.Response{StatusCode: 429, Header: make(http.Header)}
+	resp := &http.Response{StatusCode: 429, Header: http.Header{"Retry-After": {"40"}}}
 	for i := 0; i < 3; i++ {
-		if err := b.Before(); err != nil {
-			t.Fatal(err)
+		if i == 0 {
+			if err := b.Before(); err != nil {
+				t.Fatal(err)
+			}
 		}
 		b.Observe(resp, false)
 		if i < 2 {
@@ -454,7 +456,7 @@ func TestReadWaitsOutShortCooldownThenSucceeds(t *testing.T) {
 		now = now.Add(d)
 		return nil
 	}
-	b.Observe(&http.Response{StatusCode: 429, Header: make(http.Header)}, false)
+	b.Observe(&http.Response{StatusCode: 429, Header: http.Header{"Retry-After": {"60"}}}, false)
 	if got := b.Remaining(); got != time.Minute {
 		t.Fatalf("cooldown: %s", got)
 	}
@@ -511,7 +513,7 @@ func TestReadFailsFastOnLongCooldown(t *testing.T) {
 // The blocking wait must honor request cancellation.
 func TestReadWaitInterruptedByContext(t *testing.T) {
 	b := NewThrottle(1, time.Minute, 5*time.Minute, zerolog.Nop()).WithReadWait(90 * time.Second)
-	b.Observe(&http.Response{StatusCode: 429, Header: make(http.Header)}, false)
+	b.Observe(&http.Response{StatusCode: 429, Header: http.Header{"Retry-After": {"60"}}}, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	b.sleep = func(sleepCtx context.Context, d time.Duration) error {
 		cancel()

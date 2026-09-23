@@ -92,6 +92,13 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 	throttle, existing := sharedThrottle.byProvider[key]
 	if !existing {
 		throttle = request.NewThrottle(threshold, cooldown, backoffMax, _log).WithReadWait(readWait)
+		if key.configPath == "" {
+			return nil, fmt.Errorf("TorBox gate requires a persistent config path")
+		}
+		statePath := filepath.Join(key.configPath, "torbox-gate", fmt.Sprintf("%x.json", key.apiKeyHash))
+		if err := throttle.WithPersistentState(statePath); err != nil {
+			return nil, fmt.Errorf("TorBox gate state unavailable: %w", err)
+		}
 	}
 
 	// TorBox enforces a hard cap of 300 req/min per API key, applied
