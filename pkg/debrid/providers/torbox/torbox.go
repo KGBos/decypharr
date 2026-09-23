@@ -388,6 +388,33 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 		"magnet": torrent.Magnet.Link,
 	}
 	if !torrent.DownloadUncached {
+		hash := torrent.InfoHash
+		if hash == "" && torrent.Magnet != nil {
+			hash = torrent.Magnet.InfoHash
+		}
+		if hash == "" {
+			return nil, fmt.Errorf("missing info hash for TorBox cache check")
+		}
+		var availability AvailableResponse
+		check, err := tb.doGet("/api/torrents/checkcached", map[string]string{"hash": hash}, &availability)
+		if err != nil {
+			return nil, fmt.Errorf("TorBox cache check failed: %w", err)
+		}
+		if check.StatusCode < 200 || check.StatusCode >= 300 || !availability.Success {
+			return nil, fmt.Errorf("TorBox cache check failed: Status: %d", check.StatusCode)
+		}
+		cached := false
+		if availability.Data != nil {
+			for candidate, item := range *availability.Data {
+				if strings.EqualFold(candidate, hash) && item.Size > 0 {
+					cached = true
+					break
+				}
+			}
+		}
+		if !cached {
+			return nil, fmt.Errorf("DOWNLOAD_NOT_CACHED")
+		}
 		formData["add_only_if_cached"] = "true"
 	}
 
