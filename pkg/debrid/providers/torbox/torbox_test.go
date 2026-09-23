@@ -3,6 +3,7 @@ package torbox
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -521,6 +522,73 @@ func TestDeleteTorrentUsesControlEndpoint(t *testing.T) {
 
 	if err := testTorbox(server.URL).DeleteTorrent("42"); err != nil {
 		t.Fatalf("DeleteTorrent() error = %v", err)
+	}
+}
+
+func TestDeleteTorrentPostsControlJSON(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	var (
+		method      string
+		gotPath     string
+		contentType string
+		rawBody     []byte
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method = r.Method
+		gotPath = r.URL.Path
+		contentType = r.Header.Get("Content-Type")
+		rawBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"success":true,"error":null,"detail":"Torrent deleted successfully.","data":null}`)
+	}))
+	t.Cleanup(server.Close)
+
+	if err := testTorbox(server.URL).DeleteTorrent("41"); err != nil {
+		t.Fatalf("DeleteTorrent() error = %v", err)
+	}
+	if method != http.MethodPost {
+		t.Fatalf("method = %q, want POST", method)
+	}
+	if gotPath != "/api/torrents/controltorrent" {
+		t.Fatalf("path = %q, want /api/torrents/controltorrent", gotPath)
+	}
+	if contentType != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", contentType)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rawBody, &payload); err != nil {
+		t.Fatalf("body %q: %v", rawBody, err)
+	}
+	id, ok := payload["torrent_id"].(float64)
+	if !ok || id != 41 {
+		t.Fatalf("torrent_id = %#v, want 41", payload["torrent_id"])
+	}
+	if payload["operation"] != "delete" {
+		t.Fatalf("operation = %#v, want delete", payload["operation"])
+	}
+	if payload["all"] != false {
+		t.Fatalf("all = %#v, want false", payload["all"])
+	}
+}
+
+func TestDeleteTorrentRejectsNonNumericID(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+	}))
+	t.Cleanup(server.Close)
+
+	err := testTorbox(server.URL).DeleteTorrent("not-a-number")
+	if err == nil || !strings.Contains(err.Error(), "invalid TorBox torrent id") {
+		t.Fatalf("DeleteTorrent() error = %v, want invalid TorBox torrent id", err)
+	}
+	if called {
+		t.Fatal("DeleteTorrent() sent a request for a non-numeric id")
 	}
 }
 
