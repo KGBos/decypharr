@@ -872,14 +872,14 @@ func (tb *Torbox) resolveDownloadLink(ctx context.Context, account *account.Acco
 		return types.DownloadLink{}, &request.ThrottleError{RetryAfter: tb.throttle.Remaining()}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return types.DownloadLink{}, fmt.Errorf("torbox requestdl error: HTTP %d", resp.StatusCode)
+		return types.DownloadLink{}, tb.requestdlFailure(resp)
 	}
 	var result DownloadLinksResponse
 	if err := json.ConfigDefault.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return types.DownloadLink{}, fmt.Errorf("torbox requestdl response: %w", err)
 	}
 	if !result.Success || result.Data == nil || *result.Data == "" {
-		return types.DownloadLink{}, fmt.Errorf("torbox requestdl returned no CDN URL")
+		return types.DownloadLink{}, tb.requestdlFailureResponse(resp.StatusCode, result.Error)
 	}
 	expiry := 3 * time.Hour
 	if tb.autoExpiresLinksAfter > 0 && tb.autoExpiresLinksAfter < expiry {
@@ -892,6 +892,27 @@ func (tb *Torbox) resolveDownloadLink(ctx context.Context, account *account.Acco
 		return types.DownloadLink{}, fmt.Errorf("torbox requestdl returned invalid CDN URL: %w", err)
 	}
 	return dl, nil
+}
+
+// Only TorBox's machine-readable code is safe to put in a log or read error.
+// The detail field and the request URL may contain account tokens or links.
+var torboxErrorCode = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,127}$`)
+
+func (tb *Torbox) requestdlFailure(resp *http.Response) error {
+	var result struct {
+		Error any `json:"error"`
+	}
+	_ = json.ConfigDefault.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&result)
+	return tb.requestdlFailureResponse(resp.StatusCode, result.Error)
+}
+
+func (tb *Torbox) requestdlFailureResponse(status int, providerError any) error {
+	code, _ := providerError.(string)
+	if !torboxErrorCode.MatchString(code) {
+		code = "UNKNOWN"
+	}
+	tb.logger.Warn().Int("http_status", status).Str("provider_error_code", code).Msg("TorBox requestdl failed")
+	return fmt.Errorf("torbox requestdl failed: HTTP %d provider_error_code=%s", status, code)
 }
 
 func (tb *Torbox) fetchDownloadLink(account *account.Account, id string, file *types.File) (types.DownloadLink, error) {
