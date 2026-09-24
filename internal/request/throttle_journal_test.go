@@ -1,10 +1,17 @@
 package request
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -50,7 +57,8 @@ func TestPersistentGateFailsClosedAfterRestartDuringBan(t *testing.T) {
 func TestPersistentGateFailsClosedAfterUncertainRequest(t *testing.T) {
 	config.SetConfigPath(t.TempDir())
 	path := filepath.Join(t.TempDir(), "gate", "state.json")
-	first := NewThrottle(3, time.Minute, 5*time.Minute, zerolog.Nop())
+	var log bytes.Buffer
+	first := NewThrottle(3, time.Minute, 5*time.Minute, zerolog.New(&log))
 	if err := first.WithPersistentState(path); err != nil {
 		t.Fatal(err)
 	}
@@ -63,9 +71,12 @@ func TestPersistentGateFailsClosedAfterUncertainRequest(t *testing.T) {
 		conn.Close()
 	}))
 	defer server.Close()
-	_, err := New(WithThrottle(first), WithMaxRetries(0)).Get(server.URL)
+	_, err := New(WithThrottle(first), WithMaxRetries(0)).Get(server.URL + "?token=private-value")
 	if BackpressureError(err) == nil {
 		t.Fatalf("unknown outcome did not fail closed: %v", err)
+	}
+	if !strings.Contains(log.String(), `"wire_failure":"eof"`) || strings.Contains(log.String(), "private-value") {
+		t.Fatalf("wire failure log missing safe class or leaked URL query: %q", log.String())
 	}
 	restarted := NewThrottle(3, time.Minute, 5*time.Minute, zerolog.Nop())
 	if err := restarted.WithPersistentState(path); err != nil {
@@ -73,6 +84,31 @@ func TestPersistentGateFailsClosedAfterUncertainRequest(t *testing.T) {
 	}
 	if err := restarted.Before(); BackpressureError(err) == nil || BackpressureError(err).RetryAfter >= 0 {
 		t.Fatalf("restart lost unresolved marker: %v", err)
+	}
+}
+
+func TestWireFailureClass(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"missing response", nil, "missing_response"},
+		{"canceled", context.Canceled, "context_canceled"},
+		{"deadline", context.DeadlineExceeded, "deadline_exceeded"},
+		{"dns", &url.Error{URL: "https://example.test/?token=private-value", Err: &net.DNSError{Err: "no such host", Name: "example.test"}}, "dns"},
+		{"dial", &net.OpError{Op: "dial", Err: errors.New("refused")}, "network_dial"},
+		{"read", &net.OpError{Op: "read", Err: io.EOF}, "network_read"},
+		{"eof", &url.Error{URL: "https://example.test/?token=private-value", Err: io.EOF}, "eof"},
+		{"unexpected eof", io.ErrUnexpectedEOF, "unexpected_eof"},
+		{"other", errors.New("transport failed"), "other"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := wireFailureClass(tc.err); got != tc.want {
+				t.Fatalf("wireFailureClass(%v) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
 	}
 }
 
