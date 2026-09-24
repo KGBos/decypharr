@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -230,6 +232,45 @@ func (b *Throttle) persistOutcome(resp *http.Response, wireErr error) error {
 		return err
 	}
 	return nil
+}
+
+// wireFailureClass preserves the useful part of an uncertain transport
+// outcome without logging a request URL, API key, or arbitrary error text.
+// It never changes whether the durable gate fails closed.
+func wireFailureClass(err error) string {
+	if err == nil {
+		return "missing_response"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "context_canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "deadline_exceeded"
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return "dns"
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		switch opErr.Op {
+		case "dial", "read", "write":
+			return "network_" + opErr.Op
+		default:
+			return "network_other"
+		}
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "network_timeout"
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return "unexpected_eof"
+	}
+	if errors.Is(err, io.EOF) {
+		return "eof"
+	}
+	return "other"
 }
 
 // WaitRead admits a read through an open circuit. When the remaining cooldown
@@ -499,8 +540,8 @@ func (t *throttleTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		// a floor so an escalated breaker wait also holds the bucket.
 		limiter.Observe(resp, class, t.throttle.Remaining())
 	}
-	if err := t.throttle.persistOutcome(resp, err); err != nil {
-		t.throttle.logger.Error().Err(err).Msg("TorBox gate outcome not durable; refusing further requests")
+	if outcomeErr := t.throttle.persistOutcome(resp, err); outcomeErr != nil {
+		t.throttle.logger.Error().Err(outcomeErr).Str("wire_failure", wireFailureClass(err)).Msg("TorBox gate outcome not durable; refusing further requests")
 		if resp != nil && resp.Body != nil {
 			resp.Body.Close()
 		}
