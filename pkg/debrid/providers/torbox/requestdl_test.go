@@ -107,8 +107,8 @@ func TestRequestdlFreezeHonorsRawRetryAfterThroughTransport(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// The breaker's own cooldown is clamped to 1s; the bucket must not inherit
-	// that clamp for the raw 2302s server window.
+	// Both the breaker and requestdl bucket must honor the raw 2302s window,
+	// regardless of the configured fallback backoff ceiling.
 	tb, err := New(config.Debrid{
 		Name:                   "torbox-test",
 		Provider:               "torbox",
@@ -127,8 +127,8 @@ func TestRequestdlFreezeHonorsRawRetryAfterThroughTransport(t *testing.T) {
 	if _, err := tb.throttle.Do(server.Client(), req); request.BackpressureError(err) == nil {
 		t.Fatalf("expected backpressure, got %v", err)
 	}
-	if breaker := tb.throttle.Remaining(); breaker > 2*time.Second {
-		t.Fatalf("breaker clamp changed: %s", breaker)
+	if breaker := tb.throttle.Remaining(); breaker < 2300*time.Second {
+		t.Fatalf("breaker truncated server deadline: %s", breaker)
 	}
 	stats := tb.RequestdlStats().(request.RequestdlStats)
 	if remaining := time.Until(stats.PenaltyUntil); remaining < 2300*time.Second {
