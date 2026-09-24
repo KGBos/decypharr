@@ -88,6 +88,9 @@ func TestPlaybackRejectsBadRequestdlResponseWithoutCaching(t *testing.T) {
 		{"empty data", 200, `{"success":true,"data":""}`},
 		{"non 2xx", 403, `{"success":false,"detail":"denied"}`},
 		{"server error is not retried", 503, `{"success":false,"detail":"unavailable"}`},
+		{"daily cap", 403, `{"success":false,"error":"DAILY_BANDWIDTH_LIMIT_EXCEEDED","detail":"token=SECRET"}`},
+		{"daily cap in success status", 200, `{"success":false,"error":"DAILY_BANDWIDTH_LIMIT_EXCEEDED","detail":"token=SECRET"}`},
+		{"untrusted code", 403, `{"success":false,"error":"token=SECRET","detail":"token=SECRET"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls atomic.Int64
@@ -102,6 +105,12 @@ func TestPlaybackRejectsBadRequestdlResponseWithoutCaching(t *testing.T) {
 			dl, err := tb.GetDownloadLinkForPlayback(context.Background(), "1", file)
 			if err == nil || !dl.Empty() {
 				t.Fatalf("link=%q, err=%v", dl.DownloadLink, err)
+			}
+			if strings.Contains(tc.name, "daily cap") && (!strings.Contains(err.Error(), "DAILY_BANDWIDTH_LIMIT_EXCEEDED") || strings.Contains(err.Error(), "SECRET")) {
+				t.Fatalf("provider code missing or detail leaked: %v", err)
+			}
+			if tc.name == "untrusted code" && (strings.Contains(err.Error(), "SECRET") || !strings.Contains(err.Error(), "provider_error_code=UNKNOWN")) {
+				t.Fatalf("untrusted provider text leaked: %v", err)
 			}
 			if got := tb.AccountManager().Current().DownloadLinksCount(); got != 0 {
 				t.Fatalf("failed resolution cached %d links", got)
