@@ -29,7 +29,7 @@ func TestLocalDownloadSharesProviderGate(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		if r.Method == "GET" && fail.Load() {
-			w.Header().Set("Retry-After", "120")
+			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(429)
 			return
 		}
@@ -61,7 +61,7 @@ func TestLocalDownloadSharesProviderGate(t *testing.T) {
 	if request.BackpressureError(err) == nil || calls.Load() == before {
 		t.Fatalf("short cooldown did not wait then re-enter the gate: %v calls=%d", err, calls.Load())
 	}
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(1100 * time.Millisecond)
 	fail.Store(false)
 	if err = d.localDownloader(dl, destination, nil, nil); err != nil {
 		t.Fatal(err)

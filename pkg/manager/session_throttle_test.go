@@ -19,7 +19,7 @@ func TestTorboxReadFailsFastAndRecovers(t *testing.T) {
 	var calls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if calls.Add(1) == 1 {
-			w.Header().Set("Retry-After", "120")
+			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(429)
 			return
 		}
@@ -47,7 +47,7 @@ func TestTorboxReadFailsFastAndRecovers(t *testing.T) {
 	if time.Since(start) > time.Second || calls.Load() != 1 || s.resumes.Load() != 0 {
 		t.Fatal("read entered retry ladder")
 	}
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(1100 * time.Millisecond)
 	data, err := io.ReadAll(s)
 	if err != nil || string(data) != "data" {
 		t.Fatalf("automatic recovery: %q, %v", data, err)

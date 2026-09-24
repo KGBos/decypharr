@@ -362,6 +362,12 @@ func New(options ...ClientOption) *Client {
 		if e := BackpressureError(err); e != nil {
 			return false, e
 		}
+		// A provider 429 ends this operation. The shared transport gate holds
+		// later operations until the full server deadline; retryablehttp must
+		// never schedule another attempt from this response.
+		if client.throttle != nil && resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+			return false, nil
+		}
 		if client.throttle != nil && client.throttle.isOpen() {
 			return false, err
 		}
