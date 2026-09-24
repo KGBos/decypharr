@@ -54,7 +54,26 @@ func TestPersistentGateFailsClosedAfterRestartDuringBan(t *testing.T) {
 	}
 }
 
-func TestPersistentGateFailsClosedAfterUncertainRequest(t *testing.T) {
+func TestPersistentGateFailsClosedOnStartupWhenPending(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+	dir := filepath.Join(t.TempDir(), "gate")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(path, []byte(`{"status":"pending"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	restarted := NewThrottle(3, time.Minute, 5*time.Minute, zerolog.Nop())
+	if err := restarted.WithPersistentState(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Before(); BackpressureError(err) == nil || BackpressureError(err).RetryAfter >= 0 {
+		t.Fatalf("startup with pending journal did not fail closed: %v", err)
+	}
+}
+
+func TestPersistentGateRecoversFromTransientWireError(t *testing.T) {
 	config.SetConfigPath(t.TempDir())
 	path := filepath.Join(t.TempDir(), "gate", "state.json")
 	var log bytes.Buffer
@@ -72,18 +91,54 @@ func TestPersistentGateFailsClosedAfterUncertainRequest(t *testing.T) {
 	}))
 	defer server.Close()
 	_, err := New(WithThrottle(first), WithMaxRetries(0)).Get(server.URL + "?token=private-value")
-	if BackpressureError(err) == nil {
-		t.Fatalf("unknown outcome did not fail closed: %v", err)
+	if err == nil {
+		t.Fatal("expected wire error from closed connection, got nil")
 	}
-	if !strings.Contains(log.String(), `"wire_failure":"eof"`) || strings.Contains(log.String(), "private-value") {
-		t.Fatalf("wire failure log missing safe class or leaked URL query: %q", log.String())
+	if err := first.Before(); err != nil {
+		t.Fatalf("live process was marked uncertain after transient wire error: %v", err)
 	}
-	restarted := NewThrottle(3, time.Minute, 5*time.Minute, zerolog.Nop())
-	if err := restarted.WithPersistentState(path); err != nil {
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.Contains(string(data), `"idle"`) {
+		t.Fatalf("expected journal to be reset to idle, got: %s", string(data))
+	}
+}
+
+func TestPersistentGateRecoversFromContextCanceled(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+	path := filepath.Join(t.TempDir(), "gate", "state.json")
+	b := NewThrottle(3, time.Minute, 5*time.Minute, zerolog.Nop())
+	if err := b.WithPersistentState(path); err != nil {
 		t.Fatal(err)
 	}
-	if err := restarted.Before(); BackpressureError(err) == nil || BackpressureError(err).RetryAfter >= 0 {
-		t.Fatalf("restart lost unresolved marker: %v", err)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+	client := &http.Client{}
+	_, err := b.Do(client, req)
+	if err == nil {
+		t.Fatal("expected context cancellation error, got nil")
+	}
+
+	if err := b.Before(); err != nil {
+		t.Fatalf("live process was marked uncertain after context cancellation: %v", err)
+	}
+
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.Contains(string(data), `"idle"`) {
+		t.Fatalf("expected journal to be reset to idle, got: %s", string(data))
 	}
 }
 

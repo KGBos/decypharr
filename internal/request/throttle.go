@@ -208,10 +208,12 @@ func (b *Throttle) persistOutcome(resp *http.Response, wireErr error) error {
 		return nil
 	}
 	if resp == nil || wireErr != nil {
-		b.mu.Lock()
-		b.uncertain = true
-		b.mu.Unlock()
-		return fmt.Errorf("provider response outcome unknown")
+		// A live wire error (e.g. context.Canceled, timeout, network error).
+		// The live process observed the completion/interruption of the wire call without
+		// an HTTP 429 response from the provider. Reset the on-disk journal to idle so
+		// subsequent requests and future restarts are not blocked as uncertain.
+		_ = b.journal.write(gateDiskState{Status: gateIdle})
+		return nil
 	}
 	b.mu.Lock()
 	unknownDeadline := b.uncertain
