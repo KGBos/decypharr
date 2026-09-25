@@ -13,6 +13,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/customerror"
 	"github.com/sirrobot01/decypharr/internal/nntp"
+	"github.com/sirrobot01/decypharr/internal/request"
 	"github.com/sirrobot01/decypharr/pkg/manager"
 	fuseconfig "github.com/sirrobot01/decypharr/pkg/mount/dfs/config"
 	"github.com/sirrobot01/decypharr/pkg/mount/dfs/vfs/ranges"
@@ -605,6 +606,16 @@ func (dls *Downloaders) countErrors(n int64, err error) {
 	if err != nil {
 		// Intentional stop/shutdown — not a real failure.
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
+		// Provider backpressure (HTTP 429) is a gate-level condition with a
+		// known deadline, not a file failure. The provider gate already
+		// serializes admissions and honors the full Retry-After; counting
+		// these against the file's error budget would trip the file-local
+		// circuit breaker and leave a healthy file unreadable after the
+		// gate clears — exactly what ThrottleError promises not to do
+		// ("ends the current read/chunk attempt without poisoning the file").
+		if request.BackpressureError(err) != nil {
 			return
 		}
 		dls.errorCount++
