@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -23,6 +24,16 @@ const (
 	MaxReinsertionAttempt = 3
 	// maxValidatedEntries caps the validated-link memo map (see GetLink).
 	maxValidatedEntries = 8192
+	// slowHostCooldown is how long a CDN host that served a degraded stream
+	// is deprioritized when fetching fresh links. Long enough to outlast a
+	// transient bad node, short enough to forgive a recovered one.
+	slowHostCooldown = 30 * time.Minute
+	// maxCooldownHosts caps the slow-host map; resetting merely costs
+	// re-learning which hosts are slow.
+	maxCooldownHosts = 256
+	// maxCooldownSkips bounds how many freshly dealt links are discarded for
+	// pointing at cooling hosts before falling back to the last one dealt.
+	maxCooldownSkips = 3
 )
 
 var (
@@ -38,6 +49,7 @@ type EntrySaver func(entry *storage.Entry) error
 // It uses the account-level cache for storing links and only tracks validation state.
 type Service struct {
 	validated      *xsync.Map[string, error]
+	cooldowns      *xsync.Map[string, time.Time]
 	singleflight   singleflight.Group
 	clients        *xsync.Map[string, debrid.Client]
 	entryRefresher EntryRefresher
@@ -60,6 +72,7 @@ func New(
 ) *Service {
 	return &Service{
 		validated:      xsync.NewMap[string, error](),
+		cooldowns:      xsync.NewMap[string, time.Time](),
 		clients:        clients,
 		entryRefresher: entryRefresher,
 		repairer:       entryReinsert,
@@ -442,6 +455,16 @@ func (s *Service) validateLink(ctx context.Context, link *types.DownloadLink) er
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusOK {
+		// A cached link can point at a CDN host that is cooling down after
+		// serving a degraded stream; treat it as refetchable so a fresh
+		// link — preferably on another host — is dealt instead of
+		// re-serving the slow node.
+		if s.hostCooling(finalHost(resp)) {
+			return NewRefetchableError(
+				fmt.Errorf("CDN host %s in slow-stream cooldown", finalHost(resp)),
+				"host_cooldown",
+			)
+		}
 		return nil
 	}
 
@@ -564,10 +587,95 @@ func (s *Service) invalidateAndRefetch(ctx context.Context, entry *storage.Entry
 
 	_ = client.DeleteLink(link) // This might fail, doesnt matter
 
-	return s.fetchLink(ctx, entry, link.Filename, attempt)
+	fresh, err := s.fetchLink(ctx, entry, link.Filename, attempt)
+	if err != nil {
+		return fresh, err
+	}
+	// A freshly dealt link can still land on a cooling CDN host; discard a
+	// bounded number of them before falling back to the last one dealt.
+	for skipped := 0; skipped < maxCooldownSkips && s.hostCooling(CDNHost(fresh)); skipped++ {
+		s.logger.Info().
+			Str("host", CDNHost(fresh)).
+			Int("skipped", skipped+1).
+			Msg("Fresh link points at a cooling CDN host; refetching")
+		_ = client.DeleteLink(fresh)
+		if fresh, err = s.fetchLink(ctx, entry, link.Filename, attempt); err != nil {
+			return fresh, err
+		}
+	}
+	return fresh, nil
 }
 
 // Clear removes all validation tracking entries
 func (s *Service) Clear() {
 	s.validated.Clear()
+}
+
+// NoteSlowHost records that host served a degraded stream and deprioritizes
+// it for slowHostCooldown when fresh links are dealt. Called from the stream
+// recovery path after the slow-stream watchdog trips.
+func (s *Service) NoteSlowHost(host string, bps float64) {
+	if host == "" {
+		return
+	}
+	if s.cooldowns.Size() >= maxCooldownHosts {
+		s.sweepCooldowns()
+		if s.cooldowns.Size() >= maxCooldownHosts {
+			return // fail soft: drop the entry rather than grow unbounded
+		}
+	}
+	s.cooldowns.Store(host, time.Now().Add(slowHostCooldown))
+	s.logger.Warn().
+		Str("host", host).
+		Float64("kbps", bps/1024).
+		Dur("cooldown", slowHostCooldown).
+		Msg("CDN host served a degraded stream; cooling down")
+}
+
+// sweepCooldowns drops expired entries from the slow-host map.
+func (s *Service) sweepCooldowns() {
+	now := time.Now()
+	s.cooldowns.Range(func(host string, exp time.Time) bool {
+		if now.After(exp) {
+			s.cooldowns.Delete(host)
+		}
+		return true
+	})
+}
+
+// hostCooling reports whether host is inside its slow-stream cooldown.
+// Expired entries are reaped lazily on read.
+func (s *Service) hostCooling(host string) bool {
+	if host == "" {
+		return false
+	}
+	exp, ok := s.cooldowns.Load(host)
+	if !ok {
+		return false
+	}
+	if time.Now().After(exp) {
+		s.cooldowns.Delete(host)
+		return false
+	}
+	return true
+}
+
+// CDNHost extracts the host serving the bytes for a download link. TorBox
+// playback links are pre-resolved CDN URLs, so this is the CDN node itself;
+// for providers whose links are redirectors it is the redirector host, in
+// which case a cooldown simply never matches and is harmless.
+func CDNHost(dl types.DownloadLink) string {
+	u, err := url.Parse(dl.DownloadLink)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Host
+}
+
+// finalHost returns the host of the last URL in a response's redirect chain.
+func finalHost(resp *http.Response) string {
+	if resp != nil && resp.Request != nil && resp.Request.URL != nil {
+		return resp.Request.URL.Host
+	}
+	return ""
 }

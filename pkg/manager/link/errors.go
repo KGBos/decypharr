@@ -141,6 +141,37 @@ func NewAccountError(err error, code string) *Error {
 	return NewLinkError(err, CategoryAccountIssue, code)
 }
 
+// SlowStreamError is returned by the stream watchdog (see pkg/manager) when a
+// link serves bytes far below a usable rate for a sustained window. The
+// stream is alive — no error, no stall — just unusably slow, so it classifies
+// as refetchable: the session swaps to a fresh link instead of crawling until
+// the next scheduled refresh.
+type SlowStreamError struct {
+	Err   *Error
+	Host  string  // CDN host that served the degraded stream
+	Bytes int64   // bytes read before the swap was triggered
+	Bps   float64 // measured throughput in bytes/sec across the slow windows
+}
+
+// NewSlowStreamError builds a refetchable slow-stream error carrying the
+// measurements the host cooldown and the swap logging need.
+func NewSlowStreamError(host string, bytes int64, bps float64) *SlowStreamError {
+	return &SlowStreamError{
+		Err: NewRefetchableError(
+			fmt.Errorf("slow stream from %s: %.1f kB/s sustained", host, bps/1024),
+			"slow_stream",
+		),
+		Host:  host,
+		Bytes: bytes,
+		Bps:   bps,
+	}
+}
+
+func (e *SlowStreamError) Error() string { return e.Err.Error() }
+
+// Unwrap exposes the link taxonomy so errors.As finds the *Error.
+func (e *SlowStreamError) Unwrap() error { return e.Err }
+
 // ErrorCodeToLinkError converts an error code string to a LinkError with appropriate category
 func ErrorCodeToLinkError(code string) *Error {
 	switch code {
