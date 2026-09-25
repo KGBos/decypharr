@@ -388,6 +388,19 @@ type slowSwapReport struct {
 }
 
 func (t *httpTransport) open(ctx context.Context, pos int64) (io.ReadCloser, error) {
+	body, err := t.openInner(ctx, pos)
+	if err != nil {
+		// The swap's replacement body never opened: drop the armed
+		// before/after report. A failed open is followed by recovery, and
+		// the next successful open may serve a different link entirely —
+		// letting it consume this report would emit a slow_stream_after
+		// pairing the stale old_host/before_kbps with an unrelated body.
+		t.clearSwapArmed()
+	}
+	return body, err
+}
+
+func (t *httpTransport) openInner(ctx context.Context, pos int64) (io.ReadCloser, error) {
 	dl, err := t.getLink(ctx)
 	if err != nil {
 		return nil, err
@@ -514,7 +527,10 @@ func (t *httpTransport) recover(ctx context.Context, err error, attempt int) err
 
 // clearSwapArmed drops a pending slow-stream report without emitting the
 // follow-up log. Used when the swap the report describes never happened
-// (refresh failed) or never will (nothing to invalidate).
+// (refresh failed), never will (nothing to invalidate), or never opened
+// (the replacement open failed — the next successful open may serve a
+// different link after its own recovery, so it must not inherit this
+// report's attribution).
 func (t *httpTransport) clearSwapArmed() {
 	t.mu.Lock()
 	t.swapArmed = nil

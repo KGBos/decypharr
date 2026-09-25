@@ -284,6 +284,75 @@ func TestSlowWatchBodyErrorPassthroughNoTrip(t *testing.T) {
 	}
 }
 
+// healthyThenSlowErrorReader serves `good` healthy reads, then fails every
+// Read with err after blocking for errDelay — a stand-in for a connection
+// reset that arrives after a long stall on an otherwise healthy stream.
+type healthyThenSlowErrorReader struct {
+	chunk    []byte
+	delay    time.Duration
+	good     int // healthy reads before the error starts
+	errDelay time.Duration
+	err      error
+	reads    int
+}
+
+func (h *healthyThenSlowErrorReader) Read(p []byte) (int, error) {
+	h.reads++
+	if h.reads > h.good {
+		if h.errDelay > 0 {
+			time.Sleep(h.errDelay)
+		}
+		return 0, h.err
+	}
+	if h.delay > 0 {
+		time.Sleep(h.delay)
+	}
+	return copy(p, h.chunk), nil
+}
+
+func (h *healthyThenSlowErrorReader) Close() error { return nil }
+
+// TestSlowWatchBodyLongBlockedErrorOnHealthyStreamNoTrip pins the
+// highest-risk boundary: a single errored Read blocked for nearly two full
+// windows (~180ms of zero-byte blocked time) on a healthy stream must NOT
+// trip the watchdog. The windows' bps is an average over the accumulated
+// blocked time and bytes (pro-rata carryover), so the healthy bytes keep the
+// average far above the threshold — the trip is gated on measured
+// throughput, never on the error itself. The original error passes through
+// with identity. (The mirror case — the same blocked duration with no
+// healthy bytes behind it — does trip; see
+// TestSlowWatchBodyStallCancelledReadTrips.)
+func TestSlowWatchBodyLongBlockedErrorOnHealthyStreamNoTrip(t *testing.T) {
+	boom := errors.New("boom")
+	// 400 kB in ~20ms ~= 20 MB/s: one healthy read, then a single errored
+	// read blocked ~180ms (nearly two 100ms windows) with zero bytes. Even
+	// with generous scheduling overshoot the window average stays far above
+	// the 100 kB/s threshold.
+	w := newSlowWatchBodyWithParams(
+		&healthyThenSlowErrorReader{
+			chunk: make([]byte, 400*1024), delay: 20 * time.Millisecond,
+			good: 1, errDelay: 180 * time.Millisecond, err: boom,
+		},
+		"cdn1.torbox.app", nil,
+		100*1024, 100*time.Millisecond, 2,
+	)
+	buf := make([]byte, 512*1024)
+	if _, err := w.Read(buf); err != nil {
+		t.Fatalf("healthy read must not trip: %v", err)
+	}
+	n, err := w.Read(buf)
+	if err != boom {
+		t.Fatalf("long-blocked error on a healthy stream must pass through untouched, got %T (%v)", err, err)
+	}
+	if n != 0 {
+		t.Fatalf("passthrough must preserve n, got %d", n)
+	}
+	var serr *link.SlowStreamError
+	if errors.As(err, &serr) {
+		t.Fatalf("healthy stream with a long-blocked errored read must not trip the watchdog: %v", serr)
+	}
+}
+
 // TestHttpTransportSlowStreamRecover wires the full trip path: the watchdog
 // error reaches recover, cools the CDN host, refreshes the link, and arms
 // the before/after report for the replacement body.
@@ -435,5 +504,56 @@ func TestHttpTransportSlowStreamRecoverClearsArmedOnEmptyBadLink(t *testing.T) {
 	tr.mu.Unlock()
 	if armed != nil {
 		t.Errorf("empty bad link left a stale armed report: %+v", armed)
+	}
+}
+
+// errRoundTripper fails every request — a stand-in for a CDN that is
+// unreachable right after a slow-stream swap.
+type errRoundTripper struct{ err error }
+
+func (e errRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, e.err
+}
+
+// TestHttpTransportOpenFailureClearsArmedReport: when the replacement open
+// fails after recover armed a slow-stream report, the report must be
+// dropped. The swap's replacement body never opened, and the failed open is
+// followed by recovery — the next successful open may serve a different link
+// entirely, so consuming the stale report there would emit a
+// slow_stream_after pairing the old swap's old_host/before_kbps with an
+// unrelated body.
+func TestHttpTransportOpenFailureClearsArmedReport(t *testing.T) {
+	tr := &httpTransport{
+		client: &http.Client{Transport: errRoundTripper{err: errors.New("connection refused")}},
+		getLink: func(context.Context) (types.DownloadLink, error) {
+			return types.DownloadLink{Filename: "f", DownloadLink: "https://cdn1.torbox.app/x"}, nil
+		},
+		refresh: func(_ context.Context, bad types.DownloadLink) (types.DownloadLink, error) {
+			return types.DownloadLink{Filename: "f", DownloadLink: "https://cdn9.torbox.app/x"}, nil
+		},
+	}
+	tr.last = types.DownloadLink{Filename: "f", DownloadLink: "https://cdn1.torbox.app/x"}
+
+	// Arm the report via a slow-stream trip with a successful swap.
+	if err := tr.recover(context.Background(), link.NewSlowStreamError("cdn1.torbox.app", 1, 1), 0); err != nil {
+		t.Fatalf("recover should succeed, got %v", err)
+	}
+	tr.mu.Lock()
+	if tr.swapArmed == nil {
+		tr.mu.Unlock()
+		t.Fatal("recover should have armed the swap report")
+	}
+	tr.mu.Unlock()
+
+	// The replacement open fails: the armed report must be dropped, not
+	// left for a later open to inherit.
+	if _, err := tr.open(context.Background(), 0); err == nil {
+		t.Fatal("open should fail against the broken transport")
+	}
+	tr.mu.Lock()
+	armed := tr.swapArmed
+	tr.mu.Unlock()
+	if armed != nil {
+		t.Errorf("failed open left a stale armed report: %+v", armed)
 	}
 }
