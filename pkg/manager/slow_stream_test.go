@@ -38,6 +38,45 @@ func (d *dribbleReader) Read(p []byte) (int, error) {
 
 func (d *dribbleReader) Close() error { d.closed = true; return nil }
 
+// errReader blocks for delay, then fails every Read with err — a stand-in
+// for a body whose context the session's stall watchdog just cancelled.
+type errReader struct {
+	delay time.Duration
+	err   error
+}
+
+func (e *errReader) Read(p []byte) (int, error) {
+	if e.delay > 0 {
+		time.Sleep(e.delay)
+	}
+	return 0, e.err
+}
+
+func (e *errReader) Close() error { return nil }
+
+// healthyThenErrorReader serves good healthy reads, then fails every Read
+// with err — a stand-in for a transient error on a healthy stream.
+type healthyThenErrorReader struct {
+	chunk []byte
+	delay time.Duration
+	good  int // healthy reads before the error starts
+	err   error
+	reads int
+}
+
+func (h *healthyThenErrorReader) Read(p []byte) (int, error) {
+	h.reads++
+	if h.reads > h.good {
+		return 0, h.err
+	}
+	if h.delay > 0 {
+		time.Sleep(h.delay)
+	}
+	return copy(p, h.chunk), nil
+}
+
+func (h *healthyThenErrorReader) Close() error { return nil }
+
 func TestSlowWatchBodyTripsOnSustainedSlowStream(t *testing.T) {
 	// 100 bytes per 100ms => ~1 kB/s, far below the 100 kB/s test threshold.
 	// Two 150ms windows of blocked read time trip the watchdog.
@@ -164,12 +203,10 @@ func TestSlowWatchBodyRecoveryAfterBadWindow(t *testing.T) {
 	}
 }
 
-// TestHttpTransportSlowStreamRecover wires the full trip path: the watchdog
-// error reaches recover, cools the CDN host, refreshes the link, and arms
-// the before/after report for the replacement body.
 // TestSlowWatchBodyHardStallTrips: a single Read blocked for multiple
-// windows with zero bytes flowing trips the watchdog instead of riding the
-// session's stall watchdog with a same-link retry.
+// windows with zero bytes flowing trips the watchdog — whether the Read
+// returns on its own or the session's stall watchdog cancels it first —
+// instead of riding a same-link retry.
 func TestSlowWatchBodyHardStallTrips(t *testing.T) {
 	w := newSlowWatchBodyWithParams(
 		&dribbleReader{chunk: nil, delay: 250 * time.Millisecond, remaining: -1},
@@ -191,6 +228,65 @@ func TestSlowWatchBodyHardStallTrips(t *testing.T) {
 	}
 }
 
+// TestSlowWatchBodyStallCancelledReadTrips: a Read killed by the session's
+// stall watchdog (body context cancelled after 90s with zero bytes) carries
+// genuine degradation signal — 90s of zero-byte blocked time. The watchdog
+// evaluates it like any other Read and trips, so the host is cooled and the
+// link swapped instead of riding the same-link retry.
+func TestSlowWatchBodyStallCancelledReadTrips(t *testing.T) {
+	w := newSlowWatchBodyWithParams(
+		&errReader{delay: 250 * time.Millisecond, err: context.Canceled},
+		"cdn1.torbox.app", nil,
+		100*1024, 100*time.Millisecond, 2,
+	)
+	n, err := w.Read(make([]byte, 4096))
+	var serr *link.SlowStreamError
+	if !errors.As(err, &serr) {
+		t.Fatalf("expected *link.SlowStreamError, got %T (%v)", err, err)
+	}
+	if n != 0 {
+		t.Fatalf("trip must drop the in-flight bytes, got n=%d", n)
+	}
+	if serr.Host != "cdn1.torbox.app" {
+		t.Errorf("host not carried: %q", serr.Host)
+	}
+	if lerr := link.GetLinkError(err); lerr == nil || !lerr.ShouldRefetch() {
+		t.Error("tripped error must classify as refetchable")
+	}
+}
+
+// TestSlowWatchBodyErrorPassthroughNoTrip: a transient error on an otherwise
+// healthy stream passes through untouched — same n, same error, no trip.
+// The trip is bps-gated, so errors with good throughput behind them never
+// swap the link.
+func TestSlowWatchBodyErrorPassthroughNoTrip(t *testing.T) {
+	boom := errors.New("boom")
+	w := newSlowWatchBodyWithParams(
+		&healthyThenErrorReader{
+			chunk: make([]byte, 100*1024), delay: 10 * time.Millisecond,
+			good: 5, err: boom,
+		},
+		"cdn1.torbox.app", nil,
+		100*1024, 50*time.Millisecond, 2,
+	)
+	buf := make([]byte, 256*1024)
+	for i := 0; i < 5; i++ {
+		if _, err := w.Read(buf); err != nil {
+			t.Fatalf("healthy read %d must not error: %v", i, err)
+		}
+	}
+	n, err := w.Read(buf)
+	if err != boom {
+		t.Fatalf("transient error must pass through untouched, got %T (%v)", err, err)
+	}
+	if n != 0 {
+		t.Fatalf("passthrough must preserve n, got %d", n)
+	}
+}
+
+// TestHttpTransportSlowStreamRecover wires the full trip path: the watchdog
+// error reaches recover, cools the CDN host, refreshes the link, and arms
+// the before/after report for the replacement body.
 func TestHttpTransportSlowStreamRecover(t *testing.T) {
 	var notedHost string
 	var notedBps float64
@@ -311,5 +407,33 @@ func TestHttpTransportSlowStreamRecoverClearsArmedOnRefreshFailure(t *testing.T)
 	tr.mu.Unlock()
 	if armed != nil {
 		t.Errorf("failed swap left a stale armed report: %+v", armed)
+	}
+}
+
+// TestHttpTransportSlowStreamRecoverClearsArmedOnEmptyBadLink: when there is
+// no link to invalidate (tr.last is the zero value) recover takes the
+// bad.Empty() exit — the armed report must still be cleared so a later open
+// cannot inherit this swap's old_host, and no refresh is attempted.
+func TestHttpTransportSlowStreamRecoverClearsArmedOnEmptyBadLink(t *testing.T) {
+	tr := &httpTransport{
+		client:   http.DefaultClient,
+		noteSlow: func(host string, bps float64) {},
+		getLink: func(context.Context) (types.DownloadLink, error) {
+			return types.DownloadLink{Filename: "f", DownloadLink: "https://cdn1.torbox.app/x"}, nil
+		},
+		refresh: func(_ context.Context, bad types.DownloadLink) (types.DownloadLink, error) {
+			t.Fatal("refresh must not run when there is no bad link to invalidate")
+			return types.DownloadLink{}, nil
+		},
+	}
+	// tr.last left as the zero value: bad.Empty() is true.
+	if err := tr.recover(context.Background(), link.NewSlowStreamError("cdn1.torbox.app", 1, 1), 0); err != nil {
+		t.Fatalf("recover with an empty bad link should succeed, got %v", err)
+	}
+	tr.mu.Lock()
+	armed := tr.swapArmed
+	tr.mu.Unlock()
+	if armed != nil {
+		t.Errorf("empty bad link left a stale armed report: %+v", armed)
 	}
 }
