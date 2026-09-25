@@ -485,13 +485,19 @@ func (t *httpTransport) recover(ctx context.Context, err error, attempt int) err
 		bad := t.last
 		t.mu.Unlock()
 		if bad.Empty() {
-			return nil // nothing to invalidate; next open re-fetches
+			t.clearSwapArmed() // no swap happened; a later open must not
+			return nil         // inherit this report's old_host
 		}
 		newLink, rerr := t.refresh(ctx, bad)
 		if rerr != nil {
+			t.clearSwapArmed() // swap failed; same as above
 			return rerr
 		}
 		if slow && t.logger != nil {
+			// new_host is the link-URL host (== final CDN host for
+			// pre-resolved providers like TorBox; see link.CDNHost). The
+			// authoritative post-redirect host is reported by the
+			// slow_stream_after follow-up once the replacement streams.
 			t.logger.Warn().
 				Str("event", "slow_stream_swap").
 				Str("old_host", serr.Host).
@@ -504,6 +510,15 @@ func (t *httpTransport) recover(ctx context.Context, err error, attempt int) err
 	default: // retryable: same link, short backoff
 		return sleepCtx(ctx, sessionBackoff(attempt))
 	}
+}
+
+// clearSwapArmed drops a pending slow-stream report without emitting the
+// follow-up log. Used when the swap the report describes never happened
+// (refresh failed) or never will (nothing to invalidate).
+func (t *httpTransport) clearSwapArmed() {
+	t.mu.Lock()
+	t.swapArmed = nil
+	t.mu.Unlock()
 }
 
 // watchBody attaches the slow-stream watchdog to a freshly opened body. The

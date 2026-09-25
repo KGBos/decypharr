@@ -68,11 +68,23 @@ func (w *slowWatchBody) Read(p []byte) (int, error) {
 	n, err := w.rc.Read(p)
 	d := time.Since(start)
 
+	// A terminating read (EOF, error) passes through untouched: the session's
+	// normal recovery already handles failures, and tripping on the way out
+	// would swap a link the consumer was done with.
+	if err != nil {
+		return n, err
+	}
+
 	w.winBytes += int64(n)
 	w.winDur += d
 	w.totalBytes += int64(n)
 
-	if !w.tripped && w.winDur >= w.window {
+	// Evaluate every elapsed window, not just one: a single Read blocked
+	// for minutes with zero bytes (a hard stall the 90s stall watchdog
+	// would otherwise ride with a same-link retry) trips here instead.
+	// Consumed windows are subtracted pro-rata so leftover blocked time and
+	// bytes carry into the next window instead of being discarded.
+	for !w.tripped && w.winDur >= w.window {
 		// window is always > 0, so this division is safe.
 		bps := float64(w.winBytes) / w.winDur.Seconds()
 		if !w.firstWindowDone {
@@ -86,8 +98,9 @@ func (w *slowWatchBody) Read(p []byte) (int, error) {
 		} else {
 			w.consecBad = 0
 		}
-		w.winBytes = 0
-		w.winDur = 0
+		frac := float64(w.window) / float64(w.winDur)
+		w.winBytes -= int64(float64(w.winBytes) * frac)
+		w.winDur -= w.window
 		if w.consecBad >= w.badWindows {
 			w.tripped = true
 			// Drop this Read's bytes — they are re-read at the same offset
@@ -97,7 +110,7 @@ func (w *slowWatchBody) Read(p []byte) (int, error) {
 			return 0, link.NewSlowStreamError(w.host, w.totalBytes, bps)
 		}
 	}
-	return n, err
+	return n, nil
 }
 
 func (w *slowWatchBody) Close() error { return w.rc.Close() }

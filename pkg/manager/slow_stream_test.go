@@ -7,11 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/manager/link"
 )
@@ -169,6 +167,30 @@ func TestSlowWatchBodyRecoveryAfterBadWindow(t *testing.T) {
 // TestHttpTransportSlowStreamRecover wires the full trip path: the watchdog
 // error reaches recover, cools the CDN host, refreshes the link, and arms
 // the before/after report for the replacement body.
+// TestSlowWatchBodyHardStallTrips: a single Read blocked for multiple
+// windows with zero bytes flowing trips the watchdog instead of riding the
+// session's stall watchdog with a same-link retry.
+func TestSlowWatchBodyHardStallTrips(t *testing.T) {
+	w := newSlowWatchBodyWithParams(
+		&dribbleReader{chunk: nil, delay: 250 * time.Millisecond, remaining: -1},
+		"cdn1.torbox.app", nil,
+		100*1024, 100*time.Millisecond, 2,
+	)
+	start := time.Now()
+	_, err := w.Read(make([]byte, 4096))
+	elapsed := time.Since(start)
+	var serr *link.SlowStreamError
+	if !errors.As(err, &serr) {
+		t.Fatalf("expected *link.SlowStreamError, got %T (%v)", err, err)
+	}
+	// The trip is evaluated when the blocked Read returns (~250ms here):
+	// two full windows elapsed inside the single Read, so it trips on the
+	// first return instead of needing a second Read.
+	if elapsed > 400*time.Millisecond {
+		t.Errorf("trip took %s, want ~250ms (the blocked read duration)", elapsed)
+	}
+}
+
 func TestHttpTransportSlowStreamRecover(t *testing.T) {
 	var notedHost string
 	var notedBps float64
@@ -224,29 +246,30 @@ func TestHttpTransportSlowStreamRecoverNilHooks(t *testing.T) {
 	}
 }
 
-// TestWatchBodyHostFromFinalURL opens through a real test server and asserts
-// the watchdog measures the final (post-redirect) host — the CDN node serving
-// the bytes — and returns a *slowWatchBody.
+// TestWatchBodyHostFromFinalURL opens through a real 302 redirect chain and
+// asserts the watchdog measures the FINAL host — the CDN node serving the
+// bytes — not the link URL's host.
 func TestWatchBodyHostFromFinalURL(t *testing.T) {
-	var logged strings.Builder
-	logger := zerolog.New(&logged)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "4")
 		_, _ = w.Write([]byte("data"))
 	}))
-	defer server.Close()
+	defer cdn.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, cdn.URL+"/f", http.StatusFound)
+	}))
+	defer redirector.Close()
 
 	tr := &httpTransport{
-		client: server.Client(),
-		logger: &logger,
+		client: redirector.Client(), // follows redirects by default
 		getLink: func(context.Context) (types.DownloadLink, error) {
-			return types.DownloadLink{Filename: "f", DownloadLink: server.URL + "/f"}, nil
+			// The link URL names the redirector; the bytes come from cdn.
+			return types.DownloadLink{Filename: "f", DownloadLink: redirector.URL + "/f"}, nil
 		},
 		refresh: func(_ context.Context, bad types.DownloadLink) (types.DownloadLink, error) {
-			return types.DownloadLink{Filename: "f", DownloadLink: server.URL + "/f"}, nil
+			return types.DownloadLink{Filename: "f", DownloadLink: redirector.URL + "/f"}, nil
 		},
 	}
-	tr.swapArmed = &slowSwapReport{oldHost: "cdn1.torbox.app", beforeBps: 22 * 1024}
 
 	body, err := tr.open(context.Background(), 0)
 	if err != nil {
@@ -257,11 +280,36 @@ func TestWatchBodyHostFromFinalURL(t *testing.T) {
 	if !ok {
 		t.Fatalf("open should return a *slowWatchBody, got %T", body)
 	}
-	u, _ := url.Parse(server.URL)
+	u, _ := url.Parse(cdn.URL)
 	if w.host != u.Host {
-		t.Errorf("watchdog host = %q, want test server host %q", w.host, u.Host)
+		t.Errorf("watchdog host = %q, want final CDN host %q (link host was the redirector)", w.host, u.Host)
 	}
 	if _, err := io.ReadAll(w); err != nil {
 		t.Fatalf("read failed: %v", err)
+	}
+}
+
+// TestHttpTransportSlowStreamRecoverClearsArmedOnRefreshFailure: a failed
+// swap must not leave the report armed for the next open.
+func TestHttpTransportSlowStreamRecoverClearsArmedOnRefreshFailure(t *testing.T) {
+	tr := &httpTransport{
+		client: http.DefaultClient,
+		getLink: func(context.Context) (types.DownloadLink, error) {
+			return types.DownloadLink{Filename: "f", DownloadLink: "https://cdn1.torbox.app/x"}, nil
+		},
+		refresh: func(_ context.Context, bad types.DownloadLink) (types.DownloadLink, error) {
+			return types.DownloadLink{}, errors.New("provider exploded")
+		},
+	}
+	tr.last = types.DownloadLink{Filename: "f", DownloadLink: "https://cdn1.torbox.app/x"}
+	err := tr.recover(context.Background(), link.NewSlowStreamError("cdn1.torbox.app", 1, 1), 0)
+	if err == nil {
+		t.Fatal("refresh failure should propagate")
+	}
+	tr.mu.Lock()
+	armed := tr.swapArmed
+	tr.mu.Unlock()
+	if armed != nil {
+		t.Errorf("failed swap left a stale armed report: %+v", armed)
 	}
 }

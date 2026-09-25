@@ -593,6 +593,9 @@ func (s *Service) invalidateAndRefetch(ctx context.Context, entry *storage.Entry
 	}
 	// A freshly dealt link can still land on a cooling CDN host; discard a
 	// bounded number of them before falling back to the last one dealt.
+	// CDNHost reads the link URL, not the final post-redirect URL: correct
+	// for pre-resolved providers (TorBox), documented no-op otherwise —
+	// see CDNHost.
 	for skipped := 0; skipped < maxCooldownSkips && s.hostCooling(CDNHost(fresh)); skipped++ {
 		s.logger.Info().
 			Str("host", CDNHost(fresh)).
@@ -660,10 +663,16 @@ func (s *Service) hostCooling(host string) bool {
 	return true
 }
 
-// CDNHost extracts the host serving the bytes for a download link. TorBox
-// playback links are pre-resolved CDN URLs, so this is the CDN node itself;
-// for providers whose links are redirectors it is the redirector host, in
-// which case a cooldown simply never matches and is harmless.
+// CDNHost extracts the host serving the bytes for a download link.
+//
+// ASSUMPTION: for providers whose playback links are pre-resolved CDN URLs
+// (TorBox: GetDownloadLinkForPlayback resolves requestdl before caching) this
+// is the CDN node itself, and it agrees with the final-URL host the stream
+// watchdog and validateLink measure. For providers whose links are
+// redirectors, this is the redirector host: a cooldown recorded against the
+// final CDN host then never matches here, so the skip filter degrades to a
+// no-op rather than misfiring. If a redirector-style provider ever needs the
+// filter, resolve the link (Service.Resolve) before comparing.
 func CDNHost(dl types.DownloadLink) string {
 	u, err := url.Parse(dl.DownloadLink)
 	if err != nil || u.Host == "" {
