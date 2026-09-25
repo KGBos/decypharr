@@ -2,15 +2,18 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/request"
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
@@ -354,6 +357,12 @@ type httpTransport struct {
 	throttle *request.Throttle
 	getLink  func(ctx context.Context) (types.DownloadLink, error)
 	refresh  func(ctx context.Context, bad types.DownloadLink) (types.DownloadLink, error)
+	// noteSlow records a degraded CDN host in the link service's cooldown map;
+	// nil is fine (tests and transports that opt out of slow-stream failover).
+	noteSlow func(host string, bps float64)
+	// logger is a pointer so test transports can leave it unset; all
+	// slow-stream logging nil-checks it.
+	logger *zerolog.Logger
 
 	// base/limit map file-relative session offsets onto the link target when
 	// the file is a byte-ranged slice of a larger download: the served bytes
@@ -365,9 +374,33 @@ type httpTransport struct {
 
 	mu   sync.Mutex
 	last types.DownloadLink
+	// swapArmed carries the pre-swap measurements from recover to the next
+	// open so the replacement body's first window can log before/after
+	// throughput. Guarded by mu.
+	swapArmed *slowSwapReport
+}
+
+// slowSwapReport holds the measurements of a tripped slow-stream watchdog
+// until the replacement body opens.
+type slowSwapReport struct {
+	oldHost   string
+	beforeBps float64
 }
 
 func (t *httpTransport) open(ctx context.Context, pos int64) (io.ReadCloser, error) {
+	body, err := t.openInner(ctx, pos)
+	if err != nil {
+		// The swap's replacement body never opened: drop the armed
+		// before/after report. A failed open is followed by recovery, and
+		// the next successful open may serve a different link entirely —
+		// letting it consume this report would emit a slow_stream_after
+		// pairing the stale old_host/before_kbps with an unrelated body.
+		t.clearSwapArmed()
+	}
+	return body, err
+}
+
+func (t *httpTransport) openInner(ctx context.Context, pos int64) (io.ReadCloser, error) {
 	dl, err := t.getLink(ctx)
 	if err != nil {
 		return nil, err
@@ -404,9 +437,9 @@ func (t *httpTransport) open(ctx context.Context, pos int64) (io.ReadCloser, err
 	}
 	switch {
 	case resp.StatusCode == http.StatusPartialContent:
-		return resp.Body, nil
+		return t.watchBody(resp, dl), nil
 	case resp.StatusCode == http.StatusOK && absStart == 0 && t.limit <= 0:
-		return resp.Body, nil
+		return t.watchBody(resp, dl), nil
 	case resp.StatusCode == http.StatusOK && t.limit <= 0 && absStart > 0 && absStart <= sessionSeekDiscardMax:
 		// Server ignored the Range header but the offset is small enough to
 		// discard our way to it.
@@ -414,7 +447,7 @@ func (t *httpTransport) open(ctx context.Context, pos int64) (io.ReadCloser, err
 			resp.Body.Close()
 			return nil, link.ClassifyTransportError(err)
 		}
-		return resp.Body, nil
+		return t.watchBody(resp, dl), nil
 	case resp.StatusCode == http.StatusOK:
 		// Byte-ranged slices can't fall back to discarding: without range
 		// support the body would run past the slice end.
@@ -437,6 +470,20 @@ func (t *httpTransport) recover(ctx context.Context, err error, attempt int) err
 	if lerr == nil {
 		lerr = link.ClassifyTransportError(err)
 	}
+	// A degraded-but-alive stream: cool the CDN host down and arm the
+	// before/after report for the replacement body. The refetch branch below
+	// then swaps the link immediately instead of waiting for the scheduled
+	// refresh interval.
+	var serr *link.SlowStreamError
+	slow := errors.As(err, &serr)
+	if slow {
+		if t.noteSlow != nil && serr.Host != "" {
+			t.noteSlow(serr.Host, serr.Bps)
+		}
+		t.mu.Lock()
+		t.swapArmed = &slowSwapReport{oldHost: serr.Host, beforeBps: serr.Bps}
+		t.mu.Unlock()
+	}
 	switch {
 	case lerr.IsPermanent():
 		return err
@@ -451,15 +498,73 @@ func (t *httpTransport) recover(ctx context.Context, err error, attempt int) err
 		bad := t.last
 		t.mu.Unlock()
 		if bad.Empty() {
-			return nil // nothing to invalidate; next open re-fetches
+			t.clearSwapArmed() // no swap happened; a later open must not
+			return nil         // inherit this report's old_host
 		}
-		if _, rerr := t.refresh(ctx, bad); rerr != nil {
+		newLink, rerr := t.refresh(ctx, bad)
+		if rerr != nil {
+			t.clearSwapArmed() // swap failed; same as above
 			return rerr
+		}
+		if slow && t.logger != nil {
+			// new_host is the link-URL host (== final CDN host for
+			// pre-resolved providers like TorBox; see link.CDNHost). The
+			// authoritative post-redirect host is reported by the
+			// slow_stream_after follow-up once the replacement streams.
+			t.logger.Warn().
+				Str("event", "slow_stream_swap").
+				Str("old_host", serr.Host).
+				Str("new_host", link.CDNHost(newLink)).
+				Float64("before_kbps", serr.Bps/1024).
+				Int64("bytes_before_swap", serr.Bytes).
+				Msg("Slow stream detected; swapped to a fresh link without waiting for the refresh interval")
 		}
 		return nil
 	default: // retryable: same link, short backoff
 		return sleepCtx(ctx, sessionBackoff(attempt))
 	}
+}
+
+// clearSwapArmed drops a pending slow-stream report without emitting the
+// follow-up log. Used when the swap the report describes never happened
+// (refresh failed), never will (nothing to invalidate), or never opened
+// (the replacement open failed — the next successful open may serve a
+// different link after its own recovery, so it must not inherit this
+// report's attribution).
+func (t *httpTransport) clearSwapArmed() {
+	t.mu.Lock()
+	t.swapArmed = nil
+	t.mu.Unlock()
+}
+
+// watchBody attaches the slow-stream watchdog to a freshly opened body. The
+// host is taken from the final URL after redirects — the CDN node actually
+// serving the bytes — falling back to the link URL when unavailable.
+func (t *httpTransport) watchBody(resp *http.Response, dl types.DownloadLink) io.ReadCloser {
+	host := ""
+	if resp.Request != nil && resp.Request.URL != nil && resp.Request.URL.Host != "" {
+		host = resp.Request.URL.Host
+	} else if u, err := url.Parse(dl.DownloadLink); err == nil {
+		host = u.Host
+	}
+	t.mu.Lock()
+	report := t.swapArmed
+	t.swapArmed = nil
+	t.mu.Unlock()
+	var onFirstWindow func(float64)
+	if report != nil && t.logger != nil {
+		logger, oldHost, beforeBps := t.logger, report.oldHost, report.beforeBps
+		onFirstWindow = func(afterBps float64) {
+			logger.Info().
+				Str("event", "slow_stream_after").
+				Str("old_host", oldHost).
+				Str("new_host", host).
+				Float64("before_kbps", beforeBps/1024).
+				Float64("after_kbps", afterBps/1024).
+				Msg("Slow-stream swap follow-up: replacement link throughput")
+		}
+	}
+	return newSlowWatchBody(resp.Body, host, onFirstWindow)
 }
 
 // usenetTransport serves a session body by pulling directly from a usenet
@@ -588,6 +693,10 @@ func (m *Manager) openSession(ctx context.Context, entry *storage.Entry, filenam
 	} else {
 		ht := &httpTransport{
 			client: m.streamClient,
+			logger: &m.logger,
+			noteSlow: func(host string, bps float64) {
+				m.linkService.NoteSlowHost(host, bps)
+			},
 			getLink: func(ctx context.Context) (types.DownloadLink, error) {
 				return m.linkService.GetLink(ctx, entry, filename)
 			},
