@@ -51,6 +51,11 @@ var sharedNegativeCache = struct {
 	byProvider map[throttleKey]*NegativeCache
 }{byProvider: make(map[throttleKey]*NegativeCache)}
 
+var sharedMediator = struct {
+	sync.Mutex
+	byProvider map[throttleKey]*SubmissionMediator
+}{byProvider: make(map[throttleKey]*SubmissionMediator)}
+
 type throttleKey struct {
 	configPath string
 	apiKeyHash [sha256.Size]byte
@@ -64,6 +69,7 @@ type Torbox struct {
 	client                *request.Client
 	throttle              *request.Throttle
 	negativeCache         *NegativeCache
+	mediator              *SubmissionMediator
 	logger                zerolog.Logger
 	Profile               *types.Profile
 	config                config.Debrid
@@ -92,6 +98,9 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 	defer sharedThrottle.Unlock()
 	sharedNegativeCache.Lock()
 	defer sharedNegativeCache.Unlock()
+	sharedMediator.Lock()
+	defer sharedMediator.Unlock()
+
 	headers := map[string]string{
 		"Authorization": fmt.Sprintf("Bearer %s", dc.APIKey),
 	}
@@ -117,6 +126,15 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 	if !negExisting {
 		negCache = NewNegativeCache(negTTL, negMax)
 		sharedNegativeCache.byProvider[key] = negCache
+	}
+
+	mediator, medExisting := sharedMediator.byProvider[key]
+	if !medExisting {
+		mediator, err = NewSubmissionMediator(nil, dc, negCache, _log)
+		if err != nil {
+			return nil, err
+		}
+		sharedMediator.byProvider[key] = mediator
 	}
 
 	// TorBox enforces a hard cap of 300 req/min per API key, applied
@@ -155,8 +173,10 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 		client:                request.New(opts...),
 		throttle:              throttle,
 		negativeCache:         negCache,
+		mediator:              mediator,
 		logger:                _log,
 	}
+	mediator.tb = tb
 
 	// One shared /requestdl budget per configured provider, used by every
 	// client and worker (API client, download accounts, streaming reads). The
@@ -426,6 +446,29 @@ func (tb *Torbox) doPostJSON(endpoint string, payload any, result any) (*http.Re
 }
 
 func (tb *Torbox) IsAvailable(hashes []string) map[string]bool {
+	if tb.mediator != nil && tb.mediator.IsEnabled() {
+		res, err := tb.mediator.CheckCached(context.Background(), hashes)
+		if err == nil {
+			return res
+		}
+	}
+	res, _ := tb.executeCheckCached(hashes)
+	return res
+}
+
+func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
+	if tb.mediator != nil && tb.mediator.IsEnabled() {
+		return tb.mediator.Submit(context.Background(), torrent)
+	}
+
+	hash := torrent.InfoHash
+	if hash == "" && torrent.Magnet != nil {
+		hash = torrent.Magnet.InfoHash
+	}
+	return tb.executeSubmission(torrent, hash)
+}
+
+func (tb *Torbox) executeCheckCached(hashes []string) (map[string]bool, error) {
 	result := make(map[string]bool)
 	negCache := tb.getNegativeCache()
 
@@ -476,18 +519,14 @@ func (tb *Torbox) IsAvailable(hashes []string) map[string]bool {
 			}
 		}
 	}
-	return result
+	return result, nil
 }
 
-func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
+func (tb *Torbox) executeSubmission(torrent *types.Torrent, hash string) (*types.Torrent, error) {
 	var data AddMagnetResponse
 
 	formData := map[string]string{
 		"magnet": torrent.Magnet.Link,
-	}
-	hash := torrent.InfoHash
-	if hash == "" && torrent.Magnet != nil {
-		hash = torrent.Magnet.InfoHash
 	}
 
 	if !torrent.DownloadUncached {
