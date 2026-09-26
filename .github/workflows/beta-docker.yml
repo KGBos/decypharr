@@ -134,7 +134,7 @@ jobs:
           retention-days: 1
 
   merge:
-    needs: build
+    needs: [ prepare, build ]
     runs-on: ubuntu-latest
     steps:
       - name: Download Docker Hub digests
