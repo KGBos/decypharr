@@ -12,7 +12,6 @@ permissions:
   packages: write
 
 env:
-  REGISTRY_GHCR: ghcr.io/${{ github.repository }}
   LDFLAGS_PKG: github.com/sirrobot01/decypharr/pkg/version
 
 jobs:
@@ -23,6 +22,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       channel: ${{ steps.meta.outputs.channel }}
       tag: ${{ steps.meta.outputs.tag }}
+      ghcr_repo: ${{ steps.meta.outputs.ghcr_repo }}
     steps:
       - uses: actions/checkout@v4
       - name: Extract version, channel, and tag
@@ -45,9 +45,11 @@ jobs:
             VERSION="3.0.0-liteflix.${DATE}.${SHORT_SHA}"
             CHANNEL="stable"
           fi
+          GHCR_REPO="ghcr.io/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
+          echo "ghcr_repo=${GHCR_REPO}" >> "$GITHUB_OUTPUT"
 
   # Build Linux binaries (CGO required for FUSE + rapidyenc)
   build-linux:
@@ -218,8 +220,8 @@ jobs:
             VERSION=${{ needs.prepare.outputs.version }}
             CHANNEL=${{ needs.prepare.outputs.channel }}
           tags: |
-            ${{ env.REGISTRY_GHCR }}:${{ needs.prepare.outputs.tag }}
-            ${{ env.REGISTRY_GHCR }}:latest
+            ${{ needs.prepare.outputs.ghcr_repo }}:${{ needs.prepare.outputs.tag }}
+            ${{ needs.prepare.outputs.ghcr_repo }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
