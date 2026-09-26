@@ -349,15 +349,12 @@ func (b *Throttle) Observe(resp *http.Response, read bool) {
 	}
 	b.consecutive++
 	serverWait, hasServerWait := retryAfterWait(resp)
-	if !hasServerWait {
-		b.uncertain = true
-		b.open = true
-		b.logger.Error().Msg("TorBox HTTP 429 has no usable retry deadline; operator recovery required")
-		return
+	wait := retryAfterBackoff(time.Second, b.backoffMax, b.consecutive-1, resp)
+	if hasServerWait {
+		// Retry-After is a provider deadline, not a suggested backoff. The local
+		// backoff ceiling must never shorten it.
+		wait = max(wait, serverWait)
 	}
-	// Retry-After is a provider deadline, not a suggested backoff. The local
-	// backoff ceiling must never shorten it.
-	wait := serverWait
 	opening := !b.open && b.consecutive >= b.threshold
 	if b.consecutive >= b.threshold {
 		// A re-trip (consecutive beyond the threshold, no success since the

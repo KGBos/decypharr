@@ -167,32 +167,106 @@ func TestWireFailureClass(t *testing.T) {
 	}
 }
 
-func TestPersistentGateFailsClosedWithoutProviderDeadline(t *testing.T) {
+func TestDeadlineless429OpensCircuitAndRecoversWithoutOperatorAction(t *testing.T) {
 	config.SetConfigPath(t.TempDir())
 	path := filepath.Join(t.TempDir(), "gate", "state.json")
-	first := NewThrottle(3, time.Minute, 5*time.Minute, zerolog.Nop())
-	if err := first.WithPersistentState(path); err != nil {
+	var nowMu sync.Mutex
+	fakeNow := time.Now()
+	nowFn := func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return fakeNow
+	}
+	advance := func(d time.Duration) {
+		nowMu.Lock()
+		fakeNow = fakeNow.Add(d)
+		nowMu.Unlock()
+	}
+
+	gate := NewThrottle(1, time.Minute, 5*time.Minute, zerolog.Nop())
+	gate.now = nowFn
+	if err := gate.WithPersistentState(path); err != nil {
 		t.Fatal(err)
 	}
+
 	var calls atomic.Int64
+	var status atomic.Int32
+	status.Store(http.StatusTooManyRequests)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
-		w.WriteHeader(http.StatusTooManyRequests)
+		w.WriteHeader(int(status.Load()))
 	}))
 	defer server.Close()
-	resp, err := New(WithThrottle(first), WithMaxRetries(5)).Get(server.URL)
-	if resp != nil {
-		resp.Body.Close()
+
+	client := New(WithThrottle(gate), WithMaxRetries(5))
+
+	// 1. First request receives 429 with no Retry-After.
+	resp, err := client.Get(server.URL)
+	if err != nil || resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 response without client error, got resp=%v err=%v", resp, err)
 	}
-	if BackpressureError(err) == nil || calls.Load() != 1 {
-		t.Fatalf("unknown deadline retried: err=%v calls=%d", err, calls.Load())
+	resp.Body.Close()
+	if calls.Load() != 1 {
+		t.Fatalf("expected exactly 1 call (no retry loops on 429), got %d", calls.Load())
 	}
-	restarted := NewThrottle(3, time.Minute, 5*time.Minute, zerolog.Nop())
-	if err := restarted.WithPersistentState(path); err != nil {
-		t.Fatal(err)
+
+	// 2. Immediate subsequent calls fail fast without hitting wire.
+	if err := gate.Before(); BackpressureError(err) == nil || BackpressureError(err).RetryAfter <= 0 {
+		t.Fatalf("expected circuit to be open with positive RetryAfter during cooldown, got %v", err)
 	}
-	if err := restarted.Before(); BackpressureError(err) == nil || BackpressureError(err).RetryAfter >= 0 {
-		t.Fatalf("restart lost unknown deadline: %v", err)
+	if _, err := client.Get(server.URL); BackpressureError(err) == nil || BackpressureError(err).RetryAfter <= 0 || calls.Load() != 1 {
+		t.Fatalf("expected client to fail fast at gate during cooldown, err=%v calls=%d", err, calls.Load())
+	}
+
+	// 3. Advance clock past cooldown (1 minute).
+	advance(61 * time.Second)
+
+	// 4. Circuit should now be closed; submissions resume without restart or operator action.
+	if err := gate.Before(); err != nil {
+		t.Fatalf("expected circuit to close after cooldown, got err=%v", err)
+	}
+
+	// 5. Provider is now healthy (200 OK).
+	status.Store(http.StatusOK)
+	resp2, err2 := client.Get(server.URL)
+	if err2 != nil || resp2.StatusCode != http.StatusOK {
+		t.Fatalf("expected successful 200 OK request after cooldown, got resp=%v err=%v", resp2, err2)
+	}
+	resp2.Body.Close()
+	if calls.Load() != 2 {
+		t.Fatalf("expected call to reach provider after cooldown, got %d", calls.Load())
+	}
+
+	// 6. Verify journal state on disk is idle.
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.Contains(string(data), `"idle"`) {
+		t.Fatalf("expected journal to be idle after recovery, got: %s", string(data))
+	}
+
+	// 7. Verify escalation on repeated deadline-less 429s without tight retry loops.
+	status.Store(http.StatusTooManyRequests)
+	// First trip of new sequence: wait is cooldown (60s).
+	resp3, err3 := client.Get(server.URL)
+	if err3 != nil || resp3.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on trip, got resp=%v err=%v", resp3, err3)
+	}
+	resp3.Body.Close()
+	if err := gate.Before(); BackpressureError(err) == nil || BackpressureError(err).RetryAfter < time.Minute {
+		t.Fatalf("expected >= 60s cooldown, got %v", err)
+	}
+
+	// Advance past 60s cooldown and trip again: escalation level 1 doubles cooldown to 120s.
+	advance(61 * time.Second)
+	resp4, err4 := client.Get(server.URL)
+	if err4 != nil || resp4.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on retrip, got resp=%v err=%v", resp4, err4)
+	}
+	resp4.Body.Close()
+	if err := gate.Before(); BackpressureError(err) == nil || BackpressureError(err).RetryAfter < 2*time.Minute {
+		t.Fatalf("expected escalated cooldown >= 120s on retrip, got %v", err)
 	}
 }
 
