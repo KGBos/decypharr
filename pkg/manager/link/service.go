@@ -196,9 +196,18 @@ func (s *Service) fetchAndValidate(ctx context.Context, entry *storage.Entry, fi
 					// Account swap doesn't consume a re-insertion attempt.
 					return s.fetchAndValidate(ctx, entry, filename, attempt)
 				}
-			} else if linkErr.ShouldRefetch() || linkErr.ShouldRetry() {
-				// Invalidate and refetch
+			} else if linkErr.ShouldRefetch() {
+				// The link itself is stale or rejected; a fresh one is needed.
 				return s.invalidateAndRefetch(ctx, entry, link, attempt)
+			} else if linkErr.ShouldRetry() {
+				// Transient provider/CDN state (5xx, wire blip, unknown code):
+				// the link itself is not known to be bad, so do not delete it
+				// or spend another requestdl on a refetch — invalidating the
+				// cached link per attempt is upstream #381's poll-driven API
+				// flood. Return the error without memoising it: the next
+				// GetLink revalidates the same link, so a wobble that has
+				// cleared recovers on the next attempt.
+				return emptyDownloadLink, validationErr
 			}
 		}
 	}
