@@ -11,6 +11,8 @@ type Debrid struct {
 	TorboxBreakerThreshold       int      `json:"torbox_breaker_threshold,omitempty"`
 	TorboxBreakerCooldown        string   `json:"torbox_breaker_cooldown,omitempty"`
 	TorboxReadWaitMax            string   `json:"torbox_read_wait_max,omitempty"`
+	TorboxNegativeCacheTTL       string   `json:"torbox_negative_cache_ttl,omitempty"`
+	TorboxNegativeCacheMax       int      `json:"torbox_negative_cache_max,omitempty"`
 	RequestdlBudget              string   `json:"requestdl_budget,omitempty"`       // e.g. 12/minute
 	RequestdlRampSeconds         int      `json:"requestdl_ramp_seconds,omitempty"` // post-penalty ramp, default 300
 	RequestdlFreezeMax           string   `json:"requestdl_freeze_max,omitempty"`   // raw Retry-After ceiling for the bucket, default 48h
