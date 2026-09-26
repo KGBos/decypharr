@@ -13,6 +13,12 @@ type Debrid struct {
 	TorboxReadWaitMax            string   `json:"torbox_read_wait_max,omitempty"`
 	TorboxNegativeCacheTTL       string   `json:"torbox_negative_cache_ttl,omitempty"`
 	TorboxNegativeCacheMax       int      `json:"torbox_negative_cache_max,omitempty"`
+	TorboxSubmissionEnabled      *bool    `json:"torbox_submission_enabled,omitempty"`
+	TorboxCachedCheckRate        string   `json:"torbox_cached_check_rate,omitempty"`
+	TorboxUncachedCreateRate     string   `json:"torbox_uncached_create_rate,omitempty"`
+	TorboxMaxQueueDepth          int      `json:"torbox_max_queue_depth,omitempty"`
+	TorboxMediatorRampSeconds    int      `json:"torbox_mediator_ramp_seconds,omitempty"`
+	TorboxQueueJournalPath       string   `json:"torbox_queue_journal_path,omitempty"`
 	RequestdlBudget              string   `json:"requestdl_budget,omitempty"`       // e.g. 12/minute
 	RequestdlRampSeconds         int      `json:"requestdl_ramp_seconds,omitempty"` // post-penalty ramp, default 300
 	RequestdlFreezeMax           string   `json:"requestdl_freeze_max,omitempty"`   // raw Retry-After ceiling for the bucket, default 48h
@@ -53,6 +59,11 @@ type Debrid struct {
 // a save round-trip instead of being stripped by omitempty.
 func (d Debrid) DownloadsUncached() bool {
 	return d.DownloadUncached != nil && *d.DownloadUncached
+}
+
+// SubmissionEnabled returns true if the TorBox submission mediator is enabled (default true).
+func (d Debrid) SubmissionEnabled() bool {
+	return d.TorboxSubmissionEnabled == nil || *d.TorboxSubmissionEnabled
 }
 
 func (c *Config) updateDebrid(d Debrid) Debrid {
