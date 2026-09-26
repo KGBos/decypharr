@@ -46,6 +46,11 @@ var sharedThrottle = struct {
 	byProvider map[throttleKey]*request.Throttle
 }{byProvider: make(map[throttleKey]*request.Throttle)}
 
+var sharedNegativeCache = struct {
+	sync.Mutex
+	byProvider map[throttleKey]*NegativeCache
+}{byProvider: make(map[throttleKey]*NegativeCache)}
+
 type throttleKey struct {
 	configPath string
 	apiKeyHash [sha256.Size]byte
@@ -58,6 +63,7 @@ type Torbox struct {
 	autoExpiresLinksAfter time.Duration
 	client                *request.Client
 	throttle              *request.Throttle
+	negativeCache         *NegativeCache
 	logger                zerolog.Logger
 	Profile               *types.Profile
 	config                config.Debrid
@@ -77,9 +83,15 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 	if err != nil {
 		return nil, err
 	}
+	negTTL, negMax, err := negativeCacheConfig(dc)
+	if err != nil {
+		return nil, err
+	}
 	key := throttleKey{config.GetMainPath(), sha256.Sum256([]byte(dc.APIKey))}
 	sharedThrottle.Lock()
 	defer sharedThrottle.Unlock()
+	sharedNegativeCache.Lock()
+	defer sharedNegativeCache.Unlock()
 	headers := map[string]string{
 		"Authorization": fmt.Sprintf("Bearer %s", dc.APIKey),
 	}
@@ -99,6 +111,12 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 		if err := throttle.WithPersistentState(statePath); err != nil {
 			return nil, fmt.Errorf("TorBox gate state unavailable: %w", err)
 		}
+	}
+
+	negCache, negExisting := sharedNegativeCache.byProvider[key]
+	if !negExisting {
+		negCache = NewNegativeCache(negTTL, negMax)
+		sharedNegativeCache.byProvider[key] = negCache
 	}
 
 	// TorBox enforces a hard cap of 300 req/min per API key, applied
@@ -136,6 +154,7 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 		autoExpiresLinksAfter: autoExpiresLinksAfter,
 		client:                request.New(opts...),
 		throttle:              throttle,
+		negativeCache:         negCache,
 		logger:                _log,
 	}
 
@@ -271,6 +290,33 @@ func throttleConfig(dc config.Debrid) (time.Duration, time.Duration, time.Durati
 	return backoffMax, cooldown, readWait, threshold, nil
 }
 
+func negativeCacheConfig(dc config.Debrid) (time.Duration, int, error) {
+	ttl := DefaultNegativeCacheTTL
+	maxEntries := DefaultNegativeCacheMax
+	if dc.TorboxNegativeCacheTTL != "" {
+		d, err := time.ParseDuration(dc.TorboxNegativeCacheTTL)
+		if err != nil || d <= 0 || d > maxNegativeCacheTTL {
+			return 0, 0, fmt.Errorf("torbox_negative_cache_ttl must be a positive duration no greater than 48h")
+		}
+		ttl = d
+	}
+	if dc.TorboxNegativeCacheMax != 0 {
+		if dc.TorboxNegativeCacheMax < 1 || dc.TorboxNegativeCacheMax > 1000000 {
+			return 0, 0, fmt.Errorf("torbox_negative_cache_max must be between 1 and 1000000")
+		}
+		maxEntries = dc.TorboxNegativeCacheMax
+	}
+	return ttl, maxEntries, nil
+}
+
+func (tb *Torbox) getNegativeCache() *NegativeCache {
+	if tb.negativeCache != nil {
+		return tb.negativeCache
+	}
+	tb.negativeCache = NewNegativeCache(DefaultNegativeCacheTTL, DefaultNegativeCacheMax)
+	return tb.negativeCache
+}
+
 func (tb *Torbox) Config() config.Debrid {
 	return tb.config
 }
@@ -381,6 +427,7 @@ func (tb *Torbox) doPostJSON(endpoint string, payload any, result any) (*http.Re
 
 func (tb *Torbox) IsAvailable(hashes []string) map[string]bool {
 	result := make(map[string]bool)
+	negCache := tb.getNegativeCache()
 
 	for i := 0; i < len(hashes); i += 100 {
 		end := min(i+100, len(hashes))
@@ -388,6 +435,9 @@ func (tb *Torbox) IsAvailable(hashes []string) map[string]bool {
 		validHashes := make([]string, 0, end-i)
 		for _, hash := range hashes[i:end] {
 			if hash != "" {
+				if _, found := negCache.Get(hash); found {
+					continue
+				}
 				validHashes = append(validHashes, hash)
 			}
 		}
@@ -404,12 +454,25 @@ func (tb *Torbox) IsAvailable(hashes []string) map[string]bool {
 			continue
 		}
 		if res.Data == nil {
-			return result
+			for _, h := range validHashes {
+				negCache.Put(h, "DOWNLOAD_NOT_CACHED", 0)
+			}
+			continue
 		}
 
+		availableSet := make(map[string]bool)
 		for h, c := range *res.Data {
 			if c.Size > 0 {
-				result[strings.ToUpper(h)] = true
+				upperH := strings.ToUpper(h)
+				result[upperH] = true
+				availableSet[strings.ToLower(h)] = true
+				negCache.Evict(h)
+			}
+		}
+
+		for _, h := range validHashes {
+			if !availableSet[strings.ToLower(h)] {
+				negCache.Put(h, "DOWNLOAD_NOT_CACHED", 0)
 			}
 		}
 	}
@@ -422,14 +485,25 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 	formData := map[string]string{
 		"magnet": torrent.Magnet.Link,
 	}
+	hash := torrent.InfoHash
+	if hash == "" && torrent.Magnet != nil {
+		hash = torrent.Magnet.InfoHash
+	}
+
 	if !torrent.DownloadUncached {
-		hash := torrent.InfoHash
-		if hash == "" && torrent.Magnet != nil {
-			hash = torrent.Magnet.InfoHash
-		}
 		if hash == "" {
 			return nil, fmt.Errorf("missing info hash for TorBox cache check")
 		}
+		// Negative cache check: local fast-reject if recently found uncached
+		if verdict, found := tb.getNegativeCache().Get(hash); found {
+			tb.logger.Debug().
+				Str("hash", hash).
+				Str("reason", verdict.Reason).
+				Time("expires_at", verdict.ExpiresAt).
+				Msg("TorBox negative cache hit; rejecting locally without wire call")
+			return nil, fmt.Errorf("DOWNLOAD_NOT_CACHED")
+		}
+
 		var availability AvailableResponse
 		check, err := tb.doGet("/api/torrents/checkcached", map[string]string{"hash": hash}, &availability)
 		if err != nil {
@@ -448,8 +522,10 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 			}
 		}
 		if !cached {
+			tb.getNegativeCache().Put(hash, "DOWNLOAD_NOT_CACHED", 0)
 			return nil, fmt.Errorf("DOWNLOAD_NOT_CACHED")
 		}
+		tb.getNegativeCache().Evict(hash)
 		formData["add_only_if_cached"] = "true"
 	}
 
@@ -464,13 +540,13 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 	if data.Data == nil {
 		return nil, fmt.Errorf("error adding torrent")
 	}
-	expectedHash := torrent.InfoHash
-	if expectedHash == "" && torrent.Magnet != nil {
-		expectedHash = torrent.Magnet.InfoHash
-	}
+	expectedHash := hash
 	torrentIdValue, err := parseAddMagnetData(*data.Data, expectedHash)
 	if err != nil {
 		return nil, err
+	}
+	if expectedHash != "" {
+		tb.getNegativeCache().Evict(expectedHash)
 	}
 	torrentId := strconv.Itoa(torrentIdValue)
 	torrent.Id = torrentId
