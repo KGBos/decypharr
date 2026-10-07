@@ -425,13 +425,17 @@ func (tb *Torbox) doPostFormWithClient(ctx context.Context, client *request.Clie
 	defer request.DrainAndClose(resp.Body)
 
 	if result != nil {
-		bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		if readErr == nil && len(bodyBytes) > 0 {
-			if err := stdjson.Unmarshal(bodyBytes, result); err != nil {
-				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-					return resp, err
-				}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if err := request.DecodeJSON(resp, result); err != nil {
+				return resp, err
 			}
+		} else {
+			// Preserve the provider error envelope without retaining unbounded bodies.
+			bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			if readErr != nil {
+				return resp, readErr
+			}
+			_ = stdjson.Unmarshal(bodyBytes, result)
 		}
 	}
 
