@@ -233,7 +233,7 @@ func TestSubmitMagnetCachePreflight(t *testing.T) {
 		wantError        string
 	}{
 		{name: "uncached", checkBody: `{"success":true,"data":{}}`, wantError: "DOWNLOAD_NOT_CACHED", wantChecks: 1},
-		{name: "uncached null", checkBody: `{"success":true,"data":null}`, wantError: "DOWNLOAD_NOT_CACHED", wantChecks: 1},
+		{name: "missing cache data", checkBody: `{"success":true,"data":null}`, wantError: "no data", wantChecks: 1},
 		{name: "cached", checkBody: `{"success":true,"data":{"aabbcc":{"hash":"AABBCC","size":100}}}`, wantChecks: 1, wantCreates: 1},
 		{name: "cache check unavailable", checkStatus: http.StatusBadGateway, wantChecks: 1, wantError: "cache check failed"},
 		{name: "invalid cache result", checkBody: `{"success":false,"data":null}`, wantChecks: 1, wantError: "cache check failed"},
@@ -478,7 +478,7 @@ func TestDeleteTorrentRejectsNonNumericID(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	err := testTorbox(server.URL).DeleteTorrent("not-a-number")
-	if err == nil || !strings.Contains(err.Error(), "invalid torrent id") {
+	if err == nil || !strings.Contains(err.Error(), "invalid TorBox torrent id") {
 		t.Fatalf("DeleteTorrent() error = %v, want invalid torrent id", err)
 	}
 	if called {
@@ -492,5 +492,143 @@ func testTorbox(host string) *Torbox {
 		client: request.New(request.WithMaxRetries(0)),
 		logger: zerolog.Nop(),
 		config: config.Debrid{Name: "torbox"},
+	}
+}
+
+func TestSubmissionRequestsUseDedicatedClient(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	var (
+		mu    sync.Mutex
+		lanes []string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		lanes = append(lanes, r.Header.Get("X-Lane"))
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/torrents/createtorrent":
+			_, _ = fmt.Fprint(w, `{"success":true,"data":{"torrent_id":17,"hash":"ABC"}}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/torrents/mylist":
+			_, _ = fmt.Fprint(w, `{"success":true,"data":{"id":17,"name":"Release.mkv","size":100,"progress":1,"download_state":"completed","download_finished":true,"created_at":"2026-01-02T03:04:05Z","hash":"ABC","files":[{"id":1,"name":"Release.mkv","absolute_path":"Release.mkv","size":100}]}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	tb := testTorbox(server.URL)
+	tb.client = request.New(
+		request.WithHeaders(map[string]string{"X-Lane": "main"}),
+		request.WithMaxRetries(0),
+	)
+	tb.submitClient = request.New(
+		request.WithHeaders(map[string]string{"X-Lane": "submit"}),
+		request.WithMaxRetries(0),
+	)
+
+	torrent := &debridTypes.Torrent{
+		DownloadUncached: true,
+		Magnet:           &utils.Magnet{Link: "magnet:?xt=urn:btih:ABC"},
+	}
+	added, err := tb.SubmitMagnet(torrent)
+	if err != nil {
+		t.Fatalf("SubmitMagnet() error = %v", err)
+	}
+	if _, err := tb.CheckStatus(added); err != nil {
+		t.Fatalf("CheckStatus() error = %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(lanes, []string{"submit", "submit"}) {
+		t.Fatalf("request lanes = %v, want dedicated submission lane", lanes)
+	}
+}
+
+func TestGetTorrentAcceptsObjectAndArrayResponses(t *testing.T) {
+	tests := map[string]string{
+		"object": `{"success":true,"data":{"id":17,"name":"Release.mkv","size":100,"progress":1,"download_state":"completed","download_finished":true,"created_at":"2026-01-02T03:04:05Z","hash":"ABC","files":[{"id":1,"name":"Release.mkv","absolute_path":"Release.mkv","size":100}]}}`,
+		"array":  `{"success":true,"data":[{"id":17,"name":"Release.mkv","size":100,"progress":1,"download_state":"completed","download_finished":true,"created_at":"2026-01-02T03:04:05Z","hash":"ABC","files":[{"id":1,"name":"Release.mkv","absolute_path":"Release.mkv","size":100}]}]}`,
+	}
+
+	for name, body := range tests {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, body)
+			}))
+			t.Cleanup(server.Close)
+
+			torrent, err := testTorbox(server.URL).GetTorrent("17")
+			if err != nil {
+				t.Fatalf("GetTorrent() error = %v", err)
+			}
+			if torrent.Id != "17" || torrent.InfoHash != "ABC" || len(torrent.Files) != 1 {
+				t.Fatalf("GetTorrent() = %#v, want torrent 17 with one file", torrent)
+			}
+		})
+	}
+}
+
+func TestDeleteTorrentUsesControlEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/api/torrents/controltorrent" {
+			t.Errorf("path = %q, want /api/torrents/controltorrent", r.URL.Path)
+		}
+		var payload struct {
+			TorrentID int    `json:"torrent_id"`
+			Operation string `json:"operation"`
+			All       bool   `json:"all"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if payload.TorrentID != 42 || payload.Operation != "delete" || payload.All {
+			t.Errorf("payload = %#v, want torrent 42 delete operation", payload)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"success":true,"detail":"Torrent deleted successfully"}`)
+	}))
+	t.Cleanup(server.Close)
+
+	if err := testTorbox(server.URL).DeleteTorrent("42"); err != nil {
+		t.Fatalf("DeleteTorrent() error = %v", err)
+	}
+}
+
+func TestAvailabilityPreservesKeysAndReportsIncompleteBatches(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls > 1 {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"success":true,"data":{"abc":{"size":100}}}`)
+	}))
+	defer server.Close()
+	hashes := []string{"abc", "AbC", "missing"}
+	for len(hashes) < 100 {
+		hashes = append(hashes, fmt.Sprintf("hash%d", len(hashes)))
+	}
+	hashes = append(hashes, "unchecked")
+	result, err := testTorbox(server.URL).IsAvailable(hashes)
+	if err == nil {
+		t.Fatal("failed batch returned no error")
+	}
+	if !result["abc"] || !result["AbC"] {
+		t.Fatalf("input spelling was lost: %v", result)
+	}
+	if cached, checked := result["missing"]; !checked || cached {
+		t.Fatalf("cache miss = %v, %v", cached, checked)
+	}
+	if _, checked := result["unchecked"]; checked {
+		t.Fatal("failed batch reported a result")
 	}
 }

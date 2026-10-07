@@ -1,6 +1,7 @@
 package torbox
 
 import (
+	"github.com/sirrobot01/decypharr/internal/customerror"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -183,3 +184,10 @@ func (nc *NegativeCache) Clear() {
 	defer nc.mu.Unlock()
 	nc.entries = make(map[string]*NegativeVerdict)
 }
+
+// notCachedVerdict preserves the public provider code while distinguishing a
+// confirmed miss from provider failures that happen to contain the same text.
+type notCachedVerdict struct{}
+
+func (notCachedVerdict) Error() string { return "DOWNLOAD_NOT_CACHED" }
+func (notCachedVerdict) Unwrap() error { return customerror.TorrentNotCachedError }

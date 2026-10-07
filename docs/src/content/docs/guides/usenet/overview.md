@@ -62,7 +62,8 @@ Decypharr can use multiple providers with priority and failover:
         "backbone": "Omicron",
         "ssl": true,
         "max_connections": 10,
-        "priority": 2
+        "priority": 2,
+        "backup": true
       }
     ]
   }
@@ -72,6 +73,23 @@ Decypharr can use multiple providers with priority and failover:
 Lower `priority` = higher preference.
 
 `backbone` is optional. Set it when two providers share the same article spool so Decypharr can skip same-backbone providers after `423/430 article not found` responses.
+
+Set `backup` for a fallback or block-account provider. By default, a backup is
+used only when the primary tier fails or does not have an article; a merely busy
+primary does not spend block-account traffic. To trade block usage for lower
+playback startup latency, opt urgent reads into delayed spillover:
+
+```json
+{
+  "usenet": {
+    "stream_backup_wait": "250ms"
+  }
+}
+```
+
+Only urgent playback demand spills over after this wait. Read-ahead, downloads,
+and maintenance continue waiting for the primary tier. Leave the value unset or
+use `"0"` to disable spillover.
 
 ## Performance Tuning
 
@@ -103,12 +121,19 @@ Lower `priority` = higher preference.
 ```json
 {
   "usenet": {
-    "read_ahead": "16MB"
+    "read_ahead": "16MB",
+    "body_pipeline_depth": 2
   }
 }
 ```
 
 Prefetch buffer for smoother playback. Higher = smoother but more memory.
+Read-ahead bodies use an NNTP pipeline after enough work is queued to keep the
+available prefetch workers occupied; shorter ranges retain full connection
+parallelism. `body_pipeline_depth` accepts 1-4: 1 disables pipelining, 2 is the
+balanced default, and 4 favors throughput on high-latency links. Direct playback
+demand stays at one body per request so it can take priority at the next article
+boundary.
 
 ### Connection Idle Timeout
 
@@ -171,22 +196,21 @@ grabs a replacement release. The check reads one article per video file.
 ```json
 {
   "usenet": {
-    "disk_buffer_path": "/cache/usenet/streams"
+    "disk_path": "/cache/usenet/streams"
   }
 }
 ```
 
-Streams use disk buffer for assembly. Ensure sufficient disk space.
+The default empty `disk_path` keeps the bounded streaming window in memory. Set a path to enable disk-backed rewind buffering, and ensure that location has sufficient free space.
 
-## Repair
+## Health Checks and Replacement
 
-```json
-{
-  "usenet": {
-    "skip_repair": false
-  }
-}
-```
+The health checker samples NZB article availability and can optionally validate
+each media file's container signature. If a file is definitively broken and is
+linked to an Arr item, `auto_repair` deletes it through Arr and triggers a
+replacement search. Connection and provider errors remain inconclusive and do
+not trigger replacement. See the [Health Checker & Repair guide](../repair/) for
+configuration and API details.
 
 ## Arr Integration
 
@@ -216,7 +240,6 @@ See [Sabnzbd Integration](./sabnzbd/) for details.
 
 ### Incomplete Downloads
 
-- Enable `skip_repair: false` for PAR2 repair
 - Check provider retention (old files may be incomplete)
 - Try backup provider if available
 
@@ -242,10 +265,10 @@ Full Usenet config with optimal settings:
     "max_connections": 15,
     "processing_max_connections": 15,
     "read_ahead": "32MB",
+    "body_pipeline_depth": 2,
     "processing_timeout": "15m",
     "availability_sample_percent": 5,
-    "disk_buffer_path": "/cache/usenet",
-    "skip_repair": false
+    "disk_path": "/cache/usenet"
   }
 }
 ```

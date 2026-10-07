@@ -1,6 +1,7 @@
 package account
 
 import (
+	"context"
 	"sync/atomic"
 	"time"
 
@@ -46,7 +47,10 @@ func (a *Account) sliceFileLink(fileLink string) string {
 	return fileLink[0:39]
 }
 
-func (a *Account) GetDownloadLink(id string, file *types.File, fetcher LinkFetcher) (types.DownloadLink, error) {
+func (a *Account) GetDownloadLink(ctx context.Context, id string, file *types.File, fetcher LinkFetcher) (types.DownloadLink, error) {
+	if err := ctx.Err(); err != nil {
+		return types.DownloadLink{}, err
+	}
 	slicedLink := a.sliceFileLink(file.Link)
 	dl, ok := a.links.Load(slicedLink)
 	if ok && dl.Expired() {
@@ -58,7 +62,7 @@ func (a *Account) GetDownloadLink(id string, file *types.File, fetcher LinkFetch
 	}
 	if !ok {
 		var err error
-		dl, err = fetcher(a, id, file)
+		dl, err = fetcher(ctx, a, id, file)
 		if err != nil {
 			return dl, err
 		}

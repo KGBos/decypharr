@@ -1,0 +1,63 @@
+name: Validate
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: ['codex/sync-decypharr-upstream']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install FUSE build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse-dev fuse3
+      - name: Test
+        run: go test -timeout 10m ./...
+      - name: Race-test provider admission and playback
+        run: go test -race -timeout 10m ./internal/request ./pkg/debrid/account ./pkg/debrid/providers/torbox ./pkg/manager/link ./pkg/mount/dfs/backend/hanwen
+      - name: Vet
+        run: go vet ./...
+      - name: Build Linux binaries
+        run: |
+          go build -trimpath -o "$RUNNER_TEMP/decypharr" .
+          go build -trimpath -o "$RUNNER_TEMP/healthcheck" ./cmd/healthcheck
+      - name: Isolated FUSE lifecycle test
+        run: |
+          if [[ ! -c /dev/fuse ]]; then
+            echo "::warning::Real FUSE lifecycle acceptance skipped: runner has no /dev/fuse."
+            exit 0
+          fi
+          go test -c -o "$RUNNER_TEMP/hanwen.test" ./pkg/mount/dfs/backend/hanwen
+          sudo env DECYPHARR_FUSE_TEST=1 unshare --mount --propagation private \
+            "$RUNNER_TEMP/hanwen.test" -test.run '^TestFUSEDelayedCleanupPreservesReplacement$' -test.v
+  assets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run minify-js
+      - name: Verify checked-in JavaScript
+        run: git diff --exit-code -- pkg/server/assets/build/js

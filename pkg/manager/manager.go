@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -18,11 +19,17 @@ import (
 	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/arr"
+	"github.com/sirrobot01/decypharr/pkg/arr/reacquire"
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
+	"github.com/sirrobot01/decypharr/pkg/hearsay"
 	"github.com/sirrobot01/decypharr/pkg/manager/link"
+	"github.com/sirrobot01/decypharr/pkg/manager/virtualfolders"
 	"github.com/sirrobot01/decypharr/pkg/notifications"
+	"github.com/sirrobot01/decypharr/pkg/repair"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/storage/migration"
+	"github.com/sirrobot01/decypharr/pkg/strm"
 	"github.com/sirrobot01/decypharr/pkg/usenet"
 	"github.com/sirrobot01/decypharr/pkg/version"
 	"golang.org/x/sync/singleflight"
@@ -31,14 +38,20 @@ import (
 // Manager handles unified torrent management - replaces wire.Store completely
 type Manager struct {
 	storage      *storage.Storage
-	migrator     *Migrator
-	repair       *Repair
+	migrator     *migration.Migrator
+	repair       *repair.Service
 	clients      *xsync.Map[string, debrid.Client]
-	arr          *arr.Storage
+	arr          *arr.Service
+	arrService   *reacquire.Service
+	arrIndexer   *reacquire.Indexer
 	logger       zerolog.Logger
 	ready        chan struct{}
 	readyOnce    sync.Once
 	streamClient *http.Client
+
+	arrRecoveryMu          sync.RWMutex
+	arrRecovery            ArrRecovery
+	reacquireNotifications sync.Map
 
 	// Migration jobs tracking
 	migrationJobs   *xsync.Map[string, *storage.SwitcherJob]
@@ -59,8 +72,11 @@ type Manager struct {
 	fixer *Fixer
 	ctx   context.Context
 
+	// strm reconciler
+	strm *strm.Reconciler
+
 	virtualFoldersMu sync.RWMutex
-	virtualFolders   *VirtualFolders
+	virtualFolders   *virtualfolders.Folders
 	mountManager     MountManager
 
 	startTime     time.Time
@@ -82,6 +98,11 @@ type Manager struct {
 	// re-fires before the previous pass has updated the queue row.
 	processingEntries *xsync.Map[string, struct{}]
 
+	// Suppresses repeated provider submissions for the same torrent after an
+	// Arr import/re-grab loop. The queue itself handles duplicates while an
+	// entry is present; this gate covers the short window after Arr deletes it.
+	torrentSubmissions *torrentSubmissionGate
+
 	// Unified active-download queue for torrent and NZB imports.
 	jobQueue  *JobQueue
 	nzbSyncMu sync.Mutex
@@ -92,11 +113,20 @@ type Manager struct {
 	cacheWarmGate *cacheWarmGate
 	// warmOneFileFn, when set, replaces warmOneFile. Tests use it to observe
 	// concurrency without touching the mount.
-	warmOneFileFn func(ctx context.Context, path string) error
+	warmOneFileFn    func(ctx context.Context, path string) error
+	downloadMu       sync.Mutex
+	downloadTasks    sync.WaitGroup
+	downloadsStopped bool
+	cancelDownloads  context.CancelFunc
 
 	// Notifications service
 	Notifications *notifications.Service
+
+	// Hearsay network participation; nil when disabled.
+	hearsay *hearsay.Service
 }
+
+var _ repair.Backend = (*Manager)(nil)
 
 // New creates a new Manager instance
 func New() *Manager {
@@ -153,7 +183,7 @@ func New() *Manager {
 		logger:                 _logger,
 		migrationJobs:          xsync.NewMap[string, *storage.SwitcherJob](),
 		config:                 cfg,
-		arr:                    arr.NewStorage(),
+		arr:                    arr.New(),
 		queue:                  newQueue(strg, cfg.RemoveStalledAfter),
 		ctx:                    ctx,
 		ready:                  make(chan struct{}),
@@ -162,6 +192,7 @@ func New() *Manager {
 		debridSpeedTestResults: xsync.NewMap[string, debridTypes.SpeedTestResult](),
 		activeStreams:          xsync.NewMap[string, *ActiveStream](),
 		processingEntries:      xsync.NewMap[string, struct{}](),
+		torrentSubmissions:     newTorrentSubmissionGate(torrentSubmissionDedupWindow),
 	}
 
 	instance.init()
@@ -171,6 +202,10 @@ func New() *Manager {
 }
 
 func (m *Manager) init() {
+	m.downloadMu.Lock()
+	m.ctx, m.cancelDownloads = context.WithCancel(context.Background())
+	m.downloadsStopped = false
+	m.downloadMu.Unlock()
 	cfg := config.Get()
 	scheduler, err := gocron.NewScheduler(gocron.WithLocation(time.Local), gocron.WithGlobalJobOptions(gocron.WithTags("decypharr-manager")))
 	if err != nil {
@@ -201,7 +236,7 @@ func (m *Manager) init() {
 
 	m.scheduler = scheduler
 	m.cetScheduler = cetScheduler
-	m.migrator = NewMigrator(m.storage)
+	m.migrator = migration.New(m.storage)
 	m.downloader = NewDownloadManager(m)
 
 	// Initialize HTTP pool for streaming
@@ -231,19 +266,59 @@ func (m *Manager) init() {
 	// Initialize fixer
 	m.fixer = NewFixer(m)
 
+	// Initialize strm reconciler
+	m.strm = strm.NewReconciler(m.ctx, m.storage, func(ctx context.Context, entry *storage.Entry, filename string) (io.ReadCloser, error) {
+		return m.OpenStreamUntracked(ctx, entry, filename, 0)
+	}, m.logger)
+
 	// Set mount paths
 	m.setMountPaths()
 
 	m.initEntryCache()
+	m.initArrServices()
 
 	// Initialize notifications service
 	m.Notifications = notifications.New(&m.config.Notifications, m.logger)
 
-	// Initialize repair service. It registers with the scheduler in StartWorker.
-	m.repair = NewRepair(m)
+	// Initialize Hearsay state and its default network participation.
+	if hs, err := hearsay.New(m.config, m.logger); err != nil {
+		m.logger.Warn().Err(err).Msg("Hearsay disabled: failed to initialize")
+	} else {
+		m.hearsay = hs
+	}
+
+	m.repair = repair.New(repair.Dependencies{
+		Scheduler:     m.scheduler,
+		Backend:       m,
+		Storage:       m.storage,
+		Arrs:          m.arr,
+		Reacquirer:    m.arrService,
+		Usenet:        m.usenet,
+		Notifications: m.Notifications,
+		Hearsay:       m.hearsay,
+	})
 
 	// Initialize the unified active-download queue after all processors exist.
 	m.initJobQueue()
+}
+
+func (m *Manager) initArrServices() {
+	service, err := reacquire.NewService(reacquire.ServiceOptions{
+		Arrs:      m.arr,
+		Directory: filepath.Join(config.GetMainPath(), "db"),
+		Handler:   reacquire.NewHandler(m.arr, m),
+	})
+	if err != nil {
+		m.logger.Error().Err(err).Msg("Failed to initialize Arr reacquisition service")
+		m.arrService = nil
+		m.arrIndexer = nil
+		m.SetArrRecovery(nil)
+		return
+	}
+	m.arrService = service
+	m.arrIndexer = reacquire.NewIndexer(m.arr, managedArrCatalog{storage: m.storage, logger: m.logger}, service,
+		filepath.Join(m.config.Mount.MountPath, EntryAllFolder))
+	m.SetArrRecovery(service)
 }
 
 func (m *Manager) initUsenet() {
@@ -277,22 +352,30 @@ func (m *Manager) initJobQueue() {
 	// for 60-90 minutes on big libraries, during which every arr reported
 	// "download client unavailable". Backgrounding lets the API serve and the
 	// worker pool drain immediately while the restore catches up.
-	go func() {
+	m.startDownloadTask(func() {
 		defer func() {
 			if r := recover(); r != nil {
 				m.logger.Error().Interface("panic", r).Msg("Recovered from panic while restoring active downloads")
 			}
 		}()
 		m.restoreActiveDownloadJobs()
-	}()
+	})
+}
+
+// startDownloadTask registers work before shutdown can wait for it.
+// Once shutdown starts, queued entries stay in storage for the next start.
+func (m *Manager) startDownloadTask(task func()) bool {
+	m.downloadMu.Lock()
+	defer m.downloadMu.Unlock()
+	if m.downloadsStopped {
+		return false
+	}
+	m.downloadTasks.Go(task)
+	return true
 }
 
 func (m *Manager) processJob(ctx context.Context, job *Job) {
 	if job == nil {
-		return
-	}
-	if job.Entry != nil && job.Request == nil && job.DebridTorrent == nil && job.NZBMeta == nil && !job.ResumeExisting {
-		m.waitForDownloadCompletion(ctx, job.Entry)
 		return
 	}
 
@@ -325,27 +408,11 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 		}
 		return
 	}
-
-	m.waitForDownloadCompletion(ctx, job.Entry)
-}
-
-func (m *Manager) waitForDownloadCompletion(ctx context.Context, entry *storage.Entry) {
-	if entry == nil {
-		return
-	}
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		current, err := m.queue.GetTorrent(entry.InfoHash)
-		if err != nil || current.State != storage.EntryStateDownloading {
-			return
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
+	// The worker slot is released as soon as the job is handed off. Waiting
+	// here until the entry left the downloading state parked a worker for the
+	// whole post-download lifecycle - including the 30 minute mount wait of the
+	// symlink action - so a handful of slow imports stalled every job the arrs
+	// submitted. processQueuedEntries drives the entry from here.
 }
 
 func (m *Manager) migrate() {
@@ -354,7 +421,6 @@ func (m *Manager) migrate() {
 	if err == nil && !status.Running && status.Completed > 0 {
 		m.logger.Info().
 			Int("completed", status.Completed).
-			Int("errors", status.Errors).
 			Msg("Migration already completed previously")
 		return
 	}
@@ -403,6 +469,17 @@ func (m *Manager) Start(ctx context.Context) error {
 	// run the migration process
 	m.migrate()
 
+	if m.arrService != nil {
+		if err := m.arrService.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start Arr reacquisition service: %w", err)
+		}
+	}
+	if m.arrIndexer != nil {
+		if err := m.arrIndexer.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start Arr indexer: %w", err)
+		}
+	}
+
 	go func() {
 		m.syncTorrents(ctx)
 		// Sync NZBs
@@ -413,11 +490,20 @@ func (m *Manager) Start(ctx context.Context) error {
 			m.logger.Info().Msg("Starting NZB file size correction as requested by environment variable")
 			m.fixNZBFileSizes(ctx)
 		}
+		// Converge the .strm export tree with config applied since last run.
+		m.strm.SweepAsync("startup")
 	}()
 
 	// Start workers
 	if err := m.StartWorker(ctx); err != nil {
 		return fmt.Errorf("failed to start manager worker: %w", err)
+	}
+
+	// Start network participation when the operator opted in.
+	if m.hearsay != nil {
+		if err := m.hearsay.Start(ctx); err != nil {
+			m.logger.Warn().Err(err).Msg("Failed to start hearsay network participation")
+		}
 	}
 
 	// Close ready channel once, safe for multiple calls
@@ -441,14 +527,12 @@ func (m *Manager) Start(ctx context.Context) error {
 // Stop stops the manager and cleans up all resources
 func (m *Manager) Stop() error {
 	m.logger.Info().Msg("Stopping manager")
-
-	// Stop mount manager first
-	if m.mountManager != nil {
-		m.logger.Info().Msg("Stopping mount manager")
-		if err := m.mountManager.Stop(); err != nil {
-			return fmt.Errorf("failed to stop mount manager: %w", err)
-		}
+	m.downloadMu.Lock()
+	m.downloadsStopped = true
+	if m.cancelDownloads != nil {
+		m.cancelDownloads()
 	}
+	m.downloadMu.Unlock()
 
 	// Stop schedulers
 	if m.scheduler != nil {
@@ -467,6 +551,28 @@ func (m *Manager) Stop() error {
 		m.jobQueue.Close()
 	}
 
+	m.downloadTasks.Wait()
+
+	// Downloads have saved their final or resumable state.
+	if m.mountManager != nil {
+		m.logger.Info().Msg("Stopping mount manager")
+		if err := m.mountManager.Stop(); err != nil {
+			return fmt.Errorf("failed to stop mount manager: %w", err)
+		}
+	}
+	if m.repair != nil {
+		m.repair.Stop()
+	}
+	if m.arrIndexer != nil {
+		m.arrIndexer.Close()
+	}
+	if m.arrService != nil {
+		if err := m.arrService.Close(); err != nil {
+			m.logger.Warn().Err(err).Msg("Failed to close Arr reacquisition service")
+		}
+	}
+	m.SetArrRecovery(nil)
+
 	// Close usenet connection manager if active
 	if m.usenet != nil {
 		m.logger.Info().Msg("Closing usenet connections")
@@ -475,9 +581,7 @@ func (m *Manager) Stop() error {
 		}
 	}
 
-	if m.repair != nil {
-		m.repair.Stop()
-	}
+	m.hearsay.Close()
 
 	// Close storage
 	if m.storage != nil {
@@ -583,6 +687,11 @@ func (m *Manager) AddOrUpdate(entry *storage.Entry, callback func(t *storage.Ent
 	if err := m.storage.AddOrUpdate(entry); err != nil {
 		return err
 	}
+	// Keep .strm files derived state: any post-completion update (repair,
+	// refresh, provider switch) re-syncs them. Cheap and idempotent.
+	if entry.IsComplete {
+		m.strm.SyncEntryAsync(entry)
+	}
 	if callback != nil {
 		go callback(entry)
 	}
@@ -628,8 +737,14 @@ func (m *Manager) DeleteEntry(infohash string, removePlacements bool) error {
 	if err := m.storage.Delete(infohash); err != nil {
 		return err
 	}
+	m.strm.RemoveEntryAsync(torr)
 	// Refresh entry cache
-	m.RefreshEntries(true)
+	m.InvalidateEntryCache()
+	go func() {
+		if err := m.RefreshMount(); err != nil {
+			m.logger.Error().Err(err).Msg("Mount refresh after entry deletion failed")
+		}
+	}()
 	return nil
 }
 
