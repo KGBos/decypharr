@@ -1024,7 +1024,8 @@ type CacheItem struct {
 	// swapped to nil by Close, loaded per read.
 	downloaders atomic.Pointer[Downloaders]
 
-	metaMu sync.RWMutex
+	metaMu      sync.RWMutex
+	metaWriteMu sync.Mutex
 
 	metaDirty   atomic.Bool
 	metaStateMu sync.RWMutex
@@ -1100,6 +1101,10 @@ func (item *CacheItem) markMetadataDirty() {
 }
 
 func (item *CacheItem) flushMetadata(force bool) {
+	// Snapshot and rename together so an older background flush cannot
+	// overwrite a forced snapshot or race over the shared temporary file.
+	item.metaWriteMu.Lock()
+	defer item.metaWriteMu.Unlock()
 	if item.buf == nil {
 		return
 	}
