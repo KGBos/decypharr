@@ -178,14 +178,42 @@ func TestMediatorPersistentQueueWALAndCrashRecovery(t *testing.T) {
 		t.Fatalf("failed to recover queue: %v", err)
 	}
 
-	// Expected: item1 was completed, item2 and item3 were pending -> recovered len = 2
-	if recoveredQueue.Len() != 2 {
-		t.Fatalf("expected recovered queue len=2, got %d", recoveredQueue.Len())
+	// Pending entries are diagnostic WAL history only; there is no worker that
+	// resumes them after startup, so replay must not reserve queue capacity.
+	if recoveredQueue.Len() != 0 {
+		t.Fatalf("expected recovered queue len=0, got %d", recoveredQueue.Len())
 	}
 
 	// Verify journal file exists and contains entries
 	if _, err := os.Stat(journalPath); os.IsNotExist(err) {
 		t.Fatal("expected journal file to exist on disk")
+	}
+}
+
+func TestMediatorPersistentQueueReplayDoesNotAccumulateAcrossRestarts(t *testing.T) {
+	tempDir := t.TempDir()
+	journalPath := filepath.Join(tempDir, "submission_queue.jsonl")
+	queue, err := NewPersistentSubmissionQueue(journalPath, 500, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("failed to create queue: %v", err)
+	}
+
+	for cycle := 0; cycle < 3; cycle++ {
+		item := &JournalRecord{InfoHash: fmt.Sprintf("hash%d", cycle), Status: StatusPending}
+		if _, err := queue.Enqueue(item); err != nil {
+			t.Fatalf("cycle %d: failed to enqueue: %v", cycle, err)
+		}
+		if got := queue.Len(); got != 1 {
+			t.Fatalf("cycle %d: expected one active item before restart, got %d", cycle, got)
+		}
+
+		queue, err = NewPersistentSubmissionQueue(journalPath, 500, zerolog.Nop())
+		if err != nil {
+			t.Fatalf("cycle %d: failed to recover queue: %v", cycle, err)
+		}
+		if got := queue.Len(); got != 0 {
+			t.Fatalf("cycle %d: expected replayed queue len=0, got %d", cycle, got)
+		}
 	}
 }
 
