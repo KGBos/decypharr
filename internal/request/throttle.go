@@ -112,6 +112,19 @@ func (b *Throttle) WithReadWait(d time.Duration) *Throttle {
 	return b
 }
 
+// ReadWait returns the maximum remaining cooldown a read will wait out.
+func (b *Throttle) ReadWait() time.Duration {
+	if b == nil {
+		return DefaultReadWait
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.readWait > 0 {
+		return b.readWait
+	}
+	return DefaultReadWait
+}
+
 // UseRequestdl attaches the shared /requestdl budget and the predicate that
 // selects the requests it governs. It is set once at provider construction
 // before any request is served.

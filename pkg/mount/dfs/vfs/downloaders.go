@@ -109,6 +109,11 @@ type Downloaders struct {
 	// Circuit breaker - blocks all requests when max errors reached
 	circuitOpen   atomic.Bool  // True when circuit is "open" (blocking all requests)
 	circuitOpenAt atomic.Int64 // Unix nano timestamp when circuit opened
+
+	// Backpressure tracking (provider 429 gate)
+	lastBackpressureErr *request.ThrottleError
+	backpressureUntil   time.Time
+	backpressureTimer   *time.Timer
 }
 
 // ensureStreamTracked makes sure the active stream is registered when reads
@@ -325,6 +330,16 @@ func (dls *Downloaders) DownloadWithPriority(ctx context.Context, r ranges.Range
 		dls.mu.Unlock()
 		return true, nil
 	}
+
+	// Reject immediately if provider is in backpressure cooldown that cannot be waited out
+	if bp := dls.currentBackpressureLocked(); bp != nil {
+		readWait := dls.readWaitLocked()
+		if bp.RetryAfter < 0 || bp.RetryAfter > readWait {
+			dls.mu.Unlock()
+			return false, bp
+		}
+	}
+
 	// Create waiter channel
 	errChan := make(chan error, 1)
 	dls.waiters = append(dls.waiters, waiter{r: r, errChan: errChan, priority: priority})
@@ -437,6 +452,49 @@ func (dls *Downloaders) getLastErr() error {
 	return dls.lastErr
 }
 
+func (dls *Downloaders) providerThrottle() *request.Throttle {
+	if dls.manager == nil || dls.item == nil || dls.item.entry == nil {
+		return nil
+	}
+	client := dls.manager.ProviderClient(dls.item.entry.ActiveProvider)
+	if p, ok := client.(request.ThrottleProvider); ok {
+		return p.RequestThrottle()
+	}
+	return nil
+}
+
+func (dls *Downloaders) readWaitLocked() time.Duration {
+	if gate := dls.providerThrottle(); gate != nil {
+		return gate.ReadWait()
+	}
+	return request.DefaultReadWait
+}
+
+func (dls *Downloaders) currentBackpressureLocked() *request.ThrottleError {
+	if gate := dls.providerThrottle(); gate != nil {
+		if err := gate.Before(); err != nil {
+			if tErr := request.BackpressureError(err); tErr != nil {
+				return tErr
+			}
+		} else {
+			// Provider gate cooldown has expired
+			dls.lastBackpressureErr = nil
+			return nil
+		}
+	}
+	if dls.lastBackpressureErr != nil {
+		if dls.lastBackpressureErr.RetryAfter < 0 {
+			return dls.lastBackpressureErr
+		}
+		if time.Now().Before(dls.backpressureUntil) {
+			remaining := time.Until(dls.backpressureUntil)
+			return &request.ThrottleError{RetryAfter: remaining}
+		}
+		dls.lastBackpressureErr = nil
+	}
+	return nil
+}
+
 // ensureDownloaderLocked finds or creates a downloader for the range.
 // It extends the requested range by readAheadSize before clipping to missing
 // data, so the downloader's target always stays ahead of the read position.
@@ -467,6 +525,14 @@ func (dls *Downloaders) ensureDownloaderLocked(r ranges.Range, priority bool) er
 			return fmt.Errorf("too many errors (%d)", dls.errorCount)
 		}
 		return fmt.Errorf("too many errors (%d): last error: %w", dls.errorCount, dls.lastErr)
+	}
+
+	// Reject if provider backpressure cannot be waited out
+	if bp := dls.currentBackpressureLocked(); bp != nil {
+		readWait := dls.readWaitLocked()
+		if bp.RetryAfter < 0 || bp.RetryAfter > readWait {
+			return bp
+		}
 	}
 
 	// Look for existing downloader in range
@@ -599,6 +665,11 @@ func (dls *Downloaders) countErrors(n int64, err error) {
 	if err == nil && n > 0 {
 		dls.errorCount = 0
 		dls.lastErr = nil
+		dls.lastBackpressureErr = nil
+		if dls.backpressureTimer != nil {
+			dls.backpressureTimer.Stop()
+			dls.backpressureTimer = nil
+		}
 		// Success resets circuit breaker
 		dls.resetCircuitLocked()
 		return
@@ -615,7 +686,13 @@ func (dls *Downloaders) countErrors(n int64, err error) {
 		// circuit breaker and leave a healthy file unreadable after the
 		// gate clears — exactly what ThrottleError promises not to do
 		// ("ends the current read/chunk attempt without poisoning the file").
-		if request.BackpressureError(err) != nil {
+		if throttleErr := request.BackpressureError(err); throttleErr != nil {
+			dls.lastBackpressureErr = throttleErr
+			if throttleErr.RetryAfter > 0 {
+				dls.backpressureUntil = time.Now().Add(throttleErr.RetryAfter)
+			} else {
+				dls.backpressureUntil = time.Time{}
+			}
 			return
 		}
 		dls.errorCount++
@@ -651,6 +728,11 @@ func (dls *Downloaders) kickWaiters() {
 	// Check circuit state once to avoid spinning
 	circuitOpen := dls.circuitOpen.Load()
 
+	// Check provider backpressure state
+	bpErr := dls.currentBackpressureLocked()
+	readWait := dls.readWaitLocked()
+	cannotWaitBackpressure := bpErr != nil && (bpErr.RetryAfter < 0 || bpErr.RetryAfter > readWait)
+
 	fulfilled := 0
 	remaining := dls.waiters[:0]
 	// One metaMu acquisition for the whole scan; this runs under dls.mu, so
@@ -669,6 +751,12 @@ func (dls *Downloaders) kickWaiters() {
 			// Circuit is open or max errors reached - fail waiter without creating new downloaders
 			w.errChan <- dls.lastErr
 			fulfilled++
+		} else if cannotWaitBackpressure {
+			// Backpressure cannot be waited out (RetryAfter > readWait or RetryAfter < 0) -
+			// fail waiter with typed ThrottleError so read attempt ends cleanly without
+			// consuming file circuit breaker budget or spinning downloaders.
+			w.errChan <- bpErr
+			fulfilled++
 		} else {
 			remaining = append(remaining, w)
 		}
@@ -682,7 +770,7 @@ func (dls *Downloaders) kickWaiters() {
 
 	// Spawn at most one missing downloader per kick. Re-ensuring for every
 	// waiter can create duplicate stream calls for the same range under load.
-	if len(remaining) == 0 || circuitOpen || dls.errorCount >= maxErrorCount {
+	if len(remaining) == 0 || circuitOpen || dls.errorCount >= maxErrorCount || cannotWaitBackpressure {
 		return
 	}
 
@@ -697,6 +785,21 @@ func (dls *Downloaders) kickWaiters() {
 		dls.waiters = remaining[:0]
 		dls.waiterCount.Store(0)
 		dls.recomputeMinWaiterEndLocked()
+		return
+	}
+
+	// If the provider gate is in backpressure cooldown (short ban that can be waited out),
+	// do not immediately spawn downloaders in a tight loop. Schedule kickWaiters after
+	// cooldown expires.
+	if bpErr != nil && bpErr.RetryAfter > 0 {
+		if dls.backpressureTimer == nil {
+			dls.backpressureTimer = time.AfterFunc(bpErr.RetryAfter, func() {
+				dls.mu.Lock()
+				dls.backpressureTimer = nil
+				dls.mu.Unlock()
+				dls.kickWaiters()
+			})
+		}
 		return
 	}
 
@@ -728,6 +831,11 @@ func (dls *Downloaders) Close(inErr error) error {
 	}
 	dls.closed = true
 	dls.untrackStreamLocked()
+	if dls.backpressureTimer != nil {
+		dls.backpressureTimer.Stop()
+		dls.backpressureTimer = nil
+	}
+	dls.lastBackpressureErr = nil
 	// An item can die with its breaker open (e.g. idle eviction after a bad
 	// spell); release its slot in the cache-wide gauge or it leaks forever.
 	dls.resetCircuitLocked()
@@ -875,6 +983,11 @@ func (dls *Downloaders) checkIdleTimeout() bool {
 	// breaker the next time the user starts playback.
 	dls.errorCount = 0
 	dls.lastErr = nil
+	dls.lastBackpressureErr = nil
+	if dls.backpressureTimer != nil {
+		dls.backpressureTimer.Stop()
+		dls.backpressureTimer = nil
+	}
 	dls.resetCircuitLocked()
 
 	return true
@@ -892,6 +1005,11 @@ func (dls *Downloaders) StopAll() {
 	}
 	dls.stopping = true
 	dls.untrackStreamLocked()
+	if dls.backpressureTimer != nil {
+		dls.backpressureTimer.Stop()
+		dls.backpressureTimer = nil
+	}
+	dls.lastBackpressureErr = nil
 
 	// Copy slice before unlocking to avoid race during Wait
 	dlsCopy := make([]*downloader, len(dls.dls))
@@ -1176,6 +1294,9 @@ func (dl *downloader) ensureSession() (manager.StreamReader, error) {
 	}
 	if dl.session != nil {
 		return dl.session, nil
+	}
+	if dl.dls.manager == nil {
+		return nil, errors.New("no stream manager configured")
 	}
 	s, err := dl.dls.manager.OpenStreamUntracked(dl.ctx, dl.dls.item.entry, dl.dls.item.filename, dl.offset)
 	if err != nil {
