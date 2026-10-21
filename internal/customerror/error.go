@@ -10,6 +10,8 @@ import (
 	"syscall"
 )
 
+const usenetArticleNotFoundCode = "usenet_article_not_found"
+
 type Error struct {
 	err            error
 	silent         bool
@@ -46,6 +48,13 @@ func (e *Error) IsPermanent() bool {
 	return e.permanent
 }
 
+func (e *Error) StatusCode() int {
+	if e.statusCode < http.StatusBadRequest {
+		return http.StatusInternalServerError
+	}
+	return e.statusCode
+}
+
 func (e *Error) IsSilent() bool {
 	if e.err == nil {
 		return false
@@ -61,40 +70,35 @@ func NewError(err error, statusCode int, code string, silent bool, headersWritte
 		err:            err,
 		silent:         silent,
 		statusCode:     statusCode,
+		Code:           code,
 		HeadersWritten: headersWritten,
 	}
 }
 
 func NewSilentError(err error) *Error {
 	return &Error{
-		err:            err,
-		silent:         true,
-		statusCode:     http.StatusInternalServerError,
-		HeadersWritten: false,
+		err:        err,
+		silent:     true,
+		statusCode: http.StatusInternalServerError,
 	}
 }
 
 func NewPermanentError(err error) *Error {
-	e := &Error{
-		err:            err,
-		silent:         false,
-		statusCode:     http.StatusInternalServerError,
-		HeadersWritten: false,
+	return &Error{
+		err:        err,
+		statusCode: http.StatusInternalServerError,
+		permanent:  true,
 	}
-	return e.Permanent()
 }
 
 func FromError(err error) *Error {
-	var customErr *Error
-	if errors.As(err, &customErr) {
+	if customErr, ok := errors.AsType[*Error](err); ok {
 		return customErr
 	}
 
 	return &Error{
-		err:            err,
-		silent:         false,
-		statusCode:     http.StatusInternalServerError,
-		HeadersWritten: false,
+		err:        err,
+		statusCode: http.StatusInternalServerError,
 	}
 }
 
@@ -104,8 +108,7 @@ func IsSilentError(err error) bool {
 		errors.Is(err, io.ErrClosedPipe) {
 		return true
 	}
-	var netErr *net.OpError
-	if errors.As(err, &netErr) {
+	if netErr, ok := errors.AsType[*net.OpError](err); ok {
 		if errors.Is(netErr.Err, syscall.EPIPE) || errors.Is(netErr.Err, syscall.ECONNRESET) {
 			return true
 		}
@@ -118,9 +121,7 @@ func IsSilentError(err error) bool {
 		return true
 	}
 
-	// Check for custom error type
-	var customErr *Error
-	if errors.As(err, &customErr) {
+	if customErr, ok := errors.AsType[*Error](err); ok {
 		return customErr.silent
 	}
 
@@ -132,6 +133,14 @@ func NewArticleNotFoundError(err error) *Error {
 		err = errors.New("article not found")
 	}
 	return (&Error{
-		err: err,
+		err:        err,
+		statusCode: http.StatusNotFound,
+		Code:       usenetArticleNotFoundCode,
 	}).Permanent()
+}
+
+// IsArticleNotFoundError reports a confirmed permanent Usenet article failure.
+func IsArticleNotFoundError(err error) bool {
+	customErr, ok := errors.AsType[*Error](err)
+	return ok && customErr.Code == usenetArticleNotFoundCode && customErr.IsPermanent()
 }

@@ -200,16 +200,7 @@ func (c *Client) Get(url string) (*http.Response, error) {
 	return c.Do(req)
 }
 
-// zerologAdapter bridges zerolog to the retryablehttp.Logger interface so that
-// retry events (including 429 backoffs) appear in decypharr's structured log.
-type zerologAdapter struct{ log zerolog.Logger }
-
-func (z zerologAdapter) Printf(format string, args ...interface{}) {
-	z.log.Debug().Msgf(format, args...)
-}
-
-// retryAfterBackoff uses the WithRetryWait ceiling, including Retry-After.
-// TorBox raises that ceiling to minutes; other clients retain their defaults.
+// retryAfterBackoff uses the configured retry ceiling. Shared TorBox gates honor the full deadline.
 func retryAfterBackoff(min, max time.Duration, attemptNum int, resp *http.Response) time.Duration {
 	if resp == nil || resp.StatusCode != http.StatusTooManyRequests {
 		return retryablehttp.DefaultBackoff(min, max, attemptNum, resp)
@@ -372,14 +363,10 @@ func New(options ...ClientOption) *Client {
 			return false, err
 		}
 
-		// First use the default retry policy for error handling
-		// This handles the case when resp is nil (network errors)
-		shouldRetry, defaultErr := retryablehttp.DefaultRetryPolicy(ctx, resp, err)
-		if defaultErr != nil {
-			return false, defaultErr
-		}
-		if shouldRetry {
-			return true, nil
+		// Use the default policy for transport errors. HTTP responses use the
+		// configured status list so provider errors retain their response body.
+		if err != nil || resp == nil {
+			return retryablehttp.DefaultRetryPolicy(ctx, resp, err)
 		}
 
 		// Check for retryable status codes (only if resp is not nil)

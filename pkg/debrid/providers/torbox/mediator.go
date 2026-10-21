@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/sirrobot01/decypharr/internal/customerror"
 	"math"
 	"os"
 	"path/filepath"
@@ -22,12 +23,12 @@ import (
 
 // Standard defaults for the Submission Mediator
 const (
-	DefaultCachedCheckRate       = 240.0 / 60.0       // 240 req/min (4.0/s), TorBox cap: 300/min
-	DefaultUncachedCreateRate    = 45.0 / 3600.0      // 45 req/hour (0.0125/s), TorBox cap: 60/hr
-	DefaultMaxQueueDepth         = 500
-	DefaultMediatorRampSeconds   = 300                // 5 minutes linear relaxation
-	DefaultFloorMultiplier       = 0.20               // 20% floor after 429
-	DefaultQueueJournalFilename  = "submission_queue.jsonl"
+	DefaultCachedCheckRate      = 240.0 / 60.0  // 240 req/min (4.0/s), TorBox cap: 300/min
+	DefaultUncachedCreateRate   = 45.0 / 3600.0 // 45 req/hour (0.0125/s), TorBox cap: 60/hr
+	DefaultMaxQueueDepth        = 500
+	DefaultMediatorRampSeconds  = 300  // 5 minutes linear relaxation
+	DefaultFloorMultiplier      = 0.20 // 20% floor after 429
+	DefaultQueueJournalFilename = "submission_queue.jsonl"
 )
 
 var (
@@ -589,6 +590,9 @@ func (m *SubmissionMediator) IsEnabled() bool {
 
 // Submit mediates an incoming magnet submission through all 4 mechanisms.
 func (m *SubmissionMediator) Submit(ctx context.Context, torrent *types.Torrent) (*types.Torrent, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	hash := torrent.InfoHash
 	if hash == "" && torrent.Magnet != nil {
 		hash = torrent.Magnet.InfoHash
@@ -606,7 +610,7 @@ func (m *SubmissionMediator) Submit(ctx context.Context, torrent *types.Torrent)
 				Str("reason", verdict.Reason).
 				Time("expires_at", verdict.ExpiresAt).
 				Msg("TorBox mediator: negative cache hit; fast-rejecting locally")
-			return nil, fmt.Errorf("DOWNLOAD_NOT_CACHED")
+			return nil, notCachedVerdict{}
 		}
 	}
 
@@ -646,10 +650,10 @@ func (m *SubmissionMediator) Submit(ctx context.Context, torrent *types.Torrent)
 	}
 
 	// Execute Governed Wire Submission
-	res, err := m.tb.executeSubmission(torrent, normalizedHash)
+	res, err := m.tb.executeSubmission(ctx, torrent, normalizedHash)
 
 	if err != nil {
-		if strings.Contains(err.Error(), "DOWNLOAD_NOT_CACHED") {
+		if errors.Is(err, customerror.TorrentNotCachedError) {
 			m.negativeCache.Put(normalizedHash, "DOWNLOAD_NOT_CACHED", 0)
 			m.queue.Complete(normalizedHash, StatusRejected, "DOWNLOAD_NOT_CACHED")
 			m.dedup.Complete(normalizedHash, nil, err)
@@ -675,6 +679,9 @@ func (m *SubmissionMediator) Submit(ctx context.Context, torrent *types.Torrent)
 
 // CheckCached mediates batch availability checks through the rate valve and negative cache.
 func (m *SubmissionMediator) CheckCached(ctx context.Context, hashes []string) (map[string]bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	result := make(map[string]bool)
 
 	validHashes := make([]string, 0, len(hashes))
@@ -684,6 +691,7 @@ func (m *SubmissionMediator) CheckCached(ctx context.Context, hashes []string) (
 		}
 		// Skip known negative-cached hashes
 		if _, found := m.negativeCache.Get(h); found {
+			result[h] = false
 			continue
 		}
 		validHashes = append(validHashes, h)
@@ -699,7 +707,11 @@ func (m *SubmissionMediator) CheckCached(ctx context.Context, hashes []string) (
 	}
 
 	// Execute check
-	return m.tb.executeCheckCached(validHashes)
+	checked, err := m.tb.executeCheckCached(ctx, validHashes)
+	for hash, available := range checked {
+		result[hash] = available
+	}
+	return result, err
 }
 
 // LogTelemetry emits the structured status line defined in spec Section 7.1.

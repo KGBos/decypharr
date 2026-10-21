@@ -25,7 +25,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 COPY . .
 
-# Build main binary — xx-go sets CC/CXX/GOOS/GOARCH automatically
+# Build main binary — xx-go sets CC/CXX/GOOS/GOARCH automatically.
+# Use native libutp to avoid large Go allocations during peer connection setup.
+# The final image includes its C++ runtime dependencies.
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=1 \
@@ -53,8 +55,9 @@ LABEL org.opencontainers.image.title="decypharr"
 LABEL org.opencontainers.image.authors="sirrobot01"
 LABEL org.opencontainers.image.documentation="https://github.com/sirrobot01/decypharr/blob/main/README.md"
 
-# Install dependencies including rclone (from binary)
-RUN apk add --no-cache fuse3 ca-certificates su-exec shadow curl unzip tzdata && \
+# Install dependencies including rclone (from binary).
+# libstdc++/libgcc: required at runtime by rapidyenc's C++ decoder.
+RUN apk add --no-cache fuse3 ca-certificates su-exec shadow curl unzip tzdata libstdc++ libgcc && \
     echo "user_allow_other" >> /etc/fuse.conf && \
     case "$(uname -m)" in \
         x86_64) ARCH=amd64 ;; \
@@ -79,6 +82,9 @@ RUN chmod +x /entrypoint.sh
 ENV PUID=1000
 ENV PGID=1000
 ENV LOG_PATH=/app/logs
+# This anacrolix diagnostic fires whenever an internal unlock handler takes
+# 20ms; actual torrent errors remain visible and operators can override it.
+ENV GO_LOG=client-unlock-handlers.go=err
 
 EXPOSE 8282
 VOLUME ["/app"]

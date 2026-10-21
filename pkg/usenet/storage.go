@@ -6,12 +6,14 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/customerror"
 	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sourcegraph/conc/pool"
@@ -71,6 +73,32 @@ func (s *NZBStorage) metaFilePath(id string) string {
 	return filepath.Join(s.metaDir, id+metaFileExtension)
 }
 
+// readMetaLocked reads an NZB's meta blob. A manifest that is absent while the
+// meta directory itself is present is reported as UsenetManifestMissingError so
+// repair can treat the entry as broken. The directory check matters: an
+// unmounted data dir makes every ReadFile return ENOENT, and without it a
+// missing mount would mark the whole library permanently broken.
+// Caller must hold s.mu.
+func (s *NZBStorage) readMetaLocked(id string) ([]byte, error) {
+	data, err := os.ReadFile(s.metaFilePath(id))
+	if err == nil {
+		return data, nil
+	}
+	if os.IsNotExist(err) {
+		if _, dirErr := os.Stat(s.metaDir); dirErr != nil {
+			return nil, fmt.Errorf("meta directory unavailable: %w", dirErr)
+		}
+		return nil, fmt.Errorf("nzb not found: %s: %w", id, customerror.UsenetManifestMissingError)
+	}
+	return nil, fmt.Errorf("failed to read NZB meta file: %w", err)
+}
+
+// invalidManifest marks a decode failure as permanent: the bytes on disk do not
+// parse, so every later probe of this entry fails the same way.
+func invalidManifest(id string, err error) error {
+	return fmt.Errorf("decode NZB meta %s: %w: %w", id, err, customerror.UsenetManifestInvalidError)
+}
+
 // recalculateStatsLocked rebuilds cached stats by scanning metadata files.
 // Caller must hold s.mu.
 func (s *NZBStorage) recalculateStatsLocked() error {
@@ -102,6 +130,15 @@ func (s *NZBStorage) recalculateStatsLocked() error {
 func (s *NZBStorage) AddNZB(nzb *storage.NZB) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.writeNZBLocked(nzb)
+}
+
+// writeNZBLocked persists an NZB and updates cached storage stats. Caller must
+// hold s.mu.
+func (s *NZBStorage) writeNZBLocked(nzb *storage.NZB) error {
+	if nzb == nil || strings.TrimSpace(nzb.ID) == "" {
+		return fmt.Errorf("NZB and ID are required")
+	}
 
 	data, err := encodeNZBV2(nzb)
 	if err != nil {
@@ -145,13 +182,9 @@ func (s *NZBStorage) GetNZB(id string) (*storage.NZB, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	path := s.metaFilePath(id)
-	data, err := os.ReadFile(path)
+	data, err := s.readMetaLocked(id)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("nzb not found: %s", id)
-		}
-		return nil, fmt.Errorf("failed to read NZB meta file: %w", err)
+		return nil, err
 	}
 
 	return decodeNZB(data)
@@ -164,19 +197,51 @@ func (s *NZBStorage) GetNZBHeader(id string) (*storage.NZB, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	path := s.metaFilePath(id)
-	data, err := os.ReadFile(path)
+	data, err := s.readMetaLocked(id)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("nzb not found: %s", id)
-		}
-		return nil, fmt.Errorf("failed to read NZB meta file: %w", err)
+		return nil, err
 	}
 
 	if isCodecV2(data) {
 		return decodeNZBV2Header(data)
 	}
 	return decodeNZB(data)
+}
+
+// GetNZBFile returns one file of an NZB with its segment map. It decodes only
+// the requested file, so probing one file of a large NZB neither builds nor
+// retains the segment maps of every other file - the full decode aliases every
+// message id into one large buffer, which then stays alive for as long as any
+// of those ids does. Legacy proto files fall back to a full decode. A nil file
+// with a nil error means the file was not found or is deleted.
+func (s *NZBStorage) GetNZBFile(id, filename string) (*storage.NZBFile, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	data, err := s.readMetaLocked(id)
+	if err != nil {
+		return nil, err
+	}
+
+	if isCodecV2(data) {
+		file, err := decodeFileV2(data, filename)
+		if err != nil {
+			return nil, invalidManifest(id, err)
+		}
+		return file, nil
+	}
+
+	nzb, err := decodeNZB(data)
+	if err != nil {
+		return nil, invalidManifest(id, err)
+	}
+	for i := range nzb.Files {
+		if nzb.Files[i].Name == filename && !nzb.Files[i].IsDeleted {
+			file := nzb.Files[i]
+			return &file, nil
+		}
+	}
+	return nil, nil
 }
 
 // SampleFileMessageIDs returns the sampled message ids for a single file,
@@ -189,24 +254,23 @@ func (s *NZBStorage) SampleFileMessageIDs(id, filename string, percent int) ([]s
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	path := s.metaFilePath(id)
-	data, err := os.ReadFile(path)
+	data, err := s.readMetaLocked(id)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("nzb not found: %s", id)
-		}
-		return nil, fmt.Errorf("failed to read NZB meta file: %w", err)
+		return nil, err
 	}
 
 	if isCodecV2(data) {
 		ids, _, err := decodeFileMessageIDsSampled(data, filename, percent)
-		return ids, err
+		if err != nil {
+			return nil, invalidManifest(id, err)
+		}
+		return ids, nil
 	}
 
 	// Legacy proto: full decode then sample in memory.
 	nzb, err := decodeNZB(data)
 	if err != nil {
-		return nil, err
+		return nil, invalidManifest(id, err)
 	}
 	f := nzb.GetFileByName(filename)
 	if f == nil || len(f.Segments) == 0 {
@@ -504,78 +568,6 @@ func fileIsCodecV2(path string) (bool, error) {
 		return false, err
 	}
 	return n == 1 && b[0] == codecMagicV2, nil
-}
-
-// ============================================================================
-// Conversion functions between storage.NZB and NZBProto
-// ============================================================================
-
-func nzbToProto(nzb *storage.NZB) *NZBProto {
-	pb := &NZBProto{
-		Id:               nzb.ID,
-		Name:             nzb.Name,
-		Title:            nzb.Title,
-		Path:             nzb.Path,
-		TotalSize:        nzb.TotalSize,
-		DatePostedUnix:   nzb.DatePosted.Unix(),
-		Category:         nzb.Category,
-		Groups:           nzb.Groups,
-		Downloaded:       nzb.Downloaded,
-		AddedOnUnix:      nzb.AddedOn.Unix(),
-		LastActivityUnix: nzb.LastActivity.Unix(),
-		Status:           nzb.Status,
-		Progress:         nzb.Progress,
-		Percentage:       nzb.Percentage,
-		SizeDownloaded:   nzb.SizeDownloaded,
-		Eta:              nzb.ETA,
-		Speed:            nzb.Speed,
-		CompletedOnUnix:  nzb.CompletedOn.Unix(),
-		IsBad:            nzb.IsBad,
-		Storage:          nzb.Storage,
-		FailMessage:      nzb.FailMessage,
-		Password:         nzb.Password,
-	}
-
-	pb.Files = make([]*NZBFileProto, len(nzb.Files))
-	for i, f := range nzb.Files {
-		pb.Files[i] = nzbFileToProto(&f)
-	}
-
-	return pb
-}
-
-func nzbFileToProto(f *storage.NZBFile) *NZBFileProto {
-	pb := &NZBFileProto{
-		NzbId:         f.NzbID,
-		Name:          f.Name,
-		InternalPath:  f.InternalPath,
-		Size:          f.Size,
-		StartOffset:   f.StartOffset,
-		Groups:        f.Groups,
-		FileType:      string(f.FileType),
-		Password:      f.Password,
-		IsDeleted:     f.IsDeleted,
-		IsStored:      f.IsStored,
-		SegmentSize:   f.SegmentSize,
-		EncryptionKey: f.EncryptionKey,
-		EncryptionIv:  f.EncryptionIV,
-		IsEncrypted:   f.IsEncrypted,
-	}
-
-	pb.Segments = make([]*NZBSegmentProto, len(f.Segments))
-	for i, s := range f.Segments {
-		pb.Segments[i] = &NZBSegmentProto{
-			Number:           int32(s.Number),
-			MessageId:        s.MessageID,
-			Bytes:            s.Bytes,
-			StartOffset:      s.StartOffset,
-			EndOffset:        s.EndOffset,
-			Group:            s.Group,
-			SegmentDataStart: s.SegmentDataStart,
-		}
-	}
-
-	return pb
 }
 
 func protoToNZB(pb *NZBProto) *storage.NZB {

@@ -61,21 +61,15 @@ func (r *RateLimitedLogger) shouldLog(key string) bool {
 	if r.seen.Size() >= r.maxItems {
 		cutoff := now.Add(-r.window)
 
-		r.seen.Range(func(key string, value time.Time) bool {
-			if value.Before(cutoff) {
-				r.seen.Delete(key)
-			}
-			return true
+		r.seen.DeleteMatching(func(_ string, value time.Time) (bool, bool) {
+			return value.Before(cutoff), false
 		})
 		// If still too large, clear half
 		if r.seen.Size() >= r.maxItems {
 			i := 0
-			r.seen.Range(func(key string, value time.Time) bool {
-				if i%2 == 0 {
-					r.seen.Delete(key)
-				}
+			r.seen.DeleteMatching(func(string, time.Time) (bool, bool) {
 				i++
-				return true
+				return i%2 == 1, false
 			})
 		}
 	}
@@ -132,44 +126,6 @@ func (e *RateLimitedEvent) Debug() *zerolog.Event {
 		return e.parent.logger.Debug()
 	}
 	return nopLogger.Debug()
-}
-
-// --- Legacy API (still available) ---
-
-// Error logs an error message with deduplication by key.
-// Deprecated: Use Rate(key).Error() for cleaner API.
-func (r *RateLimitedLogger) Error(key string) *zerolog.Event {
-	if r.shouldLog(key) {
-		return r.logger.Error()
-	}
-	return nil
-}
-
-// Warn logs a warning message with deduplication by key.
-// Deprecated: Use Rate(key).Warn() for cleaner API.
-func (r *RateLimitedLogger) Warn(key string) *zerolog.Event {
-	if r.shouldLog(key) {
-		return r.logger.Warn()
-	}
-	return nil
-}
-
-// Info logs an info message with deduplication by key.
-// Deprecated: Use Rate(key).Info() for cleaner API.
-func (r *RateLimitedLogger) Info(key string) *zerolog.Event {
-	if r.shouldLog(key) {
-		return r.logger.Info()
-	}
-	return nil
-}
-
-// Debug logs a debug message with deduplication by key.
-// Deprecated: Use Rate(key).Debug() for cleaner API.
-func (r *RateLimitedLogger) Debug(key string) *zerolog.Event {
-	if r.shouldLog(key) {
-		return r.logger.Debug()
-	}
-	return nil
 }
 
 // ErrorOnce logs an error only once per key until Reset is called.

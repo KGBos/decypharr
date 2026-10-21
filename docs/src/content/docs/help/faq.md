@@ -199,6 +199,27 @@ And per-provider:
 }
 ```
 
+### Do downloads or repairs compete with playback?
+
+They share the same provider pools, but playback is automatically prioritized.
+The order is urgent playback demand, stream read-ahead, full downloads/imports,
+then repair and other maintenance. A currently transferring NNTP article is
+allowed to finish, then its connection is handed to the highest-priority waiter.
+When no higher-priority work is waiting, lower-priority work can use the full
+connection pool.
+
+### Does Decypharr use NNTP pipelining?
+
+Yes. Repair and availability checks send up to 16 independent `STAT` commands
+per pipeline. Once enough speculative stream read-ahead is queued to keep its
+workers occupied, the remaining bodies use shallow pipelines. The configurable
+`body_pipeline_depth` range is 1-4: 1 disables BODY pipelining, 2 is the balanced
+default, and 4 favors throughput on high-latency links. Urgent playback demand
+always requests one body at a time; read-ahead also stays single-body on a
+single-worker setup. Full downloads remain article-bounded, so newly queued
+playback takes the next released connection instead of sitting behind a deep
+body pipeline.
+
 ## Arr Integration
 
 ### Path mapping not working?
@@ -250,7 +271,7 @@ Set `auto_repair: true` if:
 
 - You have stable providers.
 - You want fully automated operation.
-- You're comfortable with the sweep deleting broken Arr file records and triggering a search.
+- You want broken Arr-managed files automatically deleted and searched again through Arr.
 
 Set `auto_repair: false` if:
 

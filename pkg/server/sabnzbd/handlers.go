@@ -44,14 +44,14 @@ func (s *SABnzbd) handleAPI(w http.ResponseWriter, r *http.Request) {
 	case ModeGetFiles:
 		s.handleGetFiles(w, r)
 	default:
-		// Default to queue if no mode specified
+		// Reject unsupported modes.
 		s.logger.Warn().Str("mode", mode).Msg("Unknown API mode, returning 404")
 		http.Error(w, "Not Found", http.StatusNotFound)
 	}
 }
 
 func (s *SABnzbd) handleQueue(w http.ResponseWriter, r *http.Request) {
-	name := r.URL.Query().Get("name")
+	name := r.FormValue("name")
 	if name == "" {
 		s.handleListQueue(w, r)
 		return
@@ -75,7 +75,7 @@ func (s *SABnzbd) handleQueueResume(w http.ResponseWriter, r *http.Request) {
 
 // handleDelete handles delete operations
 func (s *SABnzbd) handleDelete(w http.ResponseWriter, r *http.Request) {
-	nzoIDs := r.URL.Query().Get("value")
+	nzoIDs := r.FormValue("value")
 	cat := getCategory(r.Context())
 	if nzoIDs == "" {
 		s.writeError(w, "No NZB IDs provided", http.StatusBadRequest)
@@ -108,7 +108,7 @@ func (s *SABnzbd) handleDelete(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Use atomic delete operation
-		if err := s.manager.Queue().Delete(nzoID, nil); err != nil {
+		if err := s.manager.Queue().Delete(nzoID, true, nil); err != nil {
 			errors = append(errors, fmt.Sprintf("Failed to delete %s: %v", nzoID, err))
 		} else {
 			successCount++
@@ -133,7 +133,7 @@ func (s *SABnzbd) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 	response := StatusResponse{
 		Status: true,
-		Error:  "", // Could add error details here if needed
+		Error:  strings.Join(errors, "; "),
 	}
 	utils.JSONResponse(w, response, http.StatusOK)
 }
@@ -147,13 +147,17 @@ func (s *SABnzbd) handleQueuePause(w http.ResponseWriter, r *http.Request) {
 // handleQueue returns the current download queue
 func (s *SABnzbd) handleListQueue(w http.ResponseWriter, r *http.Request) {
 	category := getCategory(r.Context())
-	nzoIDsVal := r.URL.Query().Get("nzo_ids")
+	nzoIDsVal := r.FormValue("nzo_ids")
 	var nzoIDs []string
 	if nzoIDsVal != "" {
 		nzoIDs = strings.Split(nzoIDsVal, ",")
 	}
 
-	entries := s.manager.Queue().ListFilter(category, config.ProtocolNZB, storage.EntryStateDownloading, nzoIDs, "added_on", false)
+	entries, err := s.manager.Queue().ListFilter(category, config.ProtocolNZB, storage.EntryStateDownloading, nzoIDs, "added_on", false)
+	if err != nil {
+		s.writeError(w, "Failed to read the download queue", http.StatusInternalServerError)
+		return
+	}
 
 	queue := Queue{
 		Version: Version,
@@ -214,7 +218,7 @@ func (s *SABnzbd) handleListQueue(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *SABnzbd) handleHistory(w http.ResponseWriter, r *http.Request) {
-	name := r.URL.Query().Get("name")
+	name := r.FormValue("name")
 	if name == "" {
 		s.handleHistoryList(w, r)
 		return
@@ -230,7 +234,7 @@ func (s *SABnzbd) handleHistory(w http.ResponseWriter, r *http.Request) {
 
 // handleHistoryList returns the download history
 func (s *SABnzbd) handleHistoryList(w http.ResponseWriter, r *http.Request) {
-	limitStr := r.URL.Query().Get("limit")
+	limitStr := r.FormValue("limit")
 	if limitStr == "" {
 		limitStr = "0"
 	}
@@ -243,14 +247,18 @@ func (s *SABnzbd) handleHistoryList(w http.ResponseWriter, r *http.Request) {
 	if limit < 0 {
 		limit = 0
 	}
-	nzoIDsValue := r.URL.Query().Get("nzo_ids")
+	nzoIDsValue := r.FormValue("nzo_ids")
 	var nzoIDs []string
 	if nzoIDsValue != "" {
 		for id := range strings.SplitSeq(nzoIDsValue, ",") {
 			nzoIDs = append(nzoIDs, id)
 		}
 	}
-	history := s.getHistory(r.Context(), limit, nzoIDs)
+	history, err := s.getHistory(r.Context(), limit, nzoIDs)
+	if err != nil {
+		s.writeError(w, "Failed to read download history", http.StatusInternalServerError)
+		return
+	}
 
 	response := HistoryResponse{
 		History: history,
@@ -275,9 +283,9 @@ func (s *SABnzbd) handleAddURL(w http.ResponseWriter, r *http.Request) {
 	_arr := getArrFromContext(ctx)
 	cat := getCategory(ctx)
 
-	if _arr == nil {
+	if _arr.Name == "" {
 		// If Arr is not in context, create a new one with default values
-		_arr = arr.New(cat, "", "", false, nil, "", "")
+		_arr = arr.Arr{Name: cat}
 	}
 
 	if r.Method != http.MethodPost {
@@ -286,12 +294,12 @@ func (s *SABnzbd) handleAddURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	urls := r.URL.Query().Get("name")
+	urls := r.FormValue("name")
 
 	cfg := config.Get()
 	action := cfg.DefaultDownloadAction
-	if r.URL.Query().Get("action") != "" {
-		action = config.DownloadAction(r.URL.Query().Get("action"))
+	if r.FormValue("action") != "" {
+		action = config.DownloadAction(r.FormValue("action"))
 	}
 
 	if urls == "" {
@@ -349,9 +357,9 @@ func (s *SABnzbd) handleAddFile(w http.ResponseWriter, r *http.Request) {
 	_arr := getArrFromContext(ctx)
 	cat := getCategory(ctx)
 
-	if _arr == nil {
+	if _arr.Name == "" {
 		// If Arr is not in context, create a new one with default values
-		_arr = arr.New(cat, "", "", false, nil, "", "")
+		_arr = arr.Arr{Name: cat}
 	}
 
 	if r.Method != http.MethodPost {
@@ -368,8 +376,8 @@ func (s *SABnzbd) handleAddFile(w http.ResponseWriter, r *http.Request) {
 
 	cfg := config.Get()
 	action := cfg.DefaultDownloadAction
-	if r.URL.Query().Get("action") != "" {
-		action = config.DownloadAction(r.URL.Query().Get("action"))
+	if r.FormValue("action") != "" {
+		action = config.DownloadAction(r.FormValue("action"))
 	}
 
 	var nzoIDs []string
@@ -481,7 +489,7 @@ func (s *SABnzbd) handleGetScripts(w http.ResponseWriter, r *http.Request) {
 
 // handleGetFiles returns files for a specific NZB
 func (s *SABnzbd) handleGetFiles(w http.ResponseWriter, r *http.Request) {
-	nzoID := r.URL.Query().Get("value")
+	nzoID := r.FormValue("value")
 	if nzoID == "" {
 		s.writeError(w, "NZB ID is required", http.StatusBadRequest)
 		return
@@ -518,10 +526,16 @@ func (s *SABnzbd) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // Helper methods
 
-func (s *SABnzbd) getHistory(ctx context.Context, limit int, nzoIDs []string) History {
+func (s *SABnzbd) getHistory(ctx context.Context, limit int, nzoIDs []string) (History, error) {
 	cat := getCategory(ctx)
-	completed := s.manager.Queue().ListFilter(cat, config.ProtocolNZB, storage.EntryStatePausedUP, nzoIDs, "added_on", false)
-	failed := s.manager.Queue().ListFilter(cat, config.ProtocolNZB, storage.EntryStateError, nzoIDs, "added_on", false)
+	completed, err := s.manager.Queue().ListFilter(cat, config.ProtocolNZB, storage.EntryStatePausedUP, nzoIDs, "added_on", false)
+	if err != nil {
+		return History{}, err
+	}
+	failed, err := s.manager.Queue().ListFilter(cat, config.ProtocolNZB, storage.EntryStateError, nzoIDs, "added_on", false)
+	if err != nil {
+		return History{}, err
+	}
 	slots := make([]HistorySlot, 0, len(completed)+len(failed))
 	history := History{
 		Version: Version,
@@ -555,7 +569,7 @@ func (s *SABnzbd) getHistory(ctx context.Context, limit int, nzoIDs []string) Hi
 		slots = append(slots, slot)
 	}
 	history.Slots = slots
-	return history
+	return history, nil
 }
 
 func (s *SABnzbd) writeError(w http.ResponseWriter, message string, status int) {
@@ -566,7 +580,7 @@ func (s *SABnzbd) writeError(w http.ResponseWriter, message string, status int) 
 	utils.JSONResponse(w, response, status)
 }
 
-func (s *SABnzbd) addNZBURL(ctx context.Context, url string, arr *arr.Arr, action config.DownloadAction) (string, error) {
+func (s *SABnzbd) addNZBURL(ctx context.Context, url string, arr arr.Arr, action config.DownloadAction) (string, error) {
 	if url == "" {
 		return "", fmt.Errorf("URL is required")
 	}
@@ -584,7 +598,7 @@ func (s *SABnzbd) addNZBURL(ctx context.Context, url string, arr *arr.Arr, actio
 	return s.addNZBFile(ctx, content, filename, arr, action)
 }
 
-func (s *SABnzbd) addNZBFile(ctx context.Context, content []byte, filename string, arr *arr.Arr, action config.DownloadAction) (string, error) {
+func (s *SABnzbd) addNZBFile(ctx context.Context, content []byte, filename string, arr arr.Arr, action config.DownloadAction) (string, error) {
 	if len(content) == 0 {
 		return "", fmt.Errorf("NZB content is empty")
 	}

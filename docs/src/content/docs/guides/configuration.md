@@ -38,6 +38,37 @@ Configuration is stored in `config.json`. Most settings can be managed via the W
 
 Password is bcrypt-hashed. API token is auto-generated.
 
+### Token-only authentication
+
+Set `token_only` in `auth.json` to use the API token as the only credential:
+
+```json
+{
+  "api_token": "...",
+  "token_only": true
+}
+```
+
+In this mode there is no username and no password. Use these rules:
+
+- Send the token in the `Authorization` header for API requests.
+- Type the token in the password box to log in to the web interface.
+- Give the token to Sonarr or Radarr as the download client password.
+- Keep WebDAV authentication off. WebDAV accepts only a username and a
+  password. It always rejects the API token.
+
+Registration stays closed in this mode. If you lose the token, edit
+`auth.json` to set a new one.
+
+To start in this mode without the web interface, set these environment
+variables:
+
+| Variable          | Description                       |
+|-------------------|-----------------------------------|
+| `USE_AUTH`        | Set to `true` to enable auth.     |
+| `AUTH_TOKEN_ONLY` | Set to `true` for token-only auth.|
+| `API_TOKEN`       | Set the token to a known value.   |
+
 ## Downloads
 
 ```json
@@ -119,10 +150,12 @@ Array of Debrid services:
     "max_connections": 15,
     "processing_max_connections": 15,
     "read_ahead": "16MB",
+    "body_pipeline_depth": 2,
+    "stream_backup_wait": "0",
     "processing_timeout": "10m",
     "availability_sample_percent": 10,
     "import_availability_sample_percent": 1,
-    "disk_buffer_path": "/cache/usenet/streams"
+    "disk_path": ""
   }
 }
 ```
@@ -132,13 +165,46 @@ Array of Debrid services:
 | Field                         | Type   | Description                     | Default                      |
 |-------------------------------|--------|---------------------------------|------------------------------|
 | `providers`                   | array  | NNTP server configurations      | `[]`                         |
-| `max_connections`             | int    | Max connections per streaming file | `15`                      |
+| `max_connections`             | int    | Global streaming fetch-worker limit | `15`                      |
 | `processing_max_connections`  | int    | Max connections per file for parsing and NZB downloads | Same as `max_connections` |
 | `read_ahead`                  | string | Prefetch buffer size            | `16MB`                       |
+| `body_pipeline_depth`         | int    | Ordered read-ahead `BODY` commands per connection (`1` disables pipelining, range 1-4) | `2` |
+| `stream_backup_wait`          | string | Wait before urgent playback may use a busy-tier backup provider; `0` disables spillover | `0` |
 | `processing_timeout`          | string | Max time for NZB processing     | `10m`                        |
 | `availability_sample_percent` | int    | % of segments to check during repairs (1-100) | `10`             |
 | `import_availability_sample_percent` | int | % of segments to check when adding an NZB (1-100) | `1`         |
-| `disk_buffer_path`            | string | Disk buffer location            | `{main_path}/usenet/streams` |
+| `disk_path`                   | string | Disk-backed rewind location; empty buffers in memory | `""` (memory) |
+
+### NNTP workload priority
+
+Connection scheduling is automatic and work-conserving. The four admission
+classes, from highest to lowest, are urgent playback demand, bounded stream
+read-ahead, full downloads/import parsing, and background repair, availability,
+or speed-test work. Lower-priority work may use every connection while no
+higher-priority request is waiting, so the policy does not reserve idle
+connections or reduce background throughput.
+
+An in-progress article is allowed to finish. Priority takes effect at the next
+article boundary, avoiding discarded data and unnecessary reconnects. Stream
+read-ahead pipelines up to `body_pipeline_depth` ordered `BODY` commands once
+enough work is queued to keep the available prefetch workers occupied; shorter
+ranges stay single-body to preserve connection parallelism. The default depth
+of 2 balances RTT savings with a short preemption window. Set it to 1 to disable
+BODY pipelining, or up to 4 for higher throughput on high-latency links. Urgent
+playback remains one article per request, and single-worker setups also behave
+as depth one. Repair checks pipeline up to 16 `STAT` commands per connection and
+return the connection after each window.
+
+Providers marked `backup` stay in a fallback tier. They are normally used only
+after primary providers fail or do not carry an article. Setting
+`stream_backup_wait` to a duration such as `250ms` additionally allows only an
+urgent playback read to use a backup after waiting that long for a primary
+slot. Leave it unset or set it to `0` to prevent busy primaries from consuming
+block-account traffic.
+
+This workload priority is separate from a provider's `priority` field. Provider
+priority controls which server is preferred; workload priority controls which
+kind of local operation receives the next available connection.
 
 ### Provider Fields
 
@@ -152,6 +218,7 @@ Array of Debrid services:
 | `ssl`             | bool   | Use SSL/TLS                        | `false`             |
 | `max_connections` | int    | Max connections to this server     | `20`                |
 | `priority`        | int    | Provider priority (lower = higher) | Index + 1           |
+| `backup`          | bool   | Put provider in the fallback/block-account tier | `false`       |
 
 ## Mounting
 
@@ -368,7 +435,6 @@ move the cache to another filesystem.
     "strategy": "per_entry",
     "recheck_interval": "168h",
     "auto_repair": true,
-    "skip_nzb_repair": false,
     "nntp_connection_percent": 20
   }
 }
@@ -383,8 +449,7 @@ move the cache to another filesystem.
 | `strategy`                | `per_entry` (stop at first broken file) or `per_file` (probe every file)   | `per_entry` |
 | `recheck_interval`        | How long a healthy entry stays fresh before becoming a candidate again     | `168h`      |
 | `arrs`                    | Optional Arr filter when `source=arr`. Empty = all eligible                | `[]`        |
-| `auto_repair`             | When `true`, brokens are repaired in-sweep. When `false`, detect-only      | `false`     |
-| `skip_nzb_repair`         | Skip NZB / Usenet entries during scheduled repair sweeps                   | `false`     |
+| `auto_repair`             | When `true`, broken Arr-managed files are deleted and searched again through Arr | `false` |
 | `nntp_connection_percent` | Share of NNTP connections probes may use, to avoid starving downloads      | `20`        |
 
 See the [Health Checker & Repair guide](/guides/repair/) for the full model, API, and Browse-page integration.
@@ -483,6 +548,8 @@ DEBRIDS__0__API_KEY=your_key
 
 # Usenet
 USENET__MAX_CONNECTIONS=20
+USENET__BODY_PIPELINE_DEPTH=2
+USENET__STREAM_BACKUP_WAIT=250ms
 USENET__PROVIDERS__0__HOST=news.provider.com
 USENET__PROVIDERS__0__PORT=563
 USENET__PROVIDERS__0__BACKBONE=Omicron

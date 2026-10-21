@@ -2,8 +2,10 @@ package manager
 
 import (
 	"cmp"
+	"errors"
+	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -34,7 +36,7 @@ type ImportRequest struct {
 	DownloadFolder   string                `json:"downloadFolder"`
 	SelectedDebrid   string                `json:"debrid"`
 	Magnet           *utils.Magnet         `json:"magnet"`
-	Arr              *arr.Arr              `json:"arr"`
+	Arr              arr.Arr               `json:"arr"`
 	Action           config.DownloadAction `json:"action"`
 	DownloadUncached *bool                 `json:"downloadUncached"`
 	CallBackUrl      string                `json:"callBackUrl"`
@@ -48,7 +50,7 @@ type ImportRequest struct {
 	Async bool       `json:"async"`
 }
 
-func NewTorrentRequest(debrid string, downloadFolder string, magnet *utils.Magnet, arr *arr.Arr, action config.DownloadAction, downloadUncached *bool, callBackUrl string, importType ImportType, skipMultiSeason bool) *ImportRequest {
+func NewTorrentRequest(debrid string, downloadFolder string, magnet *utils.Magnet, arr arr.Arr, action config.DownloadAction, downloadUncached *bool, callBackUrl string, importType ImportType, skipMultiSeason bool) *ImportRequest {
 
 	return &ImportRequest{
 		Id:               uuid.New().String(),
@@ -65,7 +67,7 @@ func NewTorrentRequest(debrid string, downloadFolder string, magnet *utils.Magne
 	}
 }
 
-func NewNZBRequest(name, downloadFolder string, nzbContent []byte, arr *arr.Arr, action config.DownloadAction, callBackUrl string, importType ImportType, skipMultiSeason bool) *ImportRequest {
+func NewNZBRequest(name, downloadFolder string, nzbContent []byte, arr arr.Arr, action config.DownloadAction, callBackUrl string, importType ImportType, skipMultiSeason bool) *ImportRequest {
 	return &ImportRequest{
 		Name:            name,
 		Id:              uuid.New().String(),
@@ -111,22 +113,27 @@ func (q *Queue) GetTorrent(infohash string) (*storage.Entry, error) {
 	return q.storage.GetQueued(infohash)
 }
 
-func (q *Queue) deleteEntryFiles(entry *storage.Entry) {
+func (q *Queue) deleteEntryFiles(entry *storage.Entry) error {
 	if entry.IsNZB() && entry.Magnet != "" {
-		_ = os.Remove(entry.Magnet)
+		if err := os.Remove(entry.Magnet); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove staged NZB %q: %w", entry.Magnet, err)
+		}
 	}
 	downloadedPath := entry.DownloadPath()
 	if downloadedPath == "" {
-		return
+		return nil
 	}
 	if err := os.RemoveAll(downloadedPath); err != nil {
-		q.logger.Error().Err(err).Str("path", downloadedPath).Msg("Failed to delete downloaded file")
+		return fmt.Errorf("remove downloaded files %q: %w", downloadedPath, err)
 	}
+	return nil
 }
 
 func (q *Queue) wrapCleanupWithFileDelete(cleanup func(t *storage.Entry) error) func(*storage.Entry) error {
 	return func(entry *storage.Entry) error {
-		q.deleteEntryFiles(entry)
+		if err := q.deleteEntryFiles(entry); err != nil {
+			return err
+		}
 		if cleanup != nil {
 			return cleanup(entry)
 		}
@@ -134,8 +141,11 @@ func (q *Queue) wrapCleanupWithFileDelete(cleanup func(t *storage.Entry) error) 
 	}
 }
 
-func (q *Queue) Delete(infohash string, cleanup func(t *storage.Entry) error) error {
-	return q.storage.DeleteQueued(infohash, q.wrapCleanupWithFileDelete(cleanup))
+func (q *Queue) Delete(infohash string, deleteFiles bool, cleanup func(t *storage.Entry) error) error {
+	if deleteFiles {
+		cleanup = q.wrapCleanupWithFileDelete(cleanup)
+	}
+	return q.storage.DeleteQueued(infohash, cleanup)
 }
 
 func (q *Queue) DeleteWhere(category string, protocol config.Protocol, state storage.TorrentState, hashes []string, cleanup func(t *storage.Entry) error) error {
@@ -199,43 +209,44 @@ func (q *Queue) ListFilterFunc(category string, protocol config.Protocol, state 
 	return filterFunc
 }
 
-func (q *Queue) ListFilter(category string, protocol config.Protocol, state storage.TorrentState, hashes []string, sortBy string, reverse bool) []*storage.Entry {
+func (q *Queue) ListFilter(category string, protocol config.Protocol, state storage.TorrentState, hashes []string, sortBy string, reverse bool) ([]*storage.Entry, error) {
 	filterFunc := q.ListFilterFunc(category, protocol, state, hashes)
 	torrents, err := q.storage.FilterQueued(filterFunc)
 	if err != nil {
-		// return empty list on error
-		return []*storage.Entry{}
+		return nil, err
 	}
 
 	if sortBy != "" {
-		sort.Slice(torrents, func(i, j int) bool {
-			// If ascending is false, swap i and j to get descending order
+		slices.SortFunc(torrents, func(a, b *storage.Entry) int {
 			if !reverse {
-				i, j = j, i
+				a, b = b, a
 			}
-
 			switch sortBy {
 			case "name":
-				return torrents[i].Name < torrents[j].Name
+				return cmp.Compare(a.Name, b.Name)
 			case "size":
-				return torrents[i].Size < torrents[j].Size
-			case "added_on":
-				return torrents[i].AddedOn.Before(torrents[j].AddedOn)
+				return cmp.Compare(a.Size, b.Size)
 			case "completed", "downloaded":
-				return torrents[i].CompletedAt.Before(*torrents[j].CompletedAt)
+				var left, right time.Time
+				if a.CompletedAt != nil {
+					left = *a.CompletedAt
+				}
+				if b.CompletedAt != nil {
+					right = *b.CompletedAt
+				}
+				return left.Compare(right)
 			case "progress":
-				return torrents[i].Progress < torrents[j].Progress
+				return cmp.Compare(a.Progress, b.Progress)
 			case "category":
-				return torrents[i].Category < torrents[j].Category
+				return cmp.Compare(a.Category, b.Category)
 			case "seeders":
-				return torrents[i].Seeders < torrents[j].Seeders
+				return cmp.Compare(a.Seeders, b.Seeders)
 			default:
-				// Default sort by added_on
-				return torrents[i].AddedOn.Before(torrents[j].AddedOn)
+				return a.AddedOn.Compare(b.AddedOn)
 			}
 		})
 	}
-	return torrents
+	return torrents, nil
 }
 
 func (q *Queue) UpdateWhere(predicate func(*storage.Entry) bool, updateFunc func(*storage.Entry) bool) error {
