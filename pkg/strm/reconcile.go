@@ -102,12 +102,34 @@ func (s *Reconciler) SyncEntryAsync(entry *storage.Entry) {
 	}()
 }
 
+// existingTargets finds this entry's already-published .strm files. A library
+// entry with no active files is not enough evidence to remove its exports:
+// metadata can be temporarily incomplete while providers reconcile it.
+func (s *Reconciler) existingTargets(entry *storage.Entry) []strmTarget {
+	var targets []strmTarget
+	_ = filepath.WalkDir(entryDir(config.Get(), entry), func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.EqualFold(filepath.Ext(path), ".strm") {
+			return nil
+		}
+		content, err := readStrm(path)
+		if err != nil {
+			return nil
+		}
+		infohash, _, ok := ParseURL(content)
+		if ok && infohash == entry.InfoHash {
+			targets = append(targets, strmTarget{path: path, content: content})
+		}
+		return nil
+	})
+	return targets
+}
+
 // syncEntry reconciles one entry's folder: (re)write desired .strm files,
 // remove stale ones this entry owns, download missing sidecars. Returns the
 // desired targets so sweeps know which paths are accounted for.
 func (s *Reconciler) syncEntry(ctx context.Context, entry *storage.Entry, rep *Report) []strmTarget {
-	if len(entry.Files) == 0 {
-		return nil
+	if len(entry.GetActiveFiles()) == 0 {
+		return s.existingTargets(entry)
 	}
 
 	// Backfill stable file IDs for entries stored before IDs existed;
