@@ -587,7 +587,9 @@ func (m *Manager) Stop() error {
 		}
 	}
 
-	m.hearsay.Close()
+	if m.hearsay != nil {
+		m.hearsay.Close()
+	}
 
 	// Close storage
 	if m.storage != nil {
