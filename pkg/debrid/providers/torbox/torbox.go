@@ -419,7 +419,15 @@ func (tb *Torbox) doPostFormWithClient(client *request.Client, endpoint string, 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := client.Do(req)
-	if err != nil {
+	if resp == nil {
+		return nil, err
+	}
+	// Exhausted retries return the final response alongside a "giving up"
+	// error. Decode the provider body anyway so the caller can build its
+	// detailed error (status, provider fields, attempts) instead of a
+	// generic retry message. Any other error with a response is returned
+	// as-is, since the response may be a partial or cancelled attempt.
+	if err != nil && !strings.Contains(err.Error(), "giving up after") {
 		return nil, err
 	}
 	defer request.DrainAndClose(resp.Body)
@@ -476,6 +484,9 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 	hash := torrent.InfoHash
 	if hash == "" && torrent.Magnet != nil {
 		hash = torrent.Magnet.InfoHash
+	}
+	if hash == "" && torrent.Magnet != nil && torrent.Magnet.Link != "" {
+		hash = utils.ExtractInfoHash(torrent.Magnet.Link)
 	}
 	return tb.executeSubmission(torrent, hash)
 }
@@ -586,20 +597,36 @@ func (tb *Torbox) executeSubmission(torrent *types.Torrent, hash string) (*types
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, torboxAPIError(resp, data.Error, data.Detail)
 	}
-	// An array response can list several torrents; take the one for this hash.
+	// Select the created torrent. Fork safety, kept over upstream's
+	// single-element shortcut: an array must contain a torrent matching
+	// the submitted hash, never just any single entry. A single object
+	// response is accepted when there is no hash to match against.
 	var id int
-	for _, added := range data.Data {
-		if len(data.Data) == 1 || strings.EqualFold(added.Hash, torrent.InfoHash) {
-			id = cmp.Or(added.TorrentId, added.Id)
-			break
+	if hash != "" {
+		for _, added := range data.Data {
+			if strings.EqualFold(added.Hash, hash) {
+				id = cmp.Or(added.TorrentId, added.Id)
+				break
+			}
+		}
+		if id == 0 {
+			return nil, fmt.Errorf("TorBox create torrent response contained no torrent matching submitted hash")
+		}
+	} else {
+		if data.DataWasArray || len(data.Data) != 1 {
+			return nil, fmt.Errorf("cannot select TorBox torrent from array response without submitted hash")
+		}
+		id = cmp.Or(data.Data[0].TorrentId, data.Data[0].Id)
+		if id == 0 {
+			return nil, fmt.Errorf("error adding torrent")
 		}
 	}
-	if id == 0 {
-		return nil, fmt.Errorf("error adding torrent")
-	}
 	torrent.Id = strconv.Itoa(id)
-	if torrent.InfoHash != "" {
-		tb.getNegativeCache().Evict(torrent.InfoHash)
+	if torrent.InfoHash == "" && hash != "" {
+		torrent.InfoHash = hash
+	}
+	if hash != "" {
+		tb.getNegativeCache().Evict(hash)
 	}
 	torrent.Debrid = tb.config.Name
 	torrent.Added = time.Now()
@@ -1074,7 +1101,7 @@ func (tb *Torbox) getTorrents(offset int) ([]*types.Torrent, error) {
 			Name:             data.Name,
 			Bytes:            data.Size,
 			Progress:         data.Progress * 100,
-			Status:           tb.getTorboxStatus(data.DownloadState, torboxDownloadAvailable(data)),
+			Status:           tb.getTorboxStatus(data.DownloadState, torboxDownloadAvailable(&data)),
 			Speed:            data.DownloadSpeed,
 			Seeders:          data.Seeds,
 			Filename:         data.Name,
@@ -1088,10 +1115,10 @@ func (tb *Torbox) getTorrents(offset int) ([]*types.Torrent, error) {
 		for _, f := range data.Files {
 			fileName := filepath.Base(f.Name)
 			pathToCheck := f.AbsolutePath
-		if pathToCheck == "" {
-			pathToCheck = f.Name
-		}
-		if err := cfg.ValidateFileAllowed(pathToCheck, f.Size); err != nil {
+			if pathToCheck == "" {
+				pathToCheck = f.Name
+			}
+			if err := cfg.ValidateFileAllowed(pathToCheck, f.Size); err != nil {
 				continue
 			}
 			file := types.File{
@@ -1102,7 +1129,7 @@ func (tb *Torbox) getTorrents(offset int) ([]*types.Torrent, error) {
 				Path:      f.Name,
 			}
 
-			if torboxDownloadAvailable(data) {
+			if torboxDownloadAvailable(&data) {
 				file.Link = fmt.Sprintf("torbox://%s/%d", t.Id, f.Id)
 			}
 

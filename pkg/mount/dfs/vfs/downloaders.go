@@ -14,6 +14,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/customerror"
 	"github.com/sirrobot01/decypharr/internal/nntp"
 	"github.com/sirrobot01/decypharr/internal/request"
+	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	"github.com/sirrobot01/decypharr/pkg/manager"
 	fuseconfig "github.com/sirrobot01/decypharr/pkg/mount/dfs/config"
 	"github.com/sirrobot01/decypharr/pkg/mount/dfs/vfs/ranges"
@@ -563,11 +564,25 @@ func (dls *Downloaders) getLastErr() error {
 	return dls.lastErr
 }
 
+// providerClientBackend is the optional part of the Backend interface that
+// can resolve a debrid provider client. Upstream narrowed Downloaders'
+// manager to the small Backend interface, which does not include
+// ProviderClient, so the throttle lookup must ask for it optionally
+// instead of calling it directly; backends without it simply yield no
+// provider gate here and backpressure falls back to the recorded error.
+type providerClientBackend interface {
+	ProviderClient(string) debrid.Client
+}
+
 func (dls *Downloaders) providerThrottle() *request.Throttle {
 	if dls.manager == nil || dls.item == nil || dls.item.entry == nil {
 		return nil
 	}
-	client := dls.manager.ProviderClient(dls.item.entry.ActiveProvider)
+	pc, ok := dls.manager.(providerClientBackend)
+	if !ok {
+		return nil
+	}
+	client := pc.ProviderClient(dls.item.entry.ActiveProvider)
 	if p, ok := client.(request.ThrottleProvider); ok {
 		return p.RequestThrottle()
 	}

@@ -540,14 +540,6 @@ func (m *Manager) Stop() error {
 	}
 	m.downloadMu.Unlock()
 
-	// Stop mount manager first
-	if m.mountManager != nil {
-		m.logger.Info().Msg("Stopping mount manager")
-		if err := m.mountManager.Stop(); err != nil {
-			return fmt.Errorf("failed to stop mount manager: %w", err)
-		}
-	}
-
 	// Stop schedulers
 	if m.scheduler != nil {
 		if err := m.scheduler.Shutdown(); err != nil {
@@ -571,7 +563,7 @@ func (m *Manager) Stop() error {
 	if m.mountManager != nil {
 		m.logger.Info().Msg("Stopping mount manager")
 		if err := m.mountManager.Stop(); err != nil {
-			m.logger.Warn().Err(err).Msg("Failed to stop mount manager")
+			return fmt.Errorf("failed to stop mount manager: %w", err)
 		}
 	}
 	if m.repair != nil {
