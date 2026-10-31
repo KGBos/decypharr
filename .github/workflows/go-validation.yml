@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, mainframe-vm]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
