@@ -236,3 +236,30 @@ func TestSidecarStreamIsCompleteBeforePublication(t *testing.T) {
 		})
 	}
 }
+
+func TestStrmSweepPreservesEntryWithNoActiveFiles(t *testing.T) {
+	m := newTestReconciler(t)
+	cfg := config.Get()
+
+	infohash := "aabbccddeeff00112233445566778899aabbccdd"
+	entry := addStrmTestEntry(t, m, infohash, "Movie.2023", "Movie.2023.mkv")
+	entry.Files["Movie.2023.mkv"].Deleted = true
+	if err := m.storage.AddOrUpdate(entry); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(cfg.Strm.Path, entry.GetFolder(), "Movie.2023.strm")
+	want := FileURL(BaseURL(cfg), cfg.Strm.Secret, infohash, entry.Files["Movie.2023.mkv"].ID, "Movie.2023.mkv")
+	mustWrite(t, path, want)
+
+	rep, err := m.Sweep(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Deleted != 0 {
+		t.Fatalf("deleted = %d, want 0 for entry without active files", rep.Deleted)
+	}
+	if got := mustRead(t, path); got != want {
+		t.Fatalf("existing .strm changed: got %q, want %q", got, want)
+	}
+}
