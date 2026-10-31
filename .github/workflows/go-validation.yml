@@ -36,5 +36,6 @@ jobs:
           ./internal/request
           ./pkg/manager
           ./pkg/manager/link
+          ./pkg/strm
           ./pkg/mount/dfs/vfs
           ./pkg/repair
