@@ -10,8 +10,22 @@ permissions:
   contents: read
 
 jobs:
+  decide-runner:
+    runs-on: ubuntu-latest
+    outputs:
+      labels: ${{ steps.set.outputs.labels }}
+    steps:
+      - id: set
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo 'labels=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'labels=["self-hosted", "mainframe-vm"]' >> "$GITHUB_OUTPUT"
+          fi
+
   build-and-test:
-    runs-on: [self-hosted, mainframe-vm]
+    needs: decide-runner
+    runs-on: ${{ fromJSON(needs.decide-runner.outputs.labels) }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
