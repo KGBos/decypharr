@@ -17,17 +17,18 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 )
 
 // Standard defaults for the Submission Mediator
 const (
-	DefaultCachedCheckRate       = 240.0 / 60.0       // 240 req/min (4.0/s), TorBox cap: 300/min
-	DefaultUncachedCreateRate    = 45.0 / 3600.0      // 45 req/hour (0.0125/s), TorBox cap: 60/hr
-	DefaultMaxQueueDepth         = 500
-	DefaultMediatorRampSeconds   = 300                // 5 minutes linear relaxation
-	DefaultFloorMultiplier       = 0.20               // 20% floor after 429
-	DefaultQueueJournalFilename  = "submission_queue.jsonl"
+	DefaultCachedCheckRate      = 240.0 / 60.0  // 240 req/min (4.0/s), TorBox cap: 300/min
+	DefaultUncachedCreateRate   = 45.0 / 3600.0 // 45 req/hour (0.0125/s), TorBox cap: 60/hr
+	DefaultMaxQueueDepth        = 500
+	DefaultMediatorRampSeconds  = 300  // 5 minutes linear relaxation
+	DefaultFloorMultiplier      = 0.20 // 20% floor after 429
+	DefaultQueueJournalFilename = "submission_queue.jsonl"
 )
 
 var (
@@ -592,6 +593,9 @@ func (m *SubmissionMediator) Submit(ctx context.Context, torrent *types.Torrent)
 	hash := torrent.InfoHash
 	if hash == "" && torrent.Magnet != nil {
 		hash = torrent.Magnet.InfoHash
+	}
+	if hash == "" && torrent.Magnet != nil && torrent.Magnet.Link != "" {
+		hash = utils.ExtractInfoHash(torrent.Magnet.Link)
 	}
 	if hash == "" {
 		return nil, fmt.Errorf("missing info hash for TorBox submission")

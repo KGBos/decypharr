@@ -8,18 +8,33 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/internal/utils"
 )
 
 func newAcquireTestClient(pp *ProviderPool) *Client {
 	return &Client{
-		pools:          map[string]*ProviderPool{"test": pp},
-		providers:      []config.UsenetProvider{{Host: "test"}},
+		pools:          map[string]*ProviderPool{pp.config.ID(): pp},
+		orderedPools:   []*ProviderPool{pp},
+		providers:      []config.UsenetProvider{pp.config},
 		logger:         zerolog.Nop(),
-		slotFreed:      make(chan struct{}, 1),
 		idleTimeout:    5 * time.Minute,
 		staleThreshold: 60 * time.Second,
 		pingInterval:   30 * time.Second,
+	}
+}
+
+func newTieredAcquireTestClient(primary, backup *ProviderPool, spillover time.Duration) *Client {
+	return &Client{
+		pools: map[string]*ProviderPool{
+			primary.config.ID(): primary,
+			backup.config.ID():  backup,
+		},
+		orderedPools:     []*ProviderPool{primary, backup},
+		providers:        []config.UsenetProvider{primary.config, backup.config},
+		logger:           zerolog.Nop(),
+		idleTimeout:      5 * time.Minute,
+		staleThreshold:   60 * time.Second,
+		pingInterval:     30 * time.Second,
+		streamBackupWait: spillover,
 	}
 }
 
@@ -41,7 +56,7 @@ func TestWaitForConnectionUnblocksOnRelease(t *testing.T) {
 	}
 	resCh := make(chan result, 1)
 	go func() {
-		got, _, err := c.getAnyAvailableConnection(context.Background(), providerExclusions{})
+		got, _, err := c.getAnyAvailableConnection(context.Background(), WorkloadStreamDemand, providerExclusions{})
 		resCh <- result{got, err}
 	}()
 
@@ -54,7 +69,7 @@ func TestWaitForConnectionUnblocksOnRelease(t *testing.T) {
 
 	// The fictitious user returns a healthy connection to the pool.
 	pp.mu.Lock()
-	pp.conns = append(pp.conns, acquireConnectionEntry(conn, pp.config, utils.Now()))
+	pp.conns = append(pp.conns, acquireConnectionEntry(conn, pp.config, time.Now()))
 	pp.mu.Unlock()
 	c.releaseSlot(pp)
 
@@ -81,7 +96,7 @@ func TestWaitForConnectionCtxCancelUnblocks(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
-		_, _, err := c.getAnyAvailableConnection(ctx, providerExclusions{})
+		_, _, err := c.getAnyAvailableConnection(ctx, WorkloadStreamDemand, providerExclusions{})
 		errCh <- err
 	}()
 
@@ -95,6 +110,65 @@ func TestWaitForConnectionCtxCancelUnblocks(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("acquirer did not honor cancellation")
+	}
+}
+
+func TestStreamDemandSpillsToBackupAfterConfiguredWait(t *testing.T) {
+	primary := newTestPool(1)
+	primary.config.Host = "primary"
+	primary.slots <- struct{}{}
+	backup := newTestPool(1)
+	backup.config.Host = "backup"
+	backup.config.Backup = true
+	backupConn := newPipeConnection(t, true)
+	poolEntry(backup, backupConn, 0)
+	const spillover = 20 * time.Millisecond
+	c := newTieredAcquireTestClient(primary, backup, spillover)
+
+	started := time.Now()
+	conn, provider, err := c.getAnyAvailableConnection(t.Context(), WorkloadStreamDemand, providerExclusions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider != backup.config || conn != backupConn {
+		t.Fatalf("got provider %q, want backup %q", provider.Host, backup.config.Host)
+	}
+	if elapsed := time.Since(started); elapsed < spillover {
+		t.Fatalf("spilled to backup after %v, before configured wait %v", elapsed, spillover)
+	}
+	if got := c.streamBackupSpillovers.Load(); got != 1 {
+		t.Fatalf("spillovers = %d, want 1", got)
+	}
+	c.put(conn, provider)
+	c.releaseSlot(primary)
+}
+
+func TestOnlyStreamDemandCanSpillToBackup(t *testing.T) {
+	for _, workload := range []Workload{WorkloadStreamPrefetch, WorkloadDownload, WorkloadBackground} {
+		t.Run(workload.String(), func(t *testing.T) {
+			primary := newTestPool(1)
+			primary.config.Host = "primary"
+			primary.slots <- struct{}{}
+			backup := newTestPool(1)
+			backup.config.Host = "backup"
+			backup.config.Backup = true
+			poolEntry(backup, newPipeConnection(t, true), 0)
+			c := newTieredAcquireTestClient(primary, backup, time.Millisecond)
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+			defer cancel()
+
+			_, _, err := c.getAnyAvailableConnection(ctx, workload, providerExclusions{})
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("error = %v, want context deadline", err)
+			}
+			if got := c.streamBackupSpillovers.Load(); got != 0 {
+				t.Fatalf("spillovers = %d, want 0", got)
+			}
+			if !backup.hasIdle() {
+				t.Fatal("backup connection was consumed")
+			}
+			c.releaseSlot(primary)
+		})
 	}
 }
 

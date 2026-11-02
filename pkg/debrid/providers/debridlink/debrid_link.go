@@ -114,22 +114,10 @@ func (dl *DebridLink) doGet(endpoint string, queryParams map[string]string, resu
 		return nil, err
 	}
 
-	resp, err := dl.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer request.DrainAndClose(resp.Body)
-
-	if result != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && resp.ContentLength != 0 {
-		if err := json.ConfigDefault.NewDecoder(resp.Body).Decode(result); err != nil {
-			return resp, err
-		}
-	}
-
-	return resp, nil
+	return dl.client.DoJSON(req, result)
 }
 
-func (dl *DebridLink) IsAvailable(hashes []string) map[string]bool {
+func (dl *DebridLink) IsAvailable(hashes []string) (map[string]bool, error) {
 	result := make(map[string]bool)
 
 	for i := 0; i < len(hashes); i += 100 {
@@ -151,21 +139,23 @@ func (dl *DebridLink) IsAvailable(hashes []string) map[string]bool {
 		var data AvailableResponse
 
 		resp, err := dl.doGet(endpoint, nil, &data)
-		if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			continue
+		if err != nil {
+			return result, fmt.Errorf("check availability: %w", err)
 		}
-		if data.Value == nil {
-			return result
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return result, fmt.Errorf("check availability: HTTP %d", resp.StatusCode)
 		}
-		value := *data.Value
-		for _, h := range hashes[i:end] {
-			_, exists := value[h]
-			if exists {
-				result[h] = true
+		if !data.Success {
+			return result, fmt.Errorf("check availability: provider rejected the request")
+		}
+		for _, h := range validHashes {
+			result[h] = false
+			if data.Value != nil {
+				_, result[h] = (*data.Value)[h]
 			}
 		}
 	}
-	return result
+	return result, nil
 }
 
 func (dl *DebridLink) GetTorrent(torrentId string) (*types.Torrent, error) {
@@ -194,15 +184,17 @@ func (dl *DebridLink) GetTorrent(torrentId string) (*types.Torrent, error) {
 		Id:               t.ID,
 		Name:             name,
 		Bytes:            t.TotalSize,
-		Status:           "downloaded",
+		Status:           types.TorrentStatusDownloaded,
 		Filename:         name,
 		OriginalFilename: name,
 		Debrid:           dl.config.Name,
 		Added:            time.Unix(t.Created, 0),
+		Files:            make(map[string]types.File, len(t.Files)),
+		InfoHash:         t.HashString,
 	}
 	cfg := config.Get()
 	for _, f := range t.Files {
-		if err := cfg.IsFileAllowed(f.Name, f.Size); err != nil {
+		if err := cfg.ValidateFileAllowed(f.Name, f.Size); err != nil {
 			continue
 		}
 		file := types.File{
@@ -263,7 +255,7 @@ func (dl *DebridLink) UpdateTorrent(t *types.Torrent) error {
 	cfg := config.Get()
 	now := time.Now()
 	for _, f := range data.Files {
-		if err := cfg.IsFileAllowed(f.Name, f.Size); err != nil {
+		if err := cfg.ValidateFileAllowed(f.Name, f.Size); err != nil {
 			continue
 		}
 		file := types.File{
@@ -320,7 +312,7 @@ func (dl *DebridLink) SubmitMagnet(t *types.Torrent) (*types.Torrent, error) {
 	if resp.ContentLength == 0 {
 		return nil, fmt.Errorf("empty response from debridlink API")
 	}
-	if err := json.ConfigDefault.NewDecoder(resp.Body).Decode(&res); err != nil {
+	if err := request.DecodeJSON(resp, &res); err != nil {
 		return nil, err
 	}
 	if !res.Success || res.Value == nil {
@@ -376,7 +368,7 @@ func (dl *DebridLink) CheckStatus(torrent *types.Torrent) (*types.Torrent, error
 		switch torrent.Status {
 		case types.TorrentStatusDownloading:
 			if !torrent.DownloadUncached {
-				return torrent, fmt.Errorf("torrent: %s not cached", torrent.Name)
+				return torrent, fmt.Errorf("torrent %s: %w", torrent.Name, customerror.TorrentNotCachedError)
 			}
 			return torrent, nil
 		case types.TorrentStatusDownloaded:
@@ -410,7 +402,7 @@ func (dl *DebridLink) DeleteTorrent(torrentId string) error {
 	return nil
 }
 
-func (dl *DebridLink) fetchDownloadLink(account *account.Account, id string, file *types.File) (types.DownloadLink, error) {
+func (dl *DebridLink) fetchDownloadLink(ctx context.Context, account *account.Account, id string, file *types.File) (types.DownloadLink, error) {
 	now := time.Now()
 	link := types.DownloadLink{
 		Debrid:       dl.config.Name,
@@ -424,8 +416,8 @@ func (dl *DebridLink) fetchDownloadLink(account *account.Account, id string, fil
 	return link, nil
 }
 
-func (dl *DebridLink) GetDownloadLink(id string, file *types.File) (types.DownloadLink, error) {
-	return dl.accountsManager.GetDownloadLink(id, file, dl.fetchDownloadLink)
+func (dl *DebridLink) GetDownloadLink(ctx context.Context, id string, file *types.File) (types.DownloadLink, error) {
+	return dl.accountsManager.GetDownloadLink(ctx, id, file, dl.fetchDownloadLink)
 }
 
 func (dl *DebridLink) GetDownloadUncached() bool {
@@ -495,7 +487,7 @@ func (dl *DebridLink) _fetchDownloadLinks(account *account.Account, page, limit 
 	if resp.ContentLength == 0 {
 		return links, fmt.Errorf("empty response from debridlink API")
 	}
-	if err := json.ConfigDefault.NewDecoder(resp.Body).Decode(&res); err != nil {
+	if err := request.DecodeJSON(resp, &res); err != nil {
 		return links, err
 	}
 	if !res.Success || res.Value == nil {
@@ -551,6 +543,10 @@ func (dl *DebridLink) getTorrents(page, perPage int) ([]*types.Torrent, error) {
 		return torrents, fmt.Errorf("debridlink API error: Status: %d", resp.StatusCode)
 	}
 
+	if !res.Success || res.Value == nil {
+		return nil, fmt.Errorf("error getting torrents")
+	}
+
 	data := *res.Value
 
 	if len(data) == 0 {
@@ -564,18 +560,18 @@ func (dl *DebridLink) getTorrents(page, perPage int) ([]*types.Torrent, error) {
 			Id:               t.ID,
 			Name:             t.Name,
 			Bytes:            t.TotalSize,
-			Status:           "downloaded",
+			Status:           types.TorrentStatusDownloaded,
 			Filename:         t.Name,
 			OriginalFilename: t.Name,
 			InfoHash:         t.HashString,
-			Files:            make(map[string]types.File),
+			Files:            make(map[string]types.File, len(t.Files)),
 			Debrid:           dl.config.Name,
 			Added:            time.Unix(t.Created, 0),
 		}
 		cfg := config.Get()
 		now := time.Now()
 		for _, f := range t.Files {
-			if err := cfg.IsFileAllowed(f.Name, f.Size); err != nil {
+			if err := cfg.ValidateFileAllowed(f.Name, f.Size); err != nil {
 				continue
 			}
 			file := types.File{

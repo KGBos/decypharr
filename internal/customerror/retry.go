@@ -9,11 +9,7 @@ import (
 	"syscall"
 )
 
-// Error classification for retry logic (inspired by rclone's fserrors)
-// Distinguishes transient/retriable errors from permanent failures
-
-// retriableErrorStrings contains error message substrings that indicate retriable errors.
-// These catch errors from standard library that aren't exported as typed errors.
+// These catch errors that aren't exported as typed errors.
 var retriableErrorStrings = []string{
 	"use of closed network connection",
 	"unexpected EOF",
@@ -38,7 +34,6 @@ var retriableErrorStrings = []string{
 	"context deadline exceeded",
 }
 
-// permanentErrorStrings contains error message substrings that indicate non-retriable errors
 var permanentErrorStrings = []string{
 	"404",
 	"not found",
@@ -56,52 +51,31 @@ var permanentErrorStrings = []string{
 }
 
 // IsRetriableError returns true if the error is likely transient and should be retried.
-// This follows rclone's multi-layer error classification strategy.
 func IsRetriableError(err error) bool {
 	if err == nil {
 		return false
 	}
 
-	var csError *Error
-	if errors.As(err, &csError) {
-		if csError.IsPermanent() {
-			return false
-		}
-		// If not permanent, consider retriable
-		if csError.IsRetryable() {
-			return true
-		}
-		return false
-	}
-
-	// Ask the error itself whether it is retriable. This covers types like
-	// *nntp.Error that carry their own retryability knowledge but are not
-	// *customerror.Error. We intentionally place this after the *Error check
-	// so the explicit permanent/retry flags above always win for our own type.
-	type selfRetryable interface {
+	// Typed retry rules take precedence over message text.
+	if r, ok := errors.AsType[interface {
+		error
 		IsRetryable() bool
-	}
-	if r, ok := err.(selfRetryable); ok {
+	}](err); ok {
 		return r.IsRetryable()
 	}
 
-	// Check for explicit non-retriable markers first
 	if IsPermanentError(err) {
 		return false
 	}
 
-	// Context deadline exceeded is retriable (timeout)
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
 
-	// Context canceled is NOT retriable (user initiated)
 	if errors.Is(err, context.Canceled) {
 		return false
 	}
 
-	// io.EOF at expected position is not an error
-	// io.ErrUnexpectedEOF during transfer is retriable
 	if errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
@@ -112,16 +86,10 @@ func IsRetriableError(err error) bool {
 		return true
 	}
 
-	// Check for net.Error interface (Timeout() and Temporary())
-	var netErr net.Error
-	if errors.As(err, &netErr) {
-		// Timeout errors are always retriable
-		if netErr.Timeout() {
-			return true
-		}
+	if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {
+		return true
 	}
 
-	// Check for specific syscall errors
 	if errors.Is(err, syscall.ECONNRESET) ||
 		errors.Is(err, syscall.ECONNREFUSED) ||
 		errors.Is(err, syscall.ECONNABORTED) ||
@@ -132,7 +100,6 @@ func IsRetriableError(err error) bool {
 		return true
 	}
 
-	// Check error string for known patterns
 	errStr := strings.ToLower(err.Error())
 	for _, pattern := range retriableErrorStrings {
 		if strings.Contains(errStr, strings.ToLower(pattern)) {
@@ -140,7 +107,6 @@ func IsRetriableError(err error) bool {
 		}
 	}
 
-	// Check wrapped errors
 	unwrapped := errors.Unwrap(err)
 	if unwrapped != nil && !errors.Is(unwrapped, err) {
 		return IsRetriableError(unwrapped)
@@ -154,6 +120,19 @@ func IsRetriableError(err error) bool {
 func IsPermanentError(err error) bool {
 	if err == nil {
 		return false
+	}
+
+	if p, ok := errors.AsType[interface {
+		error
+		IsPermanent() bool
+	}](err); ok {
+		return p.IsPermanent()
+	}
+	if r, ok := errors.AsType[interface {
+		error
+		IsRetryable() bool
+	}](err); ok {
+		return !r.IsRetryable()
 	}
 
 	errStr := strings.ToLower(err.Error())

@@ -20,5 +20,12 @@ auth.json
 .env
 node_modules/
 .venv/
+.desloppify/
 .stignore
 .stfolder/**
+
+# profiling artifacts
+*.pprof
+*.prof
+.codex/
+.claude/

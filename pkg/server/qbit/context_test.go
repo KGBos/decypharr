@@ -1,9 +1,104 @@
 package qbit
 
 import (
-	"strings"
+	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+
+	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/pkg/arr"
+	"github.com/sirrobot01/decypharr/pkg/manager"
 )
+
+func newAuthenticationTestQBit(t *testing.T) *QBit {
+	t.Helper()
+	config.Reset()
+	config.SetConfigPath(t.TempDir())
+	t.Cleanup(config.Reset)
+	config.Get().UseAuth = false
+
+	mgr := manager.New()
+	t.Cleanup(func() {
+		if err := mgr.Stop(); err != nil {
+			t.Error(err)
+		}
+	})
+	return &QBit{manager: mgr}
+}
+
+func TestAuthenticateDoesNotOverwriteArrWithClientCredentials(t *testing.T) {
+	q := newAuthenticationTestQBit(t)
+	existing := arr.Arr{Name: "whisparr", Host: "http://whisparr:6969", Token: "arr-api-key"}
+	q.manager.Arr().AddOrUpdate(existing)
+
+	got, err := q.authenticate(t.Context(), "whisparr", "homarr-user", "homarr-password")
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	if got.Host != existing.Host || got.Token != existing.Token {
+		t.Fatalf("authenticated Arr = host %q token %q, want host %q token %q", got.Host, got.Token, existing.Host, existing.Token)
+	}
+	stored, _ := q.manager.Arr().Get("whisparr")
+	if stored.Host != existing.Host || stored.Token != existing.Token {
+		t.Fatalf("stored Arr = host %q token %q, want host %q token %q", stored.Host, stored.Token, existing.Host, existing.Token)
+	}
+}
+
+func TestAuthenticateDiscoversValidatedArrCredentials(t *testing.T) {
+	q := newAuthenticationTestQBit(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v3/system/status" || r.Header.Get("X-Api-Key") != "arr-api-key" {
+			http.Error(w, "unexpected Arr validation request", http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(`{"appName":"Sonarr"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	got, err := q.authenticate(t.Context(), "whisparr", server.URL, "arr-api-key")
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	if got.Host != server.URL || got.Token != "arr-api-key" || got.Source != arr.SourceAuto {
+		t.Fatalf("authenticated Arr = %#v", got)
+	}
+	if got.Type != arr.Sonarr {
+		t.Fatalf("Arr type = %q, want the type the instance reported", got.Type)
+	}
+	stored, ok := q.manager.Arr().Get("whisparr")
+	if !ok || stored.Host != server.URL || stored.Token != "arr-api-key" {
+		t.Fatalf("stored Arr = %#v", stored)
+	}
+}
+
+func TestPreferencesRequireAuthentication(t *testing.T) {
+	q := newAuthenticationTestQBit(t)
+	cfg := config.Get()
+	cfg.UseAuth = true
+	cfg.Auth = &config.Auth{APIToken: "api-token", TokenOnly: true}
+	routes := q.Routes()
+	for _, token := range []string{"", "wrong", "api-token"} {
+		req := httptest.NewRequest(http.MethodGet, "/app/preferences", nil)
+		if token != "" {
+			req.SetBasicAuth("client", token)
+		}
+		response := httptest.NewRecorder()
+		routes.ServeHTTP(response, req)
+		want := http.StatusUnauthorized
+		if token == "api-token" {
+			want = http.StatusOK
+		}
+		if response.Code != want {
+			t.Fatalf("token %q: status = %d, want %d", token, response.Code, want)
+		}
+	}
+	response := httptest.NewRecorder()
+	routes.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/app/version", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("public version status = %d, want 200", response.Code)
+	}
+}
 
 // TestDecodeAuthHeader covers the fix for the slice-bounds-out-of-range panic
 // at pkg/server/qbit/context.go:60-62. When the base64-decoded payload contains
@@ -25,14 +120,14 @@ func TestDecodeAuthHeader(t *testing.T) {
 	}{
 		{
 			name:     "well-formed Basic auth",
-			header:   "Basic " + b64("alice:hunter2"),
+			header:   "Basic " + base64.StdEncoding.EncodeToString([]byte("alice:hunter2")),
 			wantErr:  false,
 			wantUser: "alice",
 			wantPass: "hunter2",
 		},
 		{
 			name:     "well-formed with colon in password",
-			header:   "Basic " + b64("alice:hunt:er2"),
+			header:   "Basic " + base64.StdEncoding.EncodeToString([]byte("alice:hunt:er2")),
 			wantErr:  false,
 			wantUser: "alice:hunt", // strings.LastIndex => split on the last colon
 			wantPass: "er2",
@@ -49,7 +144,7 @@ func TestDecodeAuthHeader(t *testing.T) {
 			// Garbage that decodes successfully but has no colon.
 			// PRE-FIX: panic.
 			name:         "no-colon decoded bytes",
-			header:       "Basic " + b64("just-a-token-no-colon"),
+			header:       "Basic " + base64.StdEncoding.EncodeToString([]byte("just-a-token-no-colon")),
 			wantErr:      true,
 			mustNotPanic: true,
 		},
@@ -95,29 +190,4 @@ func TestDecodeAuthHeader(t *testing.T) {
 			}
 		})
 	}
-}
-
-// b64 encodes a string as standard base64 with padding. Tiny helper so the
-// test cases read like the wire format they represent.
-func b64(s string) string {
-	const alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	src := []byte(s)
-	var sb strings.Builder
-	for i := 0; i < len(src); i += 3 {
-		var buf [3]byte
-		n := copy(buf[:], src[i:])
-		sb.WriteByte(alpha[buf[0]>>2])
-		sb.WriteByte(alpha[(buf[0]&0x03)<<4|buf[1]>>4])
-		if n > 1 {
-			sb.WriteByte(alpha[(buf[1]&0x0f)<<2|buf[2]>>6])
-		} else {
-			sb.WriteByte('=')
-		}
-		if n > 2 {
-			sb.WriteByte(alpha[buf[2]&0x3f])
-		} else {
-			sb.WriteByte('=')
-		}
-	}
-	return sb.String()
 }

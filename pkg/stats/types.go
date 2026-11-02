@@ -2,6 +2,7 @@ package stats
 
 import (
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
+	"github.com/sirrobot01/decypharr/pkg/hearsay"
 	"github.com/sirrobot01/decypharr/pkg/manager"
 )
 
@@ -18,6 +19,7 @@ type Snapshot struct {
 	Queue         QueueStats        `json:"queue"`
 	Arrs          ArrStats          `json:"arrs"`
 	Repair        RepairStats       `json:"repair"`
+	Hearsay       hearsay.Status    `json:"hearsay"`
 }
 
 // AccessStats describes the network file servers that expose the library to
@@ -52,13 +54,13 @@ type WebDAVAccess struct {
 }
 
 type SystemStats struct {
-	// MemoryUsed is the process's real heap footprint: memory committed from
-	// the OS that has not been released back (Sys - HeapReleased). This is the
-	// number that tracks RSS, not Sys — most of Sys is reserved-but-released
-	// address space.
+	// MemoryUsed is Go runtime memory: Sys minus HeapReleased.
+	// It excludes direct mmap allocations and native library allocations.
 	MemoryUsed string `json:"memory_used"`
-	// HeapAllocMB is the live heap (HeapAlloc): bytes of in-use, reachable
-	// objects. Fluctuates between GC cycles up to NextGC.
+	// ProcessRSSMB is the OS estimate of resident process memory.
+	// It includes resident mmap pages and native library memory.
+	ProcessRSSMB string `json:"process_rss_mb,omitempty"`
+	// HeapAllocMB includes allocated objects that GC has not yet collected.
 	HeapAllocMB string `json:"heap_alloc_mb"`
 	// HeapInuseMB is the bytes in heap spans currently in use (HeapInuse).
 	HeapInuseMB string `json:"heap_inuse_mb"`

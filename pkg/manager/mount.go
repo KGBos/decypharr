@@ -2,13 +2,13 @@ package manager
 
 import (
 	"context"
+	"github.com/sirrobot01/decypharr/internal/config"
 	"io"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sourcegraph/conc/pool"
 )
@@ -40,20 +40,13 @@ type MountManager interface {
 	Refresh(dirs []string) error
 }
 
-func (m *Manager) RefreshEntries(refreshMount bool) {
-	// Refresh entries
-	m.entry.Refresh()
-
-	// Refresh mount if needed
-	if refreshMount {
-		go func() {
-			_ = m.RefreshMount()
-		}()
-	}
+// InvalidateEntryCache clears cached entries. Reads rebuild them on demand.
+func (m *Manager) InvalidateEntryCache() {
+	m.entry.InvalidateAll()
 }
 
 func (m *Manager) RefreshMount() error {
-	dirs := strings.FieldsFunc(m.config.RefreshDirs, func(r rune) bool {
+	dirs := strings.FieldsFunc(config.Get().RefreshDirs, func(r rune) bool {
 		return r == ',' || r == '&'
 	})
 	if len(dirs) == 0 {

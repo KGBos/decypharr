@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,7 +18,6 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/logger"
-	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/mount/dfs/backend"
 	"github.com/sirrobot01/decypharr/pkg/mount/dfs/config"
 	"github.com/sirrobot01/decypharr/pkg/mount/dfs/vfs"
@@ -60,7 +60,7 @@ type Backend struct {
 
 // NewBackend creates a new hanwen backend
 func NewBackend(vfs *vfs.Manager, config *config.FuseConfig) (backend.Backend, error) {
-	now := utils.Now()
+	now := time.Now()
 	log := logger.New("hanwen-backend")
 	// One shared rate-limited logger for the whole mount. Files/Dirs reference
 	// it instead of allocating their own xsync map per inode — dedup keys are
@@ -159,6 +159,12 @@ func (b *Backend) mount(ctx context.Context, mountFS mountFilesystem) (retErr er
 		MaxBackground: b.config.FuseMaxBackground,
 		MaxReadAhead:  b.config.FuseMaxReadAhead,
 		AllowOther:    true,
+		// Route handler panics through our logger; go-fuse fails the single
+		// request with EIO instead of the panic unwinding into its serve loop.
+		PanicHandler: func(p any) fuse.Status {
+			b.logger.Error().Any("panic", p).Bytes("stack", debug.Stack()).Msg("FUSE handler panic")
+			return fuse.EIO
+		},
 	}
 
 	var opt []string

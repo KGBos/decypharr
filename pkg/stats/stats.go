@@ -16,6 +16,7 @@ import (
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/manager"
+	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
 // Collector owns the cached stats snapshot and the HTTP handler.
@@ -116,8 +117,7 @@ func (c *Collector) collect() *Snapshot {
 	// --- System ---
 	mb := func(b uint64) string { return fmt.Sprintf("%.2fMB", float64(b)/1024/1024) }
 	snap.System = SystemStats{
-		// Sys - HeapReleased is the heap actually held from the OS; HeapReleased
-		// has been handed back (MADV_DONTNEED on Linux) so it does not count.
+		// This is Go runtime memory. Direct mmap allocations are excluded.
 		MemoryUsed:     mb(memStats.Sys - memStats.HeapReleased),
 		HeapAllocMB:    mb(memStats.HeapAlloc),
 		HeapInuseMB:    mb(memStats.HeapInuse),
@@ -132,6 +132,9 @@ func (c *Collector) collect() *Snapshot {
 		UptimeSeconds:  int64(uptime.Seconds()),
 		Uptime:         uptime.String(),
 		StartTime:      startTime.Format("2006-01-02 15:04:05"),
+	}
+	if rss, err := processRSS(); err == nil {
+		snap.System.ProcessRSSMB = mb(rss)
 	}
 
 	// --- Debrids ---
@@ -167,14 +170,17 @@ func (c *Collector) collect() *Snapshot {
 
 	// --- Queue ---
 	if queue := c.mgr.JobQueue(); queue != nil {
+		// Active counts entries actually downloading, not jobs holding a
+		// worker slot: a worker is released once the job is handed off to the
+		// queue scheduler, well before the download finishes.
 		snap.Queue = QueueStats{
 			Pending: queue.Len(),
-			Active:  queue.ActiveCount(),
+			Active:  c.mgr.Storage().CountQueuedByState(storage.EntryStateDownloading),
 		}
 	}
 
 	// --- Arrs ---
-	arrs := c.mgr.Arr().GetAll()
+	arrs := c.mgr.Arr().All()
 	arrNames := make([]string, 0, len(arrs))
 	for _, a := range arrs {
 		arrNames = append(arrNames, a.Name)
@@ -197,6 +203,8 @@ func (c *Collector) collect() *Snapshot {
 			Health:  health,
 		}
 	}
+
+	snap.Hearsay = c.mgr.Hearsay().Status()
 
 	return snap
 }

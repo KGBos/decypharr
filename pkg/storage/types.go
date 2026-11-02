@@ -174,6 +174,9 @@ func (e *EntryItem) GetSize() int64 {
 
 func (e *EntryItem) GetFirstFile() (*File, error) {
 	for _, f := range e.Files {
+		if f == nil || f.Deleted {
+			continue
+		}
 		return f, nil
 	}
 	return nil, fmt.Errorf("no active files found")
@@ -190,6 +193,10 @@ func (e *EntryItem) GetActiveFiles() []*File {
 }
 
 type File struct {
+	// ID is a stable per-file identifier assigned when the file first enters
+	// storage. It never changes afterward — repairs may rename a file, but the
+	// ID must not follow the name. It keys identity-based STRM URLs.
+	ID        string    `msgpack:"id,omitempty" json:"id,omitempty"`
 	Name      string    `msgpack:"name" json:"name"`
 	Path      string    `msgpack:"path,omitempty" json:"path,omitempty"`
 	AddedOn   time.Time `msgpack:"added_on" json:"added_on"`
@@ -435,6 +442,19 @@ func (e *Entry) GetFile(filename string) (*File, error) {
 	return f, nil
 }
 
+// GetFileByID resolves a file by its stable ID. Entries hold few files, so a
+// scan is fine.
+func (e *Entry) GetFileByID(id string) (*File, error) {
+	if id != "" {
+		for _, f := range e.Files {
+			if f.ID == id && !f.Deleted {
+				return f, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("no file with id %s in entry %s", id, e.Name)
+}
+
 // RunChecks performs integrity checks on the Entry
 // Returns whether to refresh and any error encountered
 func (e *Entry) RunChecks() (bool, error) {
@@ -556,7 +576,7 @@ type CachedTorrent struct {
 	MountPath        string                       `json:"mount_path"`        // Mount path
 	DeletedFiles     []string                     `json:"deleted_files"`     // Deleted files
 	Debrid           string                       `json:"debrid"`            // Debrid name
-	Arr              *arr.Arr                     `json:"arr"`               // Arr association
+	Arr              arr.Arr                      `json:"arr"`               // Arr association
 	AddedOn          string                       `json:"added_on"`          // Added on timestamp
 	IsComplete       bool                         `json:"is_complete"`       // Is complete
 	Bad              bool                         `json:"bad"`               // Is bad
@@ -577,11 +597,7 @@ func (ct *CachedTorrent) ToManagedTorrent() *Entry {
 		addedOn = now
 	}
 	createdAt = addedOn
-	// GetReader category from arr
-	var category string
-	if ct.Arr != nil {
-		category = ct.Arr.Name
-	}
+	category := ct.Arr.Name
 
 	mt := &Entry{
 		Protocol:         config.ProtocolTorrent,

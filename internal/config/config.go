@@ -11,7 +11,6 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
-	"sync"
 
 	json "github.com/bytedance/sonic"
 )
@@ -39,7 +38,6 @@ const (
 const (
 	DownloadActionSymlink  DownloadAction = "symlink"
 	DownloadActionDownload DownloadAction = "download"
-	DownloadActionStrm     DownloadAction = "strm"
 	DownloadActionNone     DownloadAction = "none"
 )
 
@@ -49,12 +47,6 @@ const (
 	WebDavUseFileNameNoExt     WebDavFolderNaming = "filename_no_ext"
 	WebDavUseOriginalNameNoExt WebDavFolderNaming = "original_no_ext"
 	WebdavUseHash              WebDavFolderNaming = "infohash"
-)
-
-var (
-	instance   *Config
-	once       sync.Once
-	configPath string
 )
 
 // QBitTorrent is deprecated. Use Manager instead.
@@ -198,9 +190,16 @@ type VirtualFolderCondition struct {
 }
 
 type Auth struct {
-	Username string `json:"username,omitempty"`
-	Password string `json:"password,omitempty"`
-	APIToken string `json:"api_token,omitempty"`
+	SessionVersion string `json:"session_version,omitempty"`
+	Username       string `json:"username,omitempty"`
+	Password       string `json:"password,omitempty"`
+	APIToken       string `json:"api_token,omitempty"`
+
+	// TokenOnly makes the API token the sole credential: there is no username
+	// or password, so registration stays closed and the login page accepts the
+	// token in place of a password. WebDAV never accepts the token, in either
+	// mode.
+	TokenOnly bool `json:"token_only,omitempty"`
 }
 
 // RepairSource selects where the health checker enumerates entries from.
@@ -224,7 +223,6 @@ type RepairConfig struct {
 	RecheckInterval       string       `json:"recheck_interval,omitempty"`
 	Arrs                  []string     `json:"arrs,omitempty"`
 	AutoRepair            bool         `json:"auto_repair,omitempty"`
-	SkipNZBRepair         bool         `json:"skip_nzb_repair,omitempty"`
 
 	// VerifyContent makes NZB probes also read each media file's head through
 	// the streaming stack and check for a valid container signature, catching
@@ -245,10 +243,12 @@ type RepairConfig struct {
 func (r RepairConfig) IsZero() bool {
 	return !r.Enabled && r.Source == "" && r.Schedule == "" && r.Workers == 0 &&
 		r.NNTPConnectionPercent == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
-		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == ""
+		!r.AutoRepair && r.StopSchedule == ""
 }
 
 type Config struct {
+	SessionSecret string `json:"session_secret,omitempty"`
+
 	// server
 	BindAddress string `json:"bind_address,omitempty"`
 	URLBase     string `json:"url_base,omitempty"`
@@ -309,6 +309,10 @@ type Config struct {
 
 	Repair RepairConfig `json:"repair,omitzero"`
 
+	Strm Strm `json:"strm,omitzero"`
+
+	Hearsay Hearsay `json:"hearsay,omitzero"`
+
 	// QueueCleanup is the global arr queue-cleanup policy (see CleanupQueue).
 	QueueCleanup QueueCleanup `json:"queue_cleanup"`
 }
@@ -346,12 +350,19 @@ func (c *Config) loadConfig() error {
 	if err := json.Unmarshal(data, &c); err != nil {
 		return fmt.Errorf("error parsing config JSON: %w", err)
 	}
+	hadStrmSecret := c.Strm.Secret != ""
+	hadSessionSecret := c.SessionSecret != ""
 
 	// Set defaults for any missing values
 	c.setDefaults()
 
 	// Apply environment variable overrides
 	c.applyEnvOverrides()
+
+	// Save new signing secrets so signatures remain valid after a restart.
+	if !hadStrmSecret || !hadSessionSecret {
+		return c.Save()
+	}
 
 	return nil
 }
@@ -381,32 +392,13 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// generateAPIToken creates a new random API token
-func generateAPIToken() (string, error) {
+// GenerateAPIToken creates a new random API token
+func GenerateAPIToken() (string, error) {
 	bytes := make([]byte, 32) // 256-bit token
 	if _, err := rand.Read(bytes); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(bytes), nil
-}
-
-func SetConfigPath(path string) {
-	configPath = path
-}
-
-func GetMainPath() string {
-	return configPath
-}
-
-func Get() *Config {
-	once.Do(func() {
-		instance = &Config{} // Initialize instance first
-		if err := instance.loadConfig(); err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "configuration Error: %v\n", err)
-			os.Exit(1)
-		}
-	})
-	return instance
 }
 
 func (c *Config) GetMinFileSize() int64 {
@@ -434,36 +426,57 @@ func (c *Config) GetMaxFileSize() int64 {
 }
 
 func (c *Config) SecretKey() string {
-	return cmp.Or(getEnv("SECRET_KEY"), "\"wqj(v%lj*!-+kf@4&i95rhh_!5_px5qnuwqbr%cjrvrozz_r*(\"")
+	return cmp.Or(getEnv("SECRET_KEY"), c.SessionSecret)
 }
 
+// GetAuth returns a copy of the authentication settings.
 func (c *Config) GetAuth() *Auth {
 	if !c.UseAuth {
 		return nil
 	}
-	if c.Auth == nil {
-		c.Auth = &Auth{}
-		if _, err := os.Stat(c.AuthFile()); err == nil {
-			file, err := os.ReadFile(c.AuthFile())
-			if err == nil {
-				_ = json.Unmarshal(file, c.Auth)
-			}
-		}
+	if c.Auth != nil {
+		return new(*c.Auth)
 	}
-	return c.Auth
+	auth := &Auth{}
+	if data, err := os.ReadFile(c.AuthFile()); err == nil {
+		_ = json.Unmarshal(data, auth)
+	}
+	return auth
 }
 
 func (c *Config) SaveAuth(auth *Auth) error {
-	c.Auth = auth
-	data, err := json.Marshal(auth)
+	if auth == nil {
+		return errors.New("authentication settings are required")
+	}
+	updated := *auth
+	updated.SessionVersion = rand.Text()
+	data, err := json.Marshal(&updated)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(c.AuthFile(), data, 0644)
+	if err := os.Chmod(c.AuthFile(), 0600); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.WriteFile(c.AuthFile(), data, 0600); err != nil {
+		return err
+	}
+	c.Auth = &updated
+	return nil
 }
 
+// NeedsAuth reports whether auth is enabled but no credential has been set up
+// yet. That is the only state in which registration is open.
 func (c *Config) NeedsAuth() bool {
-	return c.UseAuth && (c.Auth == nil || c.Auth.Username == "" || c.Auth.Password == "")
+	if !c.UseAuth {
+		return false
+	}
+	if c.Auth == nil {
+		return true
+	}
+	if c.Auth.TokenOnly {
+		return c.Auth.APIToken == ""
+	}
+	return c.Auth.Username == "" || c.Auth.Password == ""
 }
 
 // migrateQBitTorrentToManager migrates deprecated QBitTorrent config to Manager
@@ -528,6 +541,11 @@ func (c *Config) migrateNotifications() {
 }
 
 func (c *Config) setDefaults() {
+	if c.SessionSecret == "" {
+		var key [32]byte
+		_, _ = rand.Read(key[:])
+		c.SessionSecret = hex.EncodeToString(key[:])
+	}
 	// Migrate deprecated fields to Manager (backward compatibility)
 	c.migrateQBitTorrentToManager()
 	c.migrateNotifications()
@@ -683,7 +701,7 @@ func (c *Config) setDefaults() {
 			c.Auth = &Auth{}
 		}
 		if c.Auth.APIToken == "" {
-			if token, err := generateAPIToken(); err == nil {
+			if token, err := GenerateAPIToken(); err == nil {
 				c.Auth.APIToken = token
 				// Save the updated auth config
 				_ = c.SaveAuth(c.Auth)
@@ -701,6 +719,7 @@ func (c *Config) setDefaults() {
 	c.setShareCacheDefaults()
 
 	c.applyRepairDefaults()
+	c.setStrmDefaults()
 }
 
 func (c *Config) applyRepairDefaults() {
@@ -728,16 +747,14 @@ func (c *Config) Save() error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(c.JsonFile(), data, 0644); err != nil {
+	if err := os.Chmod(c.JsonFile(), 0600); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.WriteFile(c.JsonFile(), data, 0600); err != nil {
 		fmt.Printf("Failed to write config file: %v\n", err)
 		return err
 	}
 	return nil
-}
-
-func Reset() {
-	once = sync.Once{}
-	instance = nil
 }
 
 // clearHotFields zeroes every field that can be applied at runtime without a
@@ -760,21 +777,15 @@ func clearHotFields(c *Config) {
 	c.UseAuth = false
 	c.EnableWebdavAuth = false
 
-	// Manager / processing settings — read live via config.Get() on the
-	// relevant code paths, or applied lazily on the next natural restart.
+	// These settings are read from the current snapshot or applied explicitly.
+	// Worker limits, schedules, retry limits, and notification clients need a restart.
 	c.Arrs = nil
 	c.AllowedExt = nil
 	c.AllowSamples = false
 	c.MinFileSize = ""
 	c.MaxFileSize = ""
-	c.RemoveStalledAfter = ""
 	c.NZBUserAgent = ""
-	c.Notifications = Notifications{}
-	c.DiscordWebhook = ""
-	c.CallbackURL = ""
 	c.DownloadFolder = ""
-	c.RefreshInterval = ""
-	c.MaxActiveDownloads = 0
 	c.MaxCacheWarmWorkers = 0
 	c.SkipPreCache = false
 	c.SkipMultiSeason = false
@@ -785,9 +796,12 @@ func clearHotFields(c *Config) {
 	c.VirtualFolders = nil
 	c.DefaultDownloadAction = ""
 	c.RefreshDirs = ""
-	c.Retries = 0
 	c.SkipAutoMove = false
 	c.Repair = RepairConfig{}
+
+	// STRM settings are read live on every URL build, stream request, and
+	// reconciler pass; a config change triggers a resweep, not a restart.
+	c.Strm = Strm{}
 
 	// Queue cleanup rules are read live via config.Get() inside CleanupQueue,
 	// so changes apply on the next cleanup cycle without a restart.
@@ -808,8 +822,7 @@ func clearHotFields(c *Config) {
 // RequiresRestart reports whether applying n on top of c needs a full service
 // restart (re-binding the HTTP listener, recreating debrid/usenet clients, or
 // re-mounting the filesystem). It returns false when only runtime-applicable
-// ("hot") fields changed, in which case the caller can use ApplyRuntime to
-// update the live config in place without tearing anything down.
+// ("hot") fields changed. Update publishes these fields without a restart.
 //
 // Both configs are compared after their defaults have been applied (see
 // setDefaults / Save), so callers should persist n before calling this.
@@ -818,18 +831,6 @@ func (c *Config) RequiresRestart(n *Config) bool {
 	clearHotFields(&a)
 	clearHotFields(&b)
 	return !reflect.DeepEqual(a, b)
-}
-
-// ApplyRuntime copies n into the live config in place, preserving the in-memory
-// Auth pointer. Because every holder of the *Config singleton shares this
-// struct, the updated values become visible everywhere without a restart.
-//
-// Only call this when RequiresRestart(n) is false: the cold fields are then
-// identical between c and n, so this effectively updates just the hot fields.
-func (c *Config) ApplyRuntime(n *Config) {
-	auth := c.Auth
-	*c = *n
-	c.Auth = auth
 }
 
 func (c *Config) createConfig() error {

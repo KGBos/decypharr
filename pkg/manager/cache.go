@@ -38,7 +38,7 @@ func NewEntryCache(manager *Manager) *EntryCache {
 func (e *EntryCache) Get(name string) (*FileInfo, []FileInfo) {
 	// Relative-time views change as the clock advances even when library
 	// metadata does not, so never retain their children in the entry cache.
-	if !strings.HasPrefix(name, torrentEntryCachePrefix) && e.manager.virtualFoldersSnapshot().isTimeSensitive(name) {
+	if !strings.HasPrefix(name, torrentEntryCachePrefix) && e.manager.virtualFoldersSnapshot().IsTimeSensitive(name) {
 		return e.manager.getEntryChildren(name)
 	}
 	item, ok := e.entries.Load(name)
@@ -83,15 +83,11 @@ func (e *EntryCache) _refreshEntry(name string) EntryCacheItem {
 	return item
 }
 
-// Refresh triggers a cache refresh with debouncing.
-// If called multiple times rapidly, only one refresh will occur.
-func (e *EntryCache) Refresh() {
+// InvalidateAll clears cached entries. Reads rebuild them on demand.
+func (e *EntryCache) InvalidateAll() {
 	e.generation.Add(1)
 	// Clear every group and torrent entry. This is deliberately independent of
 	// the current config so renamed/removed virtual folders cannot survive in the
 	// cache after a live update.
-	e.entries.Range(func(key string, _ EntryCacheItem) bool {
-		e.entries.Delete(key)
-		return true
-	})
+	e.entries.Clear()
 }

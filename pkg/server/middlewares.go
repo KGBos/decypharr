@@ -37,10 +37,12 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		}
 
 		// Fall back to session authentication
-		session, _ := s.cookie.Get(r, "auth-session")
+		session, err := s.cookie.Get(r, "auth-session")
 		auth, ok := session.Values["authenticated"].(bool)
+		version, hasVersion := session.Values["auth_version"].(string)
+		currentAuth := cfg.GetAuth()
 
-		if !ok || !auth {
+		if err != nil || !ok || !auth || !hasVersion || currentAuth == nil || version != currentAuth.SessionVersion {
 			if isAPI {
 				s.sendJSONError(w, "Authentication required. Please provide a valid API token in the Authorization header (Bearer <token>) or authenticate via session cookies.", http.StatusUnauthorized)
 			} else {
@@ -53,9 +55,14 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// isAPIRequest checks if the request is for an API endpoint
+// isAPIRequest reports whether an authentication failure should be returned as
+// JSON instead of redirecting the caller to the login page.
 func (s *Server) isAPIRequest(r *http.Request) bool {
-	return strings.HasPrefix(r.URL.Path, "/api/")
+	path := r.URL.Path
+	if urlBase := strings.TrimSuffix(s.urlBase, "/"); urlBase != "" {
+		path = strings.TrimPrefix(path, urlBase)
+	}
+	return strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "/webhooks/")
 }
 
 // sendJSONError sends a JSON error response

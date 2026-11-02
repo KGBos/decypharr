@@ -16,7 +16,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/request"
 	"github.com/sirrobot01/decypharr/internal/utils"
-	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
+	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 )
 
 func TestSubmitMagnetAcceptsDocumentedObjectResponse(t *testing.T) {
@@ -28,7 +28,7 @@ func TestSubmitMagnetAcceptsDocumentedObjectResponse(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	torrent := &debridTypes.Torrent{
+	torrent := &types.Torrent{
 		InfoHash:         "AABBCC",
 		DownloadUncached: true,
 		Magnet:           &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
@@ -51,7 +51,7 @@ func TestSubmitMagnetSelectsMatchingTorrentFromArrayResponse(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	torrent := &debridTypes.Torrent{
+	torrent := &types.Torrent{
 		InfoHash:         "AABBCC",
 		DownloadUncached: true,
 		Magnet:           &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
@@ -74,7 +74,7 @@ func TestSubmitMagnetRejectsArrayWithoutMatchingHash(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	torrent := &debridTypes.Torrent{
+	torrent := &types.Torrent{
 		InfoHash:         "AABBCC",
 		DownloadUncached: true,
 		Magnet:           &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
@@ -95,7 +95,7 @@ func TestSubmitMagnetIncludesSanitizedProviderError(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	torrent := &debridTypes.Torrent{
+	torrent := &types.Torrent{
 		InfoHash:         "AABBCC",
 		DownloadUncached: true,
 		Magnet:           &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
@@ -137,7 +137,7 @@ func TestSubmitMagnetPreservesStatusAndBodyOnExhaustedRetries(t *testing.T) {
 		config: config.Debrid{Name: "torbox"},
 	}
 
-	torrent := &debridTypes.Torrent{
+	torrent := &types.Torrent{
 		InfoHash:         "AABBCC",
 		DownloadUncached: true,
 		Magnet:           &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
@@ -183,7 +183,7 @@ func TestSubmitMagnetHandlesChunkedErrorResponse(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	tb := testTorbox(server.URL)
-	torrent := &debridTypes.Torrent{
+	torrent := &types.Torrent{
 		InfoHash:         "AABBCC",
 		DownloadUncached: true,
 		Magnet:           &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
@@ -207,7 +207,7 @@ func TestSubmitMagnetHandlesEmptyBodyErrorResponse(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	tb := testTorbox(server.URL)
-	torrent := &debridTypes.Torrent{
+	torrent := &types.Torrent{
 		InfoHash:         "AABBCC",
 		DownloadUncached: true,
 		Magnet:           &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
@@ -264,7 +264,7 @@ func TestSubmitMagnetCachePreflight(t *testing.T) {
 				}
 			}))
 			defer server.Close()
-			torrent := &debridTypes.Torrent{InfoHash: "AABBCC", Magnet: &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"}, DownloadUncached: tc.downloadUncached}
+			torrent := &types.Torrent{InfoHash: "AABBCC", Magnet: &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"}, DownloadUncached: tc.downloadUncached}
 			got, err := testTorbox(server.URL).SubmitMagnet(torrent)
 			if tc.wantError != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
@@ -282,7 +282,7 @@ func TestSubmitMagnetCachePreflight(t *testing.T) {
 
 func TestGetTorboxStatusKeepsIncompleteDownloadsRetryable(t *testing.T) {
 	tb := &Torbox{}
-	if got := tb.getTorboxStatus("incomplete", false); got != debridTypes.TorrentStatusDownloading {
+	if got := tb.getTorboxStatus("incomplete", false); got != types.TorrentStatusDownloading {
 		t.Fatalf("getTorboxStatus(incomplete) = %q, want downloading", got)
 	}
 }
@@ -296,11 +296,11 @@ func TestUpdateTorrentTreatsPresentStalledDownloadAsCompleted(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	torrent := &debridTypes.Torrent{Id: "17"}
+	torrent := &types.Torrent{Id: "17"}
 	if err := testTorbox(server.URL).UpdateTorrent(torrent); err != nil {
 		t.Fatalf("UpdateTorrent() error = %v", err)
 	}
-	if torrent.Status != debridTypes.TorrentStatusDownloaded {
+	if torrent.Status != types.TorrentStatusDownloaded {
 		t.Fatalf("Status = %q, want downloaded", torrent.Status)
 	}
 	file := torrent.Files["Reacher.S02.mkv"]
@@ -318,11 +318,11 @@ func TestUpdateTorrentDoesNotCompletePartialPresentDownload(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	torrent := &debridTypes.Torrent{Id: "18"}
+	torrent := &types.Torrent{Id: "18"}
 	if err := testTorbox(server.URL).UpdateTorrent(torrent); err != nil {
 		t.Fatalf("UpdateTorrent() error = %v", err)
 	}
-	if torrent.Status != debridTypes.TorrentStatusDownloading {
+	if torrent.Status != types.TorrentStatusDownloading {
 		t.Fatalf("Status = %q, want downloading", torrent.Status)
 	}
 	if link := torrent.Files["Partial.Release.mkv"].Link; link != "" {
@@ -339,7 +339,7 @@ func TestCheckStatusPreservesTorboxFailureContext(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	torrent, err := testTorbox(server.URL).CheckStatus(&debridTypes.Torrent{Id: "23"})
+	torrent, err := testTorbox(server.URL).CheckStatus(&types.Torrent{Id: "23"})
 	if err == nil {
 		t.Fatal("CheckStatus() error = nil, want provider failure")
 	}
@@ -350,6 +350,59 @@ func TestCheckStatusPreservesTorboxFailureContext(t *testing.T) {
 	}
 	if torrent == nil || torrent.InfoHash != "AABBCC" {
 		t.Fatalf("CheckStatus() torrent = %#v, want returned provider hash", torrent)
+	}
+}
+
+func TestSubmissionRequestsUseDedicatedClient(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	var (
+		mu    sync.Mutex
+		lanes []string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		lanes = append(lanes, r.Header.Get("X-Lane"))
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/torrents/createtorrent":
+			_, _ = fmt.Fprint(w, `{"success":true,"data":{"torrent_id":17,"hash":"ABC"}}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/torrents/mylist":
+			_, _ = fmt.Fprint(w, `{"success":true,"data":{"id":17,"name":"Release.mkv","size":100,"progress":1,"download_state":"completed","download_finished":true,"created_at":"2026-01-02T03:04:05Z","hash":"ABC","files":[{"id":1,"name":"Release.mkv","absolute_path":"Release.mkv","size":100}]}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	tb := testTorbox(server.URL)
+	tb.client = request.New(
+		request.WithHeaders(map[string]string{"X-Lane": "main"}),
+		request.WithMaxRetries(0),
+	)
+	tb.submitClient = request.New(
+		request.WithHeaders(map[string]string{"X-Lane": "submit"}),
+		request.WithMaxRetries(0),
+	)
+
+	torrent := &types.Torrent{
+		DownloadUncached: true,
+		Magnet:           &utils.Magnet{Link: "magnet:?xt=urn:btih:ABC"},
+	}
+	added, err := tb.SubmitMagnet(torrent)
+	if err != nil {
+		t.Fatalf("SubmitMagnet() error = %v", err)
+	}
+	if _, err := tb.CheckStatus(added); err != nil {
+		t.Fatalf("CheckStatus() error = %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(lanes, []string{"submit", "submit"}) {
+		t.Fatalf("request lanes = %v, want dedicated submission lane", lanes)
 	}
 }
 
@@ -419,6 +472,60 @@ func TestGetTorrentsReturnsPaginationErrors(t *testing.T) {
 	}
 }
 
+func TestGetTorrentAcceptsObjectAndArrayResponses(t *testing.T) {
+	tests := map[string]string{
+		"object": `{"success":true,"data":{"id":17,"name":"Release.mkv","size":100,"progress":1,"download_state":"completed","download_finished":true,"created_at":"2026-01-02T03:04:05Z","hash":"ABC","files":[{"id":1,"name":"Release.mkv","absolute_path":"Release.mkv","size":100}]}}`,
+		"array":  `{"success":true,"data":[{"id":17,"name":"Release.mkv","size":100,"progress":1,"download_state":"completed","download_finished":true,"created_at":"2026-01-02T03:04:05Z","hash":"ABC","files":[{"id":1,"name":"Release.mkv","absolute_path":"Release.mkv","size":100}]}]}`,
+	}
+
+	for name, body := range tests {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, body)
+			}))
+			t.Cleanup(server.Close)
+
+			torrent, err := testTorbox(server.URL).GetTorrent("17")
+			if err != nil {
+				t.Fatalf("GetTorrent() error = %v", err)
+			}
+			if torrent.Id != "17" || torrent.InfoHash != "ABC" || len(torrent.Files) != 1 {
+				t.Fatalf("GetTorrent() = %#v, want torrent 17 with one file", torrent)
+			}
+		})
+	}
+}
+
+func TestDeleteTorrentUsesControlEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/api/torrents/controltorrent" {
+			t.Errorf("path = %q, want /api/torrents/controltorrent", r.URL.Path)
+		}
+		var payload struct {
+			TorrentID int    `json:"torrent_id"`
+			Operation string `json:"operation"`
+			All       bool   `json:"all"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if payload.TorrentID != 42 || payload.Operation != "delete" || payload.All {
+			t.Errorf("payload = %#v, want torrent 42 delete operation", payload)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"success":true,"detail":"Torrent deleted successfully"}`)
+	}))
+	t.Cleanup(server.Close)
+
+	if err := testTorbox(server.URL).DeleteTorrent("42"); err != nil {
+		t.Fatalf("DeleteTorrent() error = %v", err)
+	}
+}
+
 func TestDeleteTorrentPostsControlJSON(t *testing.T) {
 	config.SetConfigPath(t.TempDir())
 
@@ -478,8 +585,8 @@ func TestDeleteTorrentRejectsNonNumericID(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	err := testTorbox(server.URL).DeleteTorrent("not-a-number")
-	if err == nil || !strings.Contains(err.Error(), "invalid torrent id") {
-		t.Fatalf("DeleteTorrent() error = %v, want invalid torrent id", err)
+	if err == nil || !strings.Contains(err.Error(), "invalid TorBox torrent id") {
+		t.Fatalf("DeleteTorrent() error = %v, want invalid TorBox torrent id", err)
 	}
 	if called {
 		t.Fatal("DeleteTorrent() sent a request for a non-numeric id")
@@ -492,5 +599,133 @@ func testTorbox(host string) *Torbox {
 		client: request.New(request.WithMaxRetries(0)),
 		logger: zerolog.Nop(),
 		config: config.Debrid{Name: "torbox"},
+	}
+}
+
+func TestAvailabilityPreservesKeysAndReportsIncompleteBatches(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls > 1 {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"success":true,"data":{"abc":{"size":100}}}`)
+	}))
+	defer server.Close()
+	hashes := []string{"abc", "AbC", "missing"}
+	for len(hashes) < 100 {
+		hashes = append(hashes, fmt.Sprintf("hash%d", len(hashes)))
+	}
+	hashes = append(hashes, "unchecked")
+	result, err := testTorbox(server.URL).IsAvailable(hashes)
+	if err == nil {
+		t.Fatal("failed batch returned no error")
+	}
+	if !result["abc"] || !result["AbC"] {
+		t.Fatalf("input spelling was lost: %v", result)
+	}
+	if cached, checked := result["missing"]; !checked || cached {
+		t.Fatalf("cache miss = %v, %v", cached, checked)
+	}
+	if _, checked := result["unchecked"]; checked {
+		t.Fatal("failed batch reported a result")
+	}
+}
+
+func TestSubmitMagnetAcceptsObjectAndArrayResponses(t *testing.T) {
+	config.Reset()
+	config.SetConfigPath(t.TempDir())
+	t.Cleanup(config.Reset)
+
+	tests := map[string]string{
+		"object": `{"success":true,"data":{"torrent_id":17,"hash":"abc"}}`,
+		"array":  `{"success":true,"data":[{"id":9,"hash":"other"},{"id":17,"hash":"ABC"}]}`,
+	}
+
+	for name, body := range tests {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, body)
+			}))
+			t.Cleanup(server.Close)
+
+			torrent, err := testTorbox(server.URL).SubmitMagnet(&types.Torrent{
+				InfoHash:         "abc",
+				DownloadUncached: true,
+				Magnet:           &utils.Magnet{Link: "magnet:?xt=urn:btih:abc"},
+			})
+			if err != nil {
+				t.Fatalf("SubmitMagnet() error = %v", err)
+			}
+			if torrent.Id != "17" {
+				t.Fatalf("SubmitMagnet() id = %q, want 17", torrent.Id)
+			}
+		})
+	}
+}
+
+func TestSubmitMagnetSkipsUncachedWithoutSubmitting(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	var createCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "checkcached"):
+			_, _ = fmt.Fprint(w, `{"success":true,"data":{}}`)
+		case strings.Contains(r.URL.Path, "createtorrent"):
+			createCalls++
+			_, _ = fmt.Fprint(w, `{"success":true,"data":{"torrent_id":1,"hash":"AABBCC"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	torrent := &types.Torrent{
+		Name:     "Uncached.Release",
+		InfoHash: "AABBCC",
+		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+	}
+	_, err := testTorbox(server.URL).SubmitMagnet(torrent)
+	if err == nil || !strings.Contains(err.Error(), "DOWNLOAD_NOT_CACHED") {
+		t.Fatalf("SubmitMagnet() error = %v, want not-cached skip", err)
+	}
+	if createCalls != 0 {
+		t.Fatalf("createtorrent called %d times, want 0", createCalls)
+	}
+}
+
+func TestSubmitMagnetProceedsWhenCached(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	var createCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "checkcached"):
+			_, _ = fmt.Fprint(w, `{"success":true,"data":{"AABBCC":{"name":"Cached.Release","size":100,"hash":"AABBCC"}}}`)
+		case strings.Contains(r.URL.Path, "createtorrent"):
+			createCalls++
+			_, _ = fmt.Fprint(w, `{"success":true,"data":{"torrent_id":42,"hash":"AABBCC"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	torrent := &types.Torrent{
+		Name:     "Cached.Release",
+		InfoHash: "AABBCC",
+		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+	}
+	got, err := testTorbox(server.URL).SubmitMagnet(torrent)
+	if err != nil {
+		t.Fatalf("SubmitMagnet() error = %v", err)
+	}
+	if got.Id != "42" || createCalls != 1 {
+		t.Fatalf("id = %q, createCalls = %d; want 42 and 1", got.Id, createCalls)
 	}
 }

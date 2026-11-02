@@ -1,12 +1,12 @@
 package server
 
 import (
+	"fmt"
 	"net/http"
 
 	json "github.com/bytedance/sonic"
 
 	"github.com/sirrobot01/decypharr/internal/config"
-	"golang.org/x/crypto/bcrypt"
 )
 
 func (s *Server) LoginHandler(w http.ResponseWriter, r *http.Request) {
@@ -15,11 +15,15 @@ func (s *Server) LoginHandler(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/register", http.StatusSeeOther)
 		return
 	}
+	auth := cfg.GetAuth()
+	tokenOnly := auth != nil && auth.TokenOnly
+
 	if r.Method == "GET" {
 		data := map[string]any{
-			"URLBase": cfg.URLBase,
-			"Page":    "login",
-			"Title":   "Login",
+			"URLBase":   cfg.URLBase,
+			"Page":      "login",
+			"Title":     "Login",
+			"TokenOnly": tokenOnly,
 		}
 		err := s.templates.ExecuteTemplate(w, "layout", data)
 		if err != nil {
@@ -38,19 +42,33 @@ func (s *Server) LoginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.verifyAuth(credentials.Username, credentials.Password) {
-		session, _ := s.cookie.Get(r, "auth-session")
-		session.Values["authenticated"] = true
-		session.Values["username"] = credentials.Username
-		if err := session.Save(r, w); err != nil {
-			http.Error(w, "Error saving session", http.StatusInternalServerError)
-			return
-		}
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+	username := credentials.Username
+	sessionVersion := ""
+	if auth != nil {
+		sessionVersion = auth.SessionVersion
+	}
+	ok := config.VerifyAuth(credentials.Username, credentials.Password)
+	if !ok && tokenOnly {
+		// Token-only mode has no password, so the API token takes its place.
+		// This is the only way into the UI; without it the mode would lock the
+		// user out of their own instance.
+		ok = config.VerifyToken(credentials.Password)
+		username = "token"
+	}
+	if !ok {
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
 	}
 
-	http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+	session, _ := s.cookie.Get(r, "auth-session")
+	session.Values["authenticated"] = true
+	session.Values["username"] = username
+	session.Values["auth_version"] = sessionVersion
+	if err := session.Save(r, w); err != nil {
+		http.Error(w, "Error saving session", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func (s *Server) LogoutHandler(w http.ResponseWriter, r *http.Request) {
@@ -66,7 +84,18 @@ func (s *Server) LogoutHandler(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) RegisterHandler(w http.ResponseWriter, r *http.Request) {
 	cfg := config.Get()
-	authCfg := cfg.GetAuth()
+
+	// Registration exists only to set the first credential. Once auth is
+	// configured — including token-only mode, which never has a password — it
+	// must stay closed, or anyone could overwrite the stored credentials.
+	if !cfg.NeedsAuth() {
+		if r.Method == http.MethodPost {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
 
 	if r.Method == "GET" {
 		data := map[string]any{
@@ -90,19 +119,14 @@ func (s *Server) RegisterHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Hash the password
-	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	updated, err := config.Update(func(next *config.Config) error {
+		if !next.NeedsAuth() {
+			return fmt.Errorf("registration is closed")
+		}
+		return next.SetCredentials(username, password)
+	})
 	if err != nil {
-		http.Error(w, "Error processing password", http.StatusInternalServerError)
-		return
-	}
-
-	// Set the credentials
-	authCfg.Username = username
-	authCfg.Password = string(hashedPassword)
-
-	if err := cfg.SaveAuth(authCfg); err != nil {
-		http.Error(w, "Error saving credentials", http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -110,6 +134,7 @@ func (s *Server) RegisterHandler(w http.ResponseWriter, r *http.Request) {
 	session, _ := s.cookie.Get(r, "auth-session")
 	session.Values["authenticated"] = true
 	session.Values["username"] = username
+	session.Values["auth_version"] = updated.GetAuth().SessionVersion
 	if err := session.Save(r, w); err != nil {
 		http.Error(w, "Error saving session", http.StatusInternalServerError)
 		return
@@ -165,6 +190,19 @@ func (s *Server) RepairHandler(w http.ResponseWriter, r *http.Request) {
 	err := s.templates.ExecuteTemplate(w, "layout", data)
 	if err != nil {
 		s.logger.Warn().Err(err).Msg("error rendering /repair template")
+	}
+}
+
+func (s *Server) ReacquireHandler(w http.ResponseWriter, r *http.Request) {
+	cfg := config.Get()
+	data := map[string]any{
+		"URLBase":    cfg.URLBase,
+		"Page":       "reacquire",
+		"Title":      "Reacquire",
+		"SetupError": cfg.SetupError(),
+	}
+	if err := s.templates.ExecuteTemplate(w, "layout", data); err != nil {
+		s.logger.Warn().Err(err).Msg("error rendering /reacquire template")
 	}
 }
 

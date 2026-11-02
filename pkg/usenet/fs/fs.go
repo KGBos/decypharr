@@ -33,16 +33,32 @@ type PrefetchableReaderAt interface {
 
 // FS implements fs.FS for RAR volumes backed by NNTP Segments
 type FS struct {
-	ctx           context.Context
-	volumes       *xsync.Map[string, *types.Volume]
-	client        *nntp.Client // Connection client for all readers
-	maxConcurrent int          // Max concurrent connections per reader
-	prefetchSize  int64        // Prefetch size in bytes
-	logger        zerolog.Logger
+	pools             *reader.Pools
+	ctx               context.Context
+	volumes           *xsync.Map[string, *types.Volume]
+	client            *nntp.Client // Connection client for all readers
+	maxConcurrent     int          // Scheduler width for standalone readers
+	prefetchSize      int64        // Prefetch size in bytes
+	bodyPipelineDepth int
+	diskPath          string
+	retention         reader.Retention
+	scheduler         *reader.FetchScheduler
+	logger            zerolog.Logger
 }
 
 // Option configures the filesystem
 type Option func(*FS)
+
+func WithRetention(retention reader.Retention) Option {
+	return func(f *FS) { f.retention = retention }
+}
+
+func WithFetchScheduler(scheduler *reader.FetchScheduler) Option {
+	return func(f *FS) { f.scheduler = scheduler }
+}
+
+// WithPools shares the service cache budgets with this filesystem.
+func WithPools(pools *reader.Pools) Option { return func(f *FS) { f.pools = pools } }
 
 // NewFS creates a new filesystem backed by the provided connection nntpClient.
 // prefetchSize is the amount of data to prefetch ahead in bytes (e.g., 16*1024*1024 for 16MB)
@@ -51,13 +67,21 @@ func NewFS(ctx context.Context, client *nntp.Client, maxConcurrent int, prefetch
 		ctx = context.Background()
 	}
 
+	usenetConfig := config.Get().Usenet
+	retention := reader.RetentionWindow
+	if usenetConfig.UsesDiskBuffer() {
+		retention = reader.RetentionRewind
+	}
 	f := &FS{
-		ctx:           ctx,
-		volumes:       xsync.NewMap[string, *types.Volume](),
-		client:        client,
-		maxConcurrent: maxConcurrent,
-		prefetchSize:  prefetchSize,
-		logger:        logger,
+		ctx:               ctx,
+		volumes:           xsync.NewMap[string, *types.Volume](),
+		client:            client,
+		maxConcurrent:     maxConcurrent,
+		prefetchSize:      prefetchSize,
+		bodyPipelineDepth: usenetConfig.BodyPipelineDepth,
+		diskPath:          usenetConfig.DiskPath,
+		retention:         retention,
+		logger:            logger,
 	}
 
 	// Apply options
@@ -98,13 +122,18 @@ func (f *FS) Open(name string) (fs.File, error) {
 	}
 
 	return &File{
-		info:          info,
-		ctx:           f.ctx,
-		manager:       f.client,
-		maxConcurrent: f.maxConcurrent,
-		prefetchSize:  f.prefetchSize,
-		logger:        f.logger,
-		volume:        vol,
+		info:              info,
+		ctx:               f.ctx,
+		manager:           f.client,
+		maxConcurrent:     f.maxConcurrent,
+		prefetchSize:      f.prefetchSize,
+		bodyPipelineDepth: f.bodyPipelineDepth,
+		diskPath:          f.diskPath,
+		retention:         f.retention,
+		scheduler:         f.scheduler,
+		pools:             f.pools,
+		logger:            f.logger,
+		volume:            vol,
 	}, nil
 }
 
@@ -193,8 +222,6 @@ func (f *FS) CreateReaderAtForVolume(vol *types.Volume) (PrefetchableReaderAt, i
 // createNewReaderForVolume uses the new reader.StreamingReader with Pin/Unpin pattern.
 // This fixes the "chunk does not exist" race condition.
 func (f *FS) createNewReaderForVolume(vol *types.Volume) (PrefetchableReaderAt, int64, func(), error) {
-	cfg := config.Get()
-
 	// Convert segments to new reader format
 	segments := reader.VolumeToSegmentMeta(vol)
 	if len(segments) == 0 {
@@ -208,8 +235,19 @@ func (f *FS) createNewReaderForVolume(vol *types.Volume) (PrefetchableReaderAt, 
 	readerConfig := reader.DefaultConfig()
 	readerConfig.MaxConnections = f.maxConcurrent
 	readerConfig.PrefetchAhead = reader.PrefetchAheadSegments(f.prefetchSize, segments)
-	readerConfig.DiskPath = cfg.Usenet.DiskBufferPath
-
+	readerConfig.BodyPipelineDepth = f.bodyPipelineDepth
+	readerConfig.DiskPath = f.diskPath
+	readerConfig.Retention = f.retention
+	readerConfig.Scheduler = f.scheduler
+	readerOptions := []reader.Option{
+		reader.WithMaxConnections(readerConfig.MaxConnections),
+		reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
+		reader.WithBodyPipelineDepth(readerConfig.BodyPipelineDepth),
+		reader.WithDiskPath(readerConfig.DiskPath),
+		reader.WithRetention(readerConfig.Retention),
+		reader.WithFetchScheduler(readerConfig.Scheduler),
+		reader.WithPools(f.pools),
+	}
 	// Create the new streaming reader
 	var streamReader *reader.StreamingReader
 	var err error
@@ -220,20 +258,14 @@ func (f *FS) createNewReaderForVolume(vol *types.Volume) (PrefetchableReaderAt, 
 			f.client,
 			segments,
 			encConfig,
-			reader.WithMaxDisk(readerConfig.MaxDisk),
-			reader.WithMaxConnections(readerConfig.MaxConnections),
-			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
-			reader.WithDiskPath(readerConfig.DiskPath),
+			readerOptions...,
 		)
 	} else {
 		streamReader, err = reader.NewStreamingReader(
 			f.ctx,
 			f.client,
 			segments,
-			reader.WithMaxDisk(readerConfig.MaxDisk),
-			reader.WithMaxConnections(readerConfig.MaxConnections),
-			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
-			reader.WithDiskPath(readerConfig.DiskPath),
+			readerOptions...,
 		)
 	}
 

@@ -8,7 +8,6 @@ import (
 	json "github.com/bytedance/sonic"
 
 	"github.com/sirrobot01/decypharr/internal/config"
-	"golang.org/x/crypto/bcrypt"
 )
 
 // SetupState tracks the current setup wizard state
@@ -41,6 +40,7 @@ type SetupWizardResponse struct {
 	Validation   any         `json:"validation,omitempty"`
 	SetupNeeded  bool        `json:"setup_needed,omitempty"`
 	RedirectTo   string      `json:"redirect_to,omitempty"`
+	APIToken     string      `json:"api_token,omitempty"`
 	ConfigLoaded bool        `json:"config_loaded,omitempty"`
 }
 
@@ -81,9 +81,10 @@ func (s *Server) sendSetupError(w http.ResponseWriter, message string, err error
 // SetupCompleteRequest represents the complete setup data from frontend
 type SetupCompleteRequest struct {
 	Auth struct {
-		Username string `json:"username,omitempty"`
-		Password string `json:"password,omitempty"`
-		SkipAuth bool   `json:"skip_auth,omitempty"`
+		Username  string `json:"username,omitempty"`
+		Password  string `json:"password,omitempty"`
+		SkipAuth  bool   `json:"skip_auth,omitempty"`
+		TokenOnly bool   `json:"token_only,omitempty"`
 	} `json:"auth"`
 	Debrid struct {
 		Provider string `json:"provider,omitempty"`
@@ -134,166 +135,152 @@ func (s *Server) setupCompleteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 1: Handle Authentication
-	if req.Auth.SkipAuth {
-		cfg.UseAuth = false
-	} else if req.Auth.Username != "" && req.Auth.Password != "" {
-		auth := cfg.GetAuth()
-		if auth == nil {
-			auth = &config.Auth{}
+	updated, err := config.Update(func(cfg *config.Config) error {
+		if err := cfg.SetupComplete(); err == nil {
+			return fmt.Errorf("setup is already complete")
 		}
-		auth.Username = req.Auth.Username
+		if hasDebrid {
+			validProviders := map[string]bool{
+				"realdebrid": true,
+				"alldebrid":  true,
+				"debridlink": true,
+				"torbox":     true,
+				"premiumize": true,
+			}
 
-		// Hash password using bcrypt
-		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Auth.Password), bcrypt.DefaultCost)
-		if err != nil {
-			s.sendSetupError(w, "Failed to hash password", err)
-			return
-		}
-		auth.Password = string(hashedPassword)
+			if !validProviders[req.Debrid.Provider] {
+				return fmt.Errorf("Invalid debrid provider")
+			}
 
-		cfg.UseAuth = true
-		if err := cfg.SaveAuth(auth); err != nil {
-			s.sendSetupError(w, "Failed to save authentication", err)
-			return
-		}
-	}
+			debrid := config.Debrid{
+				Provider:        req.Debrid.Provider,
+				Name:            req.Debrid.Provider,
+				APIKey:          req.Debrid.APIKey,
+				DownloadAPIKeys: []string{req.Debrid.APIKey},
+				// DownloadUncached left nil: absent means the default (false).
+				RateLimit: config.DefaultRateLimit,
+			}
 
-	// Step 2: Handle Debrid Provider (optional)
-	if hasDebrid {
-		validProviders := map[string]bool{
-			"realdebrid": true,
-			"alldebrid":  true,
-			"debridlink": true,
-			"torbox":     true,
-			"premiumize": true,
-		}
-
-		if !validProviders[req.Debrid.Provider] {
-			s.sendSetupError(w, "Invalid debrid provider", nil)
-			return
-		}
-
-		debrid := config.Debrid{
-			Provider:        req.Debrid.Provider,
-			Name:            req.Debrid.Provider,
-			APIKey:          req.Debrid.APIKey,
-			DownloadAPIKeys: []string{req.Debrid.APIKey},
-			// DownloadUncached left nil: absent means the default (false).
-			RateLimit: config.DefaultRateLimit,
-		}
-
-		if len(cfg.Debrids) == 0 {
-			cfg.Debrids = []config.Debrid{debrid}
+			if len(cfg.Debrids) == 0 {
+				cfg.Debrids = []config.Debrid{debrid}
+			} else {
+				cfg.Debrids[0] = debrid
+			}
 		} else {
-			cfg.Debrids[0] = debrid
-		}
-	} else {
-		cfg.Debrids = nil
-	}
-
-	// Step 3: Handle Usenet Provider (optional)
-	if hasUsenet {
-		if req.Usenet.Port < 1 || req.Usenet.Port > 65535 {
-			s.sendSetupError(w, "Usenet port must be between 1 and 65535", nil)
-			return
+			cfg.Debrids = nil
 		}
 
-		providerMax := req.Usenet.MaxConnections
-		if providerMax <= 0 {
-			providerMax = 30
+		if hasUsenet {
+			if req.Usenet.Port < 1 || req.Usenet.Port > 65535 {
+				return fmt.Errorf("Usenet port must be between 1 and 65535")
+			}
+
+			providerMax := req.Usenet.MaxConnections
+			if providerMax <= 0 {
+				providerMax = 30
+			}
+
+			readerConnections := req.Usenet.ReaderConnections
+			if readerConnections <= 0 {
+				readerConnections = 15
+			}
+
+			cfg.Usenet.Providers = []config.UsenetProvider{{
+				Host:           req.Usenet.Host,
+				Port:           req.Usenet.Port,
+				Username:       req.Usenet.Username,
+				Password:       req.Usenet.Password,
+				MaxConnections: providerMax,
+				SSL:            req.Usenet.SSL,
+				Priority:       1,
+			}}
+			cfg.Usenet.MaxConnections = readerConnections
+			cfg.Usenet.ProcessingMaxConnections = readerConnections
+		} else {
+			cfg.Usenet.Providers = nil
 		}
 
-		readerConnections := req.Usenet.ReaderConnections
-		if readerConnections <= 0 {
-			readerConnections = 15
+		if req.Download.DownloadFolder == "" {
+			return fmt.Errorf("Download folder is required")
 		}
 
-		cfg.Usenet.Providers = []config.UsenetProvider{{
-			Host:           req.Usenet.Host,
-			Port:           req.Usenet.Port,
-			Username:       req.Usenet.Username,
-			Password:       req.Usenet.Password,
-			MaxConnections: providerMax,
-			SSL:            req.Usenet.SSL,
-			Priority:       1,
-		}}
-		cfg.Usenet.MaxConnections = readerConnections
-		cfg.Usenet.ProcessingMaxConnections = readerConnections
-	} else {
-		cfg.Usenet.Providers = nil
-	}
-
-	// Step 4: Handle Download Folder
-	if req.Download.DownloadFolder == "" {
-		s.sendSetupError(w, "Download folder is required", nil)
-		return
-	}
-
-	// Create the folder if it doesn't exist
-	if err := os.MkdirAll(req.Download.DownloadFolder, 0755); err != nil {
-		s.sendSetupError(w, "Failed to create download folder", err)
-		return
-	}
-
-	cfg.DownloadFolder = req.Download.DownloadFolder
-
-	// Set Manager defaults if not set
-	if len(cfg.Categories) == 0 {
-		cfg.Categories = []string{"sonarr", "radarr"}
-	}
-	if cfg.MaxActiveDownloads == 0 {
-		cfg.MaxActiveDownloads = 5
-	}
-	cfg.Mount.Type = config.MountType(req.Mount.MountType)
-
-	switch req.Mount.MountType {
-	case "dfs":
-		cfg.Mount.MountPath = req.Mount.MountPath
-
-		// Create cache dir
-		if err := os.MkdirAll(req.Mount.CacheDir, 0755); err != nil {
-			s.sendSetupError(w, "Failed to create cache directory", err)
-			return
+		// Create the folder if it doesn't exist
+		if err := os.MkdirAll(req.Download.DownloadFolder, 0755); err != nil {
+			return fmt.Errorf("Failed to create download folder: %w", err)
 		}
 
-		cfg.Mount.DFS.CacheDir = req.Mount.CacheDir
+		cfg.DownloadFolder = req.Download.DownloadFolder
 
-		// Set sensible DFS defaults
-		if cfg.Mount.DFS.ChunkSize == "" {
-			cfg.Mount.DFS.ChunkSize = "8MB"
+		// Set Manager defaults if not set
+		if len(cfg.Categories) == 0 {
+			cfg.Categories = []string{"sonarr", "radarr"}
 		}
-		if cfg.Mount.DFS.ReadAheadSize == "" {
-			cfg.Mount.DFS.ReadAheadSize = "32MB"
+		if cfg.MaxActiveDownloads == 0 {
+			cfg.MaxActiveDownloads = 5
 		}
-		if cfg.Mount.DFS.CacheExpiry == "" {
-			cfg.Mount.DFS.CacheExpiry = "24h"
-		}
-	case "rclone":
-		cfg.Mount.MountPath = req.Mount.MountPath
+		cfg.Mount.Type = config.MountType(req.Mount.MountType)
 
-		if req.Mount.CacheDir != "" {
-			cfg.Mount.Rclone.CacheDir = req.Mount.CacheDir
+		switch req.Mount.MountType {
+		case "dfs":
+			cfg.Mount.MountPath = req.Mount.MountPath
+
+			// Create cache dir
+			if err := os.MkdirAll(req.Mount.CacheDir, 0755); err != nil {
+				return fmt.Errorf("Failed to create cache directory: %w", err)
+			}
+
+			cfg.Mount.DFS.CacheDir = req.Mount.CacheDir
+
+			// Set sensible DFS defaults
+			if cfg.Mount.DFS.ChunkSize == "" {
+				cfg.Mount.DFS.ChunkSize = "8MB"
+			}
+			if cfg.Mount.DFS.ReadAheadSize == "" {
+				cfg.Mount.DFS.ReadAheadSize = "32MB"
+			}
+			if cfg.Mount.DFS.CacheExpiry == "" {
+				cfg.Mount.DFS.CacheExpiry = "24h"
+			}
+		case "rclone":
+			cfg.Mount.MountPath = req.Mount.MountPath
+
+			if req.Mount.CacheDir != "" {
+				cfg.Mount.Rclone.CacheDir = req.Mount.CacheDir
+			}
+
+			// Set sensible Rclone defaults
+			if cfg.Mount.Rclone.VfsCacheMode == "" {
+				cfg.Mount.Rclone.VfsCacheMode = "full"
+			}
+			if cfg.Mount.Rclone.DirCacheTime == "" {
+				cfg.Mount.Rclone.DirCacheTime = "5m"
+			}
 		}
 
-		// Set sensible Rclone defaults
-		if cfg.Mount.Rclone.VfsCacheMode == "" {
-			cfg.Mount.Rclone.VfsCacheMode = "full"
+		if err := cfg.SetupComplete(); err != nil {
+			return err
 		}
-		if cfg.Mount.Rclone.DirCacheTime == "" {
-			cfg.Mount.Rclone.DirCacheTime = "5m"
+		if req.Auth.SkipAuth {
+			cfg.UseAuth = false
+		} else if req.Auth.TokenOnly {
+			// Update creates the API token before it publishes the configuration.
+			cfg.UseAuth = true
+			if err := cfg.SaveAuth(&config.Auth{TokenOnly: true}); err != nil {
+				return fmt.Errorf("Failed to save authentication: %w", err)
+			}
+		} else if req.Auth.Username != "" && req.Auth.Password != "" {
+			if err := cfg.SetCredentials(req.Auth.Username, req.Auth.Password); err != nil {
+				return fmt.Errorf("Failed to save authentication: %w", err)
+			}
 		}
-	}
 
-	if err := cfg.Save(); err != nil {
+		return nil
+	})
+	if err != nil {
 		s.sendSetupError(w, "Failed to save configuration", err)
 		return
 	}
-
-	if err := cfg.SetupComplete(); err != nil {
-		s.sendSetupError(w, "Setup completion validation failed", err)
-		return
-	}
+	cfg = updated
 
 	// Trigger manager restart to apply new config
 	go s.Restart()
@@ -302,6 +289,9 @@ func (s *Server) setupCompleteHandler(w http.ResponseWriter, r *http.Request) {
 		Success:    true,
 		Message:    "Setup completed successfully! Restarting services...",
 		RedirectTo: "/",
+	}
+	if auth := cfg.GetAuth(); auth != nil && auth.TokenOnly {
+		response.APIToken = auth.APIToken
 	}
 
 	w.Header().Set("Content-Type", "application/json")

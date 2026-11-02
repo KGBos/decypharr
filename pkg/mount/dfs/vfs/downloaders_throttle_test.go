@@ -230,9 +230,11 @@ func TestCachedRangeFulfilledEvenDuringBackpressure(t *testing.T) {
 	defer closeTestDownloaders(dls)
 
 	r := ranges.Range{Pos: 0, Size: 1 << 20}
-	item.metaMu.Lock()
-	item.info.Rs = ranges.Ranges{r}
-	item.metaMu.Unlock()
+	// Upstream now tracks cached ranges in the buffer, not in info.Rs:
+	// actually write the range so HasRange sees it.
+	if _, _, err := item.WriteAtNoOverwrite(make([]byte, r.Size), r.Pos); err != nil {
+		t.Fatalf("seed cached range: %v", err)
+	}
 
 	errChan := make(chan error, 1)
 	dls.mu.Lock()

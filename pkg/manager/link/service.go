@@ -328,7 +328,7 @@ func (s *Service) fetchLink(ctx context.Context, entry *storage.Entry, filename 
 	}); ok {
 		downloadLink, err = playback.GetDownloadLinkForPlayback(request.WithClass(ctx, request.ClassPlayback), placement.ID, debridFile)
 	} else {
-		downloadLink, err = client.GetDownloadLink(placement.ID, debridFile)
+		downloadLink, err = client.GetDownloadLink(ctx, placement.ID, debridFile)
 	}
 	if err != nil {
 		return downloadLink, err

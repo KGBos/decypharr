@@ -1,11 +1,13 @@
 package qbit
 
 import (
+	"errors"
 	"net/http"
 	"path/filepath"
 	"strings"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/customerror"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/arr"
 	"github.com/sirrobot01/decypharr/pkg/storage"
@@ -13,23 +15,20 @@ import (
 
 func (q *QBit) handleLogin(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	cfg := config.Get()
 	username := r.FormValue("username")
 	password := r.FormValue("password")
-	a, err := q.authenticate(getCategory(ctx), username, password)
+	_, err := q.authenticate(ctx, getCategory(ctx), username, password)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
-	if cfg.UseAuth {
-		cookie := &http.Cookie{
-			Name:     "SID",
-			Value:    createSID(a.Host, a.Token),
-			Path:     "/",
-			SameSite: http.SameSiteNoneMode,
-		}
-		http.SetCookie(w, cookie)
+	cookie := &http.Cookie{
+		Name:     "SID",
+		Value:    createSID(username, password),
+		Path:     "/",
+		SameSite: http.SameSiteNoneMode,
 	}
+	http.SetCookie(w, cookie)
 	_, _ = w.Write([]byte("Ok."))
 }
 
@@ -74,7 +73,11 @@ func (q *QBit) handleTorrentsInfo(w http.ResponseWriter, r *http.Request) {
 	hashes := getHashes(ctx)
 
 	// Convert hashes to filter function
-	torrents := q.manager.Queue().ListFilter(category, config.ProtocolTorrent, storage.TorrentState(state), hashes, "added_on", false)
+	torrents, err := q.manager.Queue().ListFilter(category, config.ProtocolTorrent, storage.TorrentState(state), hashes, "added_on", false)
+	if err != nil {
+		http.Error(w, "Failed to read the download queue", http.StatusInternalServerError)
+		return
+	}
 	qbitTorrents := make([]Torrent, len(torrents))
 	for i, t := range torrents {
 		qbitTorrents[i] = convertToQBitTorrentTorrent(t)
@@ -120,9 +123,9 @@ func (q *QBit) handleTorrentsAdd(w http.ResponseWriter, r *http.Request) {
 	debridName := r.FormValue("debrid")
 	category := r.FormValue("category")
 	_arr := getArrFromContext(ctx)
-	if _arr == nil {
+	if _arr.Name == "" {
 		// Arr is not in context
-		_arr = arr.New(category, "", "", false, nil, "", "")
+		_arr = arr.Arr{Name: category}
 	}
 	atleastOne := false
 
@@ -135,7 +138,7 @@ func (q *QBit) handleTorrentsAdd(w http.ResponseWriter, r *http.Request) {
 		for _, url := range urlList {
 			if err := q.addMagnet(ctx, url, _arr, debridName, action, cfg.Notifications.CallbackURL, rmTrackerUrls, cfg.SkipMultiSeason); err != nil {
 				q.logger.Debug().Msgf("Error adding magnet: %s", err.Error())
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				writeTorrentAddError(w, err)
 				return
 			}
 			atleastOne = true
@@ -148,7 +151,7 @@ func (q *QBit) handleTorrentsAdd(w http.ResponseWriter, r *http.Request) {
 			for _, fileHeader := range files {
 				if err := q.addTorrent(ctx, fileHeader, _arr, debridName, action, cfg.Notifications.CallbackURL, rmTrackerUrls, cfg.SkipMultiSeason); err != nil {
 					q.logger.Debug().Err(err).Str("torrent", fileHeader.Filename).Msgf("Error adding torrent")
-					http.Error(w, err.Error(), http.StatusBadRequest)
+					writeTorrentAddError(w, err)
 					return
 				}
 				atleastOne = true
@@ -164,16 +167,42 @@ func (q *QBit) handleTorrentsAdd(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+type torrentAddErrorResponse struct {
+	Error     string `json:"error"`
+	Code      string `json:"code"`
+	Retryable bool   `json:"retryable"`
+	Permanent bool   `json:"permanent"`
+}
+
+func writeTorrentAddError(w http.ResponseWriter, err error) {
+	status := http.StatusBadGateway
+	response := torrentAddErrorResponse{
+		Error:     err.Error(),
+		Code:      "provider_error",
+		Retryable: true,
+	}
+
+	if typed, ok := errors.AsType[*customerror.Error](err); ok {
+		status = typed.StatusCode()
+		response.Code = typed.Code
+		response.Retryable = typed.IsRetryable()
+		response.Permanent = typed.IsPermanent()
+	}
+
+	utils.JSONResponse(w, response, status)
+}
+
 func (q *QBit) handleTorrentsDelete(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	hashes := getHashes(ctx)
+	deleteFiles := strings.EqualFold(r.FormValue("deleteFiles"), "true")
 
 	if len(hashes) == 0 {
 		http.Error(w, "No hashes provided", http.StatusBadRequest)
 		return
 	}
 	for _, hash := range hashes {
-		err := q.manager.Queue().Delete(hash, nil)
+		err := q.manager.Queue().Delete(hash, deleteFiles, nil)
 		if err != nil && !strings.Contains(err.Error(), "not found") {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -319,7 +348,11 @@ func (q *QBit) handleAddTorrentTags(w http.ResponseWriter, r *http.Request) {
 	for i, tag := range tags {
 		tags[i] = strings.TrimSpace(tag)
 	}
-	torrents := q.manager.Queue().ListFilter("", config.ProtocolTorrent, "", hashes, "", false)
+	torrents, err := q.manager.Queue().ListFilter("", config.ProtocolTorrent, "", hashes, "", false)
+	if err != nil {
+		http.Error(w, "Failed to read the download queue", http.StatusInternalServerError)
+		return
+	}
 	for _, t := range torrents {
 		q.setTorrentTags(t, tags)
 	}
@@ -338,7 +371,11 @@ func (q *QBit) handleRemoveTorrentTags(w http.ResponseWriter, r *http.Request) {
 	for i, tag := range tags {
 		tags[i] = strings.TrimSpace(tag)
 	}
-	torrents := q.manager.Queue().ListFilter("", config.ProtocolTorrent, "", hashes, "", false)
+	torrents, err := q.manager.Queue().ListFilter("", config.ProtocolTorrent, "", hashes, "", false)
+	if err != nil {
+		http.Error(w, "Failed to read the download queue", http.StatusInternalServerError)
+		return
+	}
 	for _, torrent := range torrents {
 		q.removeTorrentTags(torrent, tags)
 

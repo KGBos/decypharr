@@ -20,7 +20,7 @@ class DecypharrUtils {
         let container = document.querySelector('.toast-container');
         if (!container) {
             container = document.createElement('div');
-            container.className = 'toast-container fixed bottom-4 right-4 z-50 space-y-2';
+            container.className = 'toast-container fixed inset-x-3 bottom-3 z-50 space-y-2 sm:left-auto sm:right-4 sm:w-auto';
             document.body.appendChild(container);
         }
         this.toastContainer = container;
@@ -177,12 +177,12 @@ class DecypharrUtils {
         };
 
         const toastHtml = `
-            <div id="${toastId}" class="alert ${alertTypeClass[type]} shadow-lg mb-2">
-                <div class="flex items-start gap-3">
+            <div id="${toastId}" class="alert ${alertTypeClass[type]} mb-2 max-w-full shadow-lg">
+                <div class="flex min-w-0 items-start gap-3">
                     <svg class="w-6 h-6 shrink-0" fill="currentColor" viewBox="0 0 20 20">
                         ${icons[type]}
                     </svg>
-                    <div class="flex-1">
+                    <div class="min-w-0 flex-1 break-words">
                         <span class="text-sm">${message.replace(/\n/g, '<br>')}</span>
                     </div>
                     <button class="btn btn-sm btn-ghost btn-circle" onclick="window.decypharrUtils.closeToast('${toastId}');">
@@ -316,16 +316,6 @@ class DecypharrUtils {
             field.style.textSecurity = 'disc';
             field.setAttribute('data-password-visible', 'false');
             icon.className = 'bi bi-eye';
-        }
-    }
-
-    // Legacy methods for backward compatibility
-    togglePassword(fieldId) {
-        const field = document.getElementById(fieldId);
-        const button = field?.closest('.password-toggle-container')?.querySelector('.password-toggle-btn');
-        let icon = button.querySelector("i");
-        if (field && icon) {
-            this.togglePasswordField(field, icon);
         }
     }
 
@@ -710,10 +700,6 @@ class DecypharrUtils {
 
 // Initialize utilities
 window.decypharrUtils = new DecypharrUtils();
-
-// Global functions for backward compatibility
-window.fetcher = (endpoint, options = {}) => window.decypharrUtils.fetcher(endpoint, options);
-window.createToast = (message, type, duration) => window.decypharrUtils.createToast(message, type, duration);
 
 // Export for ES6 modules if needed
 if (typeof module !== 'undefined' && module.exports) {

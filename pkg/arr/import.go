@@ -1,9 +1,11 @@
 package arr
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
-	gourl "net/url"
+	"net/url"
 	"time"
 )
 
@@ -14,92 +16,21 @@ type ImportResponseSchema struct {
 	Name         string `json:"name"`
 	Size         int    `json:"size"`
 	Series       struct {
-		Title     string `json:"title"`
-		SortTitle string `json:"sortTitle"`
-		Status    string `json:"status"`
-		Ended     bool   `json:"ended"`
-		Overview  string `json:"overview"`
-		Network   string `json:"network"`
-		AirTime   string `json:"airTime"`
-		Images    []struct {
-			CoverType string `json:"coverType"`
-			RemoteUrl string `json:"remoteUrl"`
-		} `json:"images"`
-		OriginalLanguage struct {
-			Id   int    `json:"id"`
-			Name string `json:"name"`
-		} `json:"originalLanguage"`
-		Seasons []struct {
-			SeasonNumber int  `json:"seasonNumber"`
-			Monitored    bool `json:"monitored"`
-		} `json:"seasons"`
-		Year              int       `json:"year"`
-		Path              string    `json:"path"`
-		QualityProfileId  int       `json:"qualityProfileId"`
-		SeasonFolder      bool      `json:"seasonFolder"`
-		Monitored         bool      `json:"monitored"`
-		MonitorNewItems   string    `json:"monitorNewItems"`
-		UseSceneNumbering bool      `json:"useSceneNumbering"`
-		Runtime           int       `json:"runtime"`
-		TvdbId            int       `json:"tvdbId"`
-		TvRageId          int       `json:"tvRageId"`
-		TvMazeId          int       `json:"tvMazeId"`
-		TmdbId            int       `json:"tmdbId"`
-		FirstAired        time.Time `json:"firstAired"`
-		LastAired         time.Time `json:"lastAired"`
-		SeriesType        string    `json:"seriesType"`
-		CleanTitle        string    `json:"cleanTitle"`
-		ImdbId            string    `json:"imdbId"`
-		TitleSlug         string    `json:"titleSlug"`
-		Certification     string    `json:"certification"`
-		Genres            []string  `json:"genres"`
-		Tags              []any     `json:"tags"`
-		Added             time.Time `json:"added"`
-		Ratings           struct {
-			Votes int     `json:"votes"`
-			Value float64 `json:"value"`
-		} `json:"ratings"`
-		LanguageProfileId int `json:"languageProfileId"`
-		Id                int `json:"id"`
+		Id int `json:"id"`
 	} `json:"series"`
+	Movie struct {
+		Id int `json:"id"`
+	} `json:"movie"`
 	SeasonNumber int `json:"seasonNumber"`
 	Episodes     []struct {
-		SeriesId                 int       `json:"seriesId"`
-		TvdbId                   int       `json:"tvdbId"`
-		EpisodeFileId            int       `json:"episodeFileId"`
-		SeasonNumber             int       `json:"seasonNumber"`
-		EpisodeNumber            int       `json:"episodeNumber"`
-		Title                    string    `json:"title"`
-		AirDate                  string    `json:"airDate"`
-		AirDateUtc               time.Time `json:"airDateUtc"`
-		Runtime                  int       `json:"runtime"`
-		Overview                 string    `json:"overview"`
-		HasFile                  bool      `json:"hasFile"`
-		Monitored                bool      `json:"monitored"`
-		AbsoluteEpisodeNumber    int       `json:"absoluteEpisodeNumber"`
-		UnverifiedSceneNumbering bool      `json:"unverifiedSceneNumbering"`
-		Id                       int       `json:"id"`
-		FinaleType               string    `json:"finaleType,omitempty"`
+		Id int `json:"id"`
 	} `json:"episodes"`
-	ReleaseGroup string `json:"releaseGroup"`
-	Quality      struct {
-		Quality struct {
-			Id         int    `json:"id"`
-			Name       string `json:"name"`
-			Source     string `json:"source"`
-			Resolution int    `json:"resolution"`
-		} `json:"quality"`
-		Revision struct {
-			Version  int  `json:"version"`
-			Real     int  `json:"real"`
-			IsRepack bool `json:"isRepack"`
-		} `json:"revision"`
-	} `json:"quality"`
-	Languages []struct {
+	ReleaseGroup string          `json:"releaseGroup"`
+	Quality      json.RawMessage `json:"quality"`
+	Languages    []struct {
 		Id   int    `json:"id"`
 		Name string `json:"name"`
 	} `json:"languages"`
-	QualityWeight     int    `json:"qualityWeight"`
 	CustomFormats     []any  `json:"customFormats"`
 	CustomFormatScore int    `json:"customFormatScore"`
 	IndexerFlags      int    `json:"indexerFlags"`
@@ -108,30 +39,20 @@ type ImportResponseSchema struct {
 		Reason string `json:"reason"`
 		Type   string `json:"type"`
 	} `json:"rejections"`
-	Id int `json:"id"`
+	Id    int       `json:"id"`
+	Added time.Time `json:"added,omitzero"`
 }
 
-type ManualImportRequestFile struct {
-	DownloadId   string `json:"downloadId"`
-	FolderName   string `json:"folderName"`
-	Path         string `json:"path"`
-	SeriesId     int    `json:"seriesId"`
-	SeasonNumber int    `json:"seasonNumber"`
-	EpisodeIds   []int  `json:"episodeIds"`
-	Quality      struct {
-		Quality struct {
-			Id         int    `json:"id"`
-			Name       string `json:"name"`
-			Source     string `json:"source"`
-			Resolution int    `json:"resolution"`
-		} `json:"quality"`
-		Revision struct {
-			Version  int  `json:"version"`
-			Real     int  `json:"real"`
-			IsRepack bool `json:"isRepack"`
-		} `json:"revision"`
-	} `json:"quality"`
-	Languages []struct {
+type ManualImportFile struct {
+	DownloadId   string          `json:"downloadId"`
+	FolderName   string          `json:"folderName"`
+	Path         string          `json:"path"`
+	MovieId      int             `json:"movieId,omitzero"`
+	SeriesId     int             `json:"seriesId,omitzero"`
+	SeasonNumber int             `json:"seasonNumber,omitzero"`
+	EpisodeIds   []int           `json:"episodeIds,omitempty"`
+	Quality      json.RawMessage `json:"quality"`
+	Languages    []struct {
 		Id   int    `json:"id"`
 		Name string `json:"name"`
 	} `json:"languages"`
@@ -139,62 +60,71 @@ type ManualImportRequestFile struct {
 	CustomFormats     []any  `json:"customFormats"`
 	CustomFormatScore int    `json:"customFormatScore"`
 	IndexerFlags      int    `json:"indexerFlags"`
-	ReleaseType       string `json:"releaseType"`
+	ReleaseType       string `json:"releaseType,omitempty"`
 	Rejections        []struct {
 		Reason string `json:"reason"`
 		Type   string `json:"type"`
 	} `json:"rejections"`
 }
 
-type ManualImportRequestSchema struct {
-	Name       string                    `json:"name"`
-	Files      []ManualImportRequestFile `json:"files"`
-	ImportMode string                    `json:"importMode"`
-}
-
-func (a *Arr) Import(downloadID string) error {
-	query := gourl.Values{}
-	query.Add("downloadId", downloadID)
-	url := "api/v3/manualimport" + "?" + query.Encode()
-	var data []ImportResponseSchema
-	_, err := a.Request(http.MethodGet, url, nil, &data)
+// ManualImport asks the Arr to import a finished download it did not pick up.
+func (s *Service) ManualImport(ctx context.Context, name, downloadID string) error {
+	instance, err := s.instance(name)
 	if err != nil {
-		return fmt.Errorf("failed to import: %w", err)
+		return err
 	}
-	var files []ManualImportRequestFile
-	for _, d := range data {
-		var episodesIds []int
-		for _, e := range d.Episodes {
-			episodesIds = append(episodesIds, e.Id)
+
+	var candidates []ImportResponseSchema
+	query := url.Values{"downloadId": {downloadID}}
+	resp, err := s.get(ctx, instance, "api/v3/manualimport?"+query.Encode(), &candidates)
+	if err != nil {
+		return fmt.Errorf("manual import lookup: %w", err)
+	}
+	if err := expectStatus(resp, http.StatusOK); err != nil {
+		return fmt.Errorf("manual import lookup: %w", err)
+	}
+	if len(candidates) == 0 {
+		return fmt.Errorf("manual import: no files found for download %q", downloadID)
+	}
+
+	files := make([]ManualImportFile, 0, len(candidates))
+	for _, candidate := range candidates {
+		if instance.Type == Radarr && candidate.Movie.Id <= 0 {
+			return fmt.Errorf("manual import: no movie matched for %q", candidate.Path)
 		}
-		file := ManualImportRequestFile{
+		if len(candidate.Quality) == 0 || string(candidate.Quality) == "null" {
+			return fmt.Errorf("manual import: no quality returned for %q", candidate.Path)
+		}
+		episodeIDs := make([]int, 0, len(candidate.Episodes))
+		for _, episode := range candidate.Episodes {
+			episodeIDs = append(episodeIDs, episode.Id)
+		}
+		files = append(files, ManualImportFile{
 			DownloadId:        downloadID,
-			Path:              d.Path,
-			FolderName:        d.FolderName,
-			SeriesId:          d.Series.Id,
-			SeasonNumber:      d.SeasonNumber,
-			EpisodeIds:        episodesIds,
-			Quality:           d.Quality,
-			Languages:         d.Languages,
-			ReleaseGroup:      d.ReleaseGroup,
-			CustomFormats:     d.CustomFormats,
-			CustomFormatScore: d.CustomFormatScore,
-			IndexerFlags:      d.IndexerFlags,
-			ReleaseType:       d.ReleaseType,
-			Rejections:        d.Rejections,
-		}
-		files = append(files, file)
+			Path:              candidate.Path,
+			FolderName:        candidate.FolderName,
+			MovieId:           candidate.Movie.Id,
+			SeriesId:          candidate.Series.Id,
+			SeasonNumber:      candidate.SeasonNumber,
+			EpisodeIds:        episodeIDs,
+			Quality:           candidate.Quality,
+			Languages:         candidate.Languages,
+			ReleaseGroup:      candidate.ReleaseGroup,
+			CustomFormats:     candidate.CustomFormats,
+			CustomFormatScore: candidate.CustomFormatScore,
+			IndexerFlags:      candidate.IndexerFlags,
+			ReleaseType:       candidate.ReleaseType,
+			Rejections:        candidate.Rejections,
+		})
 	}
 
-	request := ManualImportRequestSchema{
-		Name:       "ManualImport",
-		Files:      files,
-		ImportMode: "copy",
-	}
-
-	url = "api/v3/command"
-	if _, err := a.Request(http.MethodPost, url, request, nil); err != nil {
-		return fmt.Errorf("failed to import: %w", err)
+	_, err = s.command(ctx, instance, struct {
+		Name       string             `json:"name"`
+		Files      []ManualImportFile `json:"files"`
+		ImportMode string             `json:"importMode"`
+	}{Name: "ManualImport", Files: files, ImportMode: "copy"})
+	if err != nil {
+		return fmt.Errorf("manual import: %w", err)
 	}
 	return nil
 }

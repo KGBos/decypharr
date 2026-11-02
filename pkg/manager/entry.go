@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/sirrobot01/decypharr/internal/utils"
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
+	"github.com/sirrobot01/decypharr/pkg/manager/virtualfolders"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/version"
 )
@@ -69,7 +69,7 @@ func (m *Manager) setMountPaths() {
 		name:    "",
 		size:    0,
 		kind:    EntryKindSystem,
-		modTime: utils.Now(),
+		modTime: time.Now(),
 		isDir:   true,
 	}
 }
@@ -80,7 +80,7 @@ func (m *Manager) RootInfo() *FileInfo {
 			name:    "",
 			size:    0,
 			kind:    EntryKindSystem,
-			modTime: utils.Now(),
+			modTime: time.Now(),
 			isDir:   true,
 		}
 	}
@@ -90,7 +90,7 @@ func (m *Manager) RootInfo() *FileInfo {
 // GetEntries returns the subdirectories under a given mount name
 // It shows built-in, per-provider, and virtual folders.
 func (m *Manager) GetEntries() []FileInfo {
-	now := utils.Now()
+	now := time.Now()
 	var subDirs []FileInfo
 	extras := []string{EntryAllFolder, EntryBadFolder, EntryTorrentFolder, EntryNZBFolder}
 	for _, dir := range extras {
@@ -117,7 +117,7 @@ func (m *Manager) GetEntries() []FileInfo {
 
 	// Add virtual folders.
 	if virtualFolders := m.virtualFoldersSnapshot(); virtualFolders != nil {
-		for _, folderName := range virtualFolders.folders {
+		for _, folderName := range virtualFolders.Names() {
 			subDirs = append(subDirs, FileInfo{
 				name:    folderName,
 				isDir:   true,
@@ -214,7 +214,7 @@ func (m *Manager) getEntryChildren(group string) (*FileInfo, []FileInfo) {
 	currentDir := &FileInfo{
 		name:    group,
 		size:    0,
-		modTime: utils.Now(),
+		modTime: time.Now(),
 		isDir:   true,
 	}
 	switch group {
@@ -365,7 +365,7 @@ func (m *Manager) getEntryChildren(group string) (*FileInfo, []FileInfo) {
 			return currentDir, infos
 		}
 		virtualFolders := m.virtualFoldersSnapshot()
-		if !virtualFolders.has(group) {
+		if !virtualFolders.Has(group) {
 			return nil, nil
 		}
 		currentDir.kind = EntryKindVirtual
@@ -450,50 +450,6 @@ func (m *Manager) CopyEntry(entry *FileInfo, destPath string, delete bool) error
 	if !entry.CanDelete() {
 		return fmt.Errorf("entry %s cannot be copied", entry.name)
 	}
-	//if entry.isDir {
-	//	// This is a torrent folder
-	//	m.logger.Debug().Str("torrent", entry.name).Msg("Copying torrent folder")
-	//	torr, err := m.GetTorrentByName(entry.name)
-	//	if err != nil {
-	//		return fmt.Errorf("torrent %s not found", entry.name)
-	//	}
-	//	// Create a copy of the torrent, with the new destination
-	//	// To do this, we need to create a new torrent with the same files, but with the new folder name
-	//	newTorrent := *torr
-	//	newTorrent.Folder = filepath.Base(destPath)
-	//	// Set a new infohash to avoid conflicts
-	//	newTorrent.InfoHash = utils.GenerateInfoHash()
-	//	err = m.AddOrUpdate(&newTorrent, func(t *storage.Entry) {
-	//		m.RefreshEntries(true)
-	//	})
-	//	if delete {
-	//		// Delete the original torrent
-	//		err = m.DeleteEntry(torr.InfoHash, false) // do not delete from debrid
-	//	}
-	//	return err
-	//}
-	//// This is a file within a torrent
-	//
-	//torr, err := m.GetTorrentByName(entry.Parent())
-	//if err != nil {
-	//	return fmt.Errorf("torrent %s not found", entry.Parent())
-	//}
-	//file, err := torr.GetFile(entry.Name())
-	//if err != nil {
-	//	return fmt.Errorf("file %s not found in torrent %s", entry.Name(), entry.Parent())
-	//}
-	//// Create a copy of the file, with the new name
-	//newFile := *file
-	//newFile.Name = filepath.Base(destPath)
-	//// Add the new file to the torrent
-	//torr.Files[newFile.Name] = &newFile
-	//err = m.AddOrUpdate(torr, func(t *storage.Entry) {
-	//	m.RefreshEntries(true)
-	//})
-	//if delete {
-	//	// Remove the original file
-	//	err = m.RemoveTorrentFile(torr.Folder, file.Name)
-	//}
 	return fmt.Errorf("copying entries is not supported yet")
 }
 
@@ -529,12 +485,12 @@ func (m *Manager) RemoveTorrentFile(torrentName, filename string) error {
 	return nil
 }
 
-func (m *Manager) getVirtualFolderChildren(virtualFolders *VirtualFolders, folder string) []FileInfo {
+func (m *Manager) getVirtualFolderChildren(virtualFolders *virtualfolders.Folders, folder string) []FileInfo {
 	// Use metadata-only iteration (no disk reads)
 	var infos []FileInfo
 	seen := make(map[string]struct{})
 	err := m.storage.ForEachMeta(func(meta *storage.EntryMetaInfo) error {
-		if virtualFolders.matchesFilter(folder, meta, m.virtualFolderFileNames(meta)) {
+		if virtualFolders.Matches(folder, meta, m.virtualFolderFileNames(meta)) {
 			if _, ok := seen[meta.Name]; ok {
 				return nil
 			}

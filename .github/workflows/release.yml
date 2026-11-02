@@ -247,12 +247,14 @@ jobs:
           CHANNEL: ${{ needs.prepare.outputs.channel }}
         run: |
           PRERELEASE=""
+          LATEST="--latest"
           if [ "$CHANNEL" != "stable" ]; then
             PRERELEASE="--prerelease"
+            LATEST="--latest=false"
           fi
 
           gh release create "$TAG" dist/* \
             --title "decypharr ${TAG}" \
             --generate-notes \
-            --latest \
+            "$LATEST" \
             $PRERELEASE

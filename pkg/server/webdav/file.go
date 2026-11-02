@@ -5,8 +5,10 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 
+	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/customerror"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/manager"
@@ -23,9 +25,8 @@ var streamCopyBufPool = sync.Pool{
 	},
 }
 
-func (h *Handler) StreamResponse(entry *storage.Entry, info *manager.FileInfo, w http.ResponseWriter, r *http.Request) error {
-	size := info.Size()
-	start, end := h.getRange(info, r)
+func (h *Handler) StreamResponse(entry *storage.Entry, name string, size int64, w http.ResponseWriter, r *http.Request) error {
+	start, end := resolveRange(r.Header.Get("Range"), size)
 	if start < 0 {
 		start = 0
 	}
@@ -44,7 +45,14 @@ func (h *Handler) StreamResponse(entry *storage.Entry, info *manager.FileInfo, w
 		client = "Unknown"
 	}
 
-	stream, err := h.manager.OpenStream(r.Context(), entry, info.Name(), start, client)
+	owner := manager.RewindOwnerApplication
+	cfg := config.Get()
+	if cfg.Mount.Type == config.MountTypeRclone &&
+		strings.EqualFold(cfg.Mount.Rclone.VfsCacheMode, "full") &&
+		strings.HasPrefix(strings.ToLower(client), "rclone/") {
+		owner = manager.RewindOwnerDownstream
+	}
+	stream, err := h.manager.OpenStreamWithRewindOwner(r.Context(), entry, name, start, client, owner)
 	if err != nil {
 		return customerror.NewError(err, http.StatusInternalServerError, "server.internal_error", false, false)
 	}
@@ -53,11 +61,11 @@ func (h *Handler) StreamResponse(entry *storage.Entry, info *manager.FileInfo, w
 	// Fast-fail before headers: an unreachable link becomes a proper error
 	// status instead of a dead 200.
 	if err := stream.Prime(); err != nil {
-		return customerror.NewError(err, http.StatusInternalServerError, "server.internal_error", false, false)
+		return customerror.FromError(err)
 	}
 
 	length := end - start + 1
-	w.Header().Set("Content-Type", utils.GetContentType(info.Name()))
+	w.Header().Set("Content-Type", utils.GetContentType(name))
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 	w.Header().Set("Accept-Ranges", "bytes")
 	statusCode := http.StatusOK
@@ -76,10 +84,6 @@ func (h *Handler) StreamResponse(entry *storage.Entry, info *manager.FileInfo, w
 		return customerror.NewError(err, http.StatusInternalServerError, "server.internal_error", false, true)
 	}
 	return nil
-}
-
-func (h *Handler) getRange(info *manager.FileInfo, r *http.Request) (int64, int64) {
-	return resolveRange(r.Header.Get("Range"), info.Size())
 }
 
 // resolveRange maps a Range header to file-relative offsets (byte-ranged

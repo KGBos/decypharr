@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -47,7 +48,7 @@ type Premiumize struct {
 	config                config.Debrid
 	profile               *types.Profile
 	profileLastFetched    time.Time
-	isFileAllowed         func(string, int64) error
+	validateFileAllowed   func(string, int64) error
 }
 
 func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Premiumize, error) {
@@ -86,7 +87,7 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Premiumize
 		autoExpiresLinksAfter: autoExpiresLinksAfter,
 		logger:                _log,
 		config:                dc,
-		isFileAllowed:         config.Get().IsFileAllowed,
+		validateFileAllowed:   func(name string, size int64) error { return config.Get().ValidateFileAllowed(name, size) },
 	}, nil
 }
 
@@ -224,7 +225,7 @@ func (pm *Premiumize) UpdateAndReturnTorrent(t *types.Torrent) (*types.Torrent, 
 	}
 	if t.Status == types.TorrentStatusDownloading || t.Status == types.TorrentStatusQueued {
 		if !t.DownloadUncached {
-			return t, fmt.Errorf("torrent: %s not cached", t.Name)
+			return t, fmt.Errorf("torrent %s: %w", t.Name, customerror.TorrentNotCachedError)
 		}
 		return t, nil
 	}
@@ -277,37 +278,36 @@ func (pm *Premiumize) DeleteTorrent(torrentID string) error {
 	return err
 }
 
-func (pm *Premiumize) IsAvailable(infohashes []string) map[string]bool {
+func (pm *Premiumize) IsAvailable(infohashes []string) (map[string]bool, error) {
 	result := make(map[string]bool, len(infohashes))
 	const batchSize = 100
 	for i := 0; i < len(infohashes); i += batchSize {
 		end := min(i+batchSize, len(infohashes))
 		values := url.Values{}
-		hashByItem := make(map[string]string, end-i)
+		validHashes := make([]string, 0, end-i)
 		for _, hash := range infohashes[i:end] {
 			if hash == "" {
 				continue
 			}
 			item := utils.ConstructMagnet(hash, "").Link
 			values.Add("items[]", item)
-			hashByItem[item] = hash
+			validHashes = append(validHashes, hash)
 		}
 		if len(values) == 0 {
 			continue
 		}
 		var data cacheCheckResponse
 		if _, err := pm.doForm(context.Background(), http.MethodPost, "/api/cache/check", values, &data); err != nil {
-			pm.logger.Error().Err(err).Msg("Error checking Premiumize availability")
-			continue
+			return result, fmt.Errorf("check availability: %w", err)
 		}
-		items := values["items[]"]
+		if len(data.Response) != len(validHashes) {
+			return result, fmt.Errorf("check availability: got %d results for %d hashes", len(data.Response), len(validHashes))
+		}
 		for idx, available := range data.Response {
-			if idx < len(items) && available {
-				result[hashByItem[items[idx]]] = true
-			}
+			result[validHashes[idx]] = available
 		}
 	}
-	return result
+	return result, nil
 }
 
 func (pm *Premiumize) GetTorrents() ([]*types.Torrent, error) {
@@ -369,7 +369,7 @@ func (pm *Premiumize) transferToTorrent(tr premiumizeTransfer, fallbackInfoHash 
 	}
 	return &types.Torrent{
 		Id:               tr.ID,
-		InfoHash:         cmp.Or(utils.ExtractInfoHash(tr.Src), fallbackInfoHash),
+		InfoHash:         pm.transferInfoHash(tr, fallbackInfoHash),
 		Name:             name,
 		Filename:         name,
 		OriginalFilename: name,
@@ -384,11 +384,24 @@ func (pm *Premiumize) transferToTorrent(tr premiumizeTransfer, fallbackInfoHash 
 	}, nil
 }
 
+func (pm *Premiumize) transferInfoHash(tr premiumizeTransfer, fallbackInfoHash string) string {
+	if infoHash := cmp.Or(utils.ExtractInfoHash(tr.Src), fallbackInfoHash); infoHash != "" {
+		return infoHash
+	}
+
+	// Premiumize documents src as a deprecated proxy URL, not the original
+	// magnet, so completed transfers commonly have no recoverable infohash.
+	// Use a provider-scoped, deterministic 40-character key so separate cloud
+	// transfers cannot collapse into the same empty storage record during sync.
+	digest := sha256.Sum256([]byte("premiumize\x00" + pm.config.Name + "\x00" + tr.ID))
+	return fmt.Sprintf("%x", digest[:20])
+}
+
 func (pm *Premiumize) filesForTransfer(tr premiumizeTransfer) (map[string]types.File, []string, bool, error) {
 	files := make(map[string]types.File)
 	links := make([]string, 0)
 	if fileID := tr.FileID.String(); fileID != "" {
-		item, err := pm.itemDetails(fileID)
+		item, err := pm.itemDetails(context.Background(), fileID)
 		if err != nil {
 			return nil, nil, false, err
 		}
@@ -405,9 +418,9 @@ func (pm *Premiumize) filesForTransfer(tr premiumizeTransfer) (map[string]types.
 	return files, links, false, nil
 }
 
-func (pm *Premiumize) itemDetails(id string) (*itemDetailsResponse, error) {
+func (pm *Premiumize) itemDetails(ctx context.Context, id string) (*itemDetailsResponse, error) {
 	var data itemDetailsResponse
-	req, err := http.NewRequest(http.MethodGet, pm.endpoint("/api/item/details?id="+url.QueryEscape(id)), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pm.endpoint("/api/item/details?id="+url.QueryEscape(id)), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -454,8 +467,8 @@ func (pm *Premiumize) addFile(files map[string]types.File, links *[]string, tran
 	if itemPath == "" {
 		itemPath = name
 	}
-	if pm.isFileAllowed != nil {
-		if err := pm.isFileAllowed(itemPath, size); err != nil {
+	if pm.validateFileAllowed != nil {
+		if err := pm.validateFileAllowed(itemPath, size); err != nil {
 			return
 		}
 	} else if filepath.Ext(itemPath) == "" {
@@ -476,16 +489,16 @@ func (pm *Premiumize) addFile(files map[string]types.File, links *[]string, tran
 	*links = append(*links, link)
 }
 
-func (pm *Premiumize) GetDownloadLink(id string, file *types.File) (types.DownloadLink, error) {
-	return pm.accountsManager.GetDownloadLink(id, file, pm.fetchDownloadLink)
+func (pm *Premiumize) GetDownloadLink(ctx context.Context, id string, file *types.File) (types.DownloadLink, error) {
+	return pm.accountsManager.GetDownloadLink(ctx, id, file, pm.fetchDownloadLink)
 }
 
-func (pm *Premiumize) fetchDownloadLink(acc *account.Account, id string, file *types.File) (types.DownloadLink, error) {
+func (pm *Premiumize) fetchDownloadLink(ctx context.Context, acc *account.Account, id string, file *types.File) (types.DownloadLink, error) {
 	link := file.Link
 	size := file.Size
 	filename := file.Name
 	if link == "" && file.Id != "" {
-		item, err := pm.itemDetails(file.Id)
+		item, err := pm.itemDetails(ctx, file.Id)
 		if err != nil {
 			return types.DownloadLink{}, err
 		}
@@ -538,7 +551,7 @@ func (pm *Premiumize) CheckFile(ctx context.Context, infohash, fileID string) er
 	if fileID == "" {
 		return customerror.HosterUnavailableError
 	}
-	if _, err := pm.itemDetails(fileID); err != nil {
+	if _, err := pm.itemDetails(ctx, fileID); err != nil {
 		return err
 	}
 	return nil
