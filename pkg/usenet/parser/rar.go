@@ -11,8 +11,6 @@ import (
 	"strings"
 
 	"github.com/rs/zerolog"
-	"github.com/sirrobot01/decypharr/internal/crypto"
-	"github.com/sirrobot01/decypharr/internal/nntp"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/types"
@@ -110,15 +108,15 @@ type RARFileEntry struct {
 
 // RARParser handles parsing RAR archives from usenet segments
 type RARParser struct {
-	manager       *nntp.Client
+	source        ArticleSource
 	maxConcurrent int
 	logger        zerolog.Logger
 }
 
 // NewRARParser creates a new RAR parser
-func NewRARParser(manager *nntp.Client, maxConcurrent int, logger zerolog.Logger) *RARParser {
+func NewRARParser(source ArticleSource, maxConcurrent int, logger zerolog.Logger) *RARParser {
 	return &RARParser{
-		manager:       manager,
+		source:        source,
 		maxConcurrent: maxConcurrent,
 		logger:        logger.With().Str("component", "rar_parser").Logger(),
 	}
@@ -146,7 +144,10 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 		return group.Files[i].Number < group.Files[j].Number
 	})
 
-	volumes := buildArchiveVolumeDescriptors(group)
+	volumes, err := buildArchiveVolumeDescriptors(group)
+	if err != nil {
+		return nil, err
+	}
 	if len(volumes) == 0 {
 		return nil, fmt.Errorf("no RAR volumes found")
 	}
@@ -155,9 +156,19 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 	filename = utils.RemoveInvalidChars(path.Base(filename))
 
 	// Build base segments and volume info
-	baseSegments, volumeInfos, _ := buildBaseSegments(group)
+	baseSegments, volumeInfos, _, err := buildBaseSegments(group)
+	if err != nil {
+		return nil, err
+	}
 	if len(baseSegments) == 0 {
 		return nil, fmt.Errorf("no base segments found for RAR volumes")
+	}
+	segmentIndex, err := newSegmentLayout(baseSegments)
+	if err != nil {
+		return nil, fmt.Errorf("index RAR source segments: %w", err)
+	}
+	if err := segmentIndex.validateVolumes(volumeInfos); err != nil {
+		return nil, fmt.Errorf("validate RAR volume layout: %w", err)
 	}
 
 	// Parse RAR archive to get file entries with volume parts
@@ -194,13 +205,13 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 		}
 
 		// Build segments for this file across all its volume parts
-		fileSegments, err := p.buildSegmentsForFile(rarFile, baseSegments, volumeOffsetMap)
+		fileSegments, err := p.buildSegmentsForFile(rarFile, segmentIndex, volumeOffsetMap)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("map stored RAR file %q: %w", rarFile.Name, err)
 		}
 
 		if len(fileSegments) == 0 {
-			continue
+			return nil, fmt.Errorf("stored RAR file %q has no source segments", rarFile.Name)
 		}
 
 		streamSize := int64(0)
@@ -252,7 +263,7 @@ func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, p
 	}
 
 	// Detect RAR version from first volume
-	firstStream := newRarReader(ctx, p.manager, []*types.Volume{volumes[0]})
+	firstStream := newRarReader(ctx, p.source, []*types.Volume{volumes[0]})
 	sig := make([]byte, 8)
 	if _, err := io.ReadFull(firstStream, sig); err != nil {
 		return nil, fmt.Errorf("failed to read RAR signature: %w", err)
@@ -297,7 +308,7 @@ func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, p
 		vol := input.vol
 
 		// Create stream reader for this specific volume
-		stream := newRarReader(ctx, p.manager, []*types.Volume{vol})
+		stream := newRarReader(ctx, p.source, []*types.Volume{vol})
 
 		// Skip signature (7 or 8 bytes depending on version)
 		sigSize := 8
@@ -349,7 +360,7 @@ func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, p
 	isHeaderEncrypted := false
 	for _, result := range results {
 		if result.err != nil {
-			continue
+			return nil, fmt.Errorf("parse RAR volume %d (%s): %w", result.index, volumes[result.index].Name, result.err)
 		}
 		if result.isHeaderEncrypted {
 			isHeaderEncrypted = true
@@ -446,7 +457,7 @@ func (p *RARParser) parseRAR5Headers(data []byte, volumeIndex int, volumeName st
 
 		// Parse file headers
 		if header.Type == RAR5HeaderTypeFile {
-			file := p.parseRAR5FileHeader(header.Data, volumeIndex, volumeName, dataOffset, dataSize, password)
+			file := p.parseRAR5FileHeader(header.Data, header.ExtraSize, volumeIndex, volumeName, dataOffset, dataSize, password)
 			if file != nil {
 				files = append(files, file)
 			}
@@ -478,9 +489,10 @@ func (p *RARParser) parseRAR5Headers(data []byte, volumeIndex int, volumeName st
 
 // rar5HeaderData represents a RAR 5.0 header
 type rar5HeaderData struct {
-	Type  uint64
-	Flags uint64
-	Data  []byte
+	ExtraSize uint64
+	Type      uint64
+	Flags     uint64
+	Data      []byte
 }
 
 // readRAR5Header reads a single RAR 5.0 header
@@ -503,6 +515,8 @@ func (p *RARParser) readRAR5Header(r *bytes.Reader) (*rar5HeaderData, int, int64
 		return nil, 0, 0, fmt.Errorf("invalid RAR5 header size: %d (too large)", headerSize)
 	}
 
+	contentStart, _ := r.Seek(0, io.SeekCurrent)
+
 	// Read header type (vint)
 	headerType, err := readVInt(r)
 	if err != nil {
@@ -516,8 +530,9 @@ func (p *RARParser) readRAR5Header(r *bytes.Reader) (*rar5HeaderData, int, int64
 	}
 
 	// Read extra area size if present
+	var extraSize uint64
 	if headerFlags&RAR5HeaderFlagExtraArea != 0 {
-		_, err = readVInt(r)
+		extraSize, err = readVInt(r)
 		if err != nil {
 			return nil, 0, 0, err
 		}
@@ -535,7 +550,7 @@ func (p *RARParser) readRAR5Header(r *bytes.Reader) (*rar5HeaderData, int, int64
 
 	// Calculate remaining header data size based on actual bytes consumed
 	currentPos, _ := r.Seek(0, io.SeekCurrent)
-	consumedSize := int(currentPos-startPos) - 4 // Exclude CRC
+	consumedSize := int(currentPos - contentStart)
 	remainingHeaderSize := int(headerSize) - consumedSize
 
 	// Read remaining header data
@@ -553,19 +568,24 @@ func (p *RARParser) readRAR5Header(r *bytes.Reader) (*rar5HeaderData, int, int64
 		}
 	}
 
-	totalHeaderSize := int(headerSize) + 4 // Include CRC
+	totalHeaderSize := int(headerSize) + int(contentStart-startPos)
 
 	return &rar5HeaderData{
-		Type:  headerType,
-		Flags: headerFlags,
-		Data:  headerData,
+		ExtraSize: extraSize,
+		Type:      headerType,
+		Flags:     headerFlags,
+		Data:      headerData,
 	}, totalHeaderSize, dataAreaSize, nil
 }
 
 // parseRAR5FileHeader parses a RAR 5.0 file header
 // If password is provided and encryption salt is found, it derives the file-specific encryption key.
-func (p *RARParser) parseRAR5FileHeader(data []byte, volumeIndex int, volumeName string, dataOffset int64, packedSize int64, password string) *RARFileEntry {
-	r := bytes.NewReader(data)
+func (p *RARParser) parseRAR5FileHeader(data []byte, extraSize uint64, volumeIndex int, volumeName string, dataOffset int64, packedSize int64, password string) *RARFileEntry {
+	if extraSize > uint64(len(data)) {
+		return nil
+	}
+	baseEnd := len(data) - int(extraSize)
+	r := bytes.NewReader(data[:baseEnd])
 
 	// Read file flags (vint)
 	fileFlags, err := readVInt(r)
@@ -665,110 +685,24 @@ func (p *RARParser) parseRAR5FileHeader(data []byte, volumeIndex int, volumeName
 	// - Bit 6 (0x0040): Solid flag
 	// - Bits 8-10 (0x0380): Compression method (0-5, where 0 = stored/no compression)
 	// - Bits 11-15 (0x7C00): Dictionary size
-	compressionMethod := (compressionInfo >> 8) & 0x07 // Extract bits 8-10
-	isStored := compressionMethod == 0                 // Method 0 = no compression
+	compressionMethod := (compressionInfo & 0x0380) >> 7
+	isStored := compressionMethod == 0 // Method 0 = no compression
 
-	// Parse extra area if present (remaining bytes after filename)
-	// Extra area contains encryption info, hash, etc.
-	var isEncrypted bool
-	var encryptionIV []byte
-	var encryptionKey []byte
-
-	if r.Len() > 0 {
-		// Parse extra area records
-		for r.Len() > 2 {
-			// Read record size (vint)
-			recordSize, err := readVInt(r)
-			if err != nil || recordSize == 0 || recordSize > 65536 {
-				break
-			}
-
-			// Read record type (vint)
-			recordType, err := readVInt(r)
-			if err != nil {
-				break
-			}
-
-			// Calculate remaining data in this record
-			recordDataSize := int(recordSize) - 1 // Minus the type byte (approximate)
-			if recordDataSize <= 0 || recordDataSize > 65536 || recordDataSize > r.Len() {
-				// Invalid or too large record - stop parsing extra area
-				break
-			}
-
-			if recordType == RAR5ExtraTypeEncryption {
-				// Encryption record format:
-				// - Version (vint)
-				// - Flags (vint)
-				// - KDF count (1 byte)
-				// - Salt (16 bytes, if UseAES256 flag set)
-				// - IV (16 bytes)
-				// - Check value (12 bytes, optional if flags & 0x01)
-				isEncrypted = true
-
-				// Read encryption version
-				_, err := readVInt(r)
-				if err != nil {
-					break
-				}
-
-				// Read flags
-				encFlags, err := readVInt(r)
-				if err != nil {
-					break
-				}
-
-				// Read KDF count (1 byte)
-				kdfByte, err := r.ReadByte()
-				if err != nil {
-					break
-				}
-				kdfCount := int(kdfByte)
-
-				// Read salt (16 bytes)
-				salt := make([]byte, 16)
-				if _, err := io.ReadFull(r, salt); err != nil {
-					break
-				}
-
-				// If we have a password, derive the file-specific key using this salt
-				if password != "" {
-					derivedKeys := crypto.DeriveKeys([]byte(password), salt, kdfCount)
-					encryptionKey = derivedKeys.Key
-				}
-
-				// Read IV (16 bytes) - THIS IS WHAT WE NEED
-				iv := make([]byte, 16)
-				if _, err := io.ReadFull(r, iv); err != nil {
-					break
-				}
-				encryptionIV = iv
-
-				// Skip check value if present (flags & 0x01 = has check)
-				if encFlags&0x01 != 0 {
-					checkValue := make([]byte, 12)
-					_, _ = io.ReadFull(r, checkValue)
-				}
-			} else {
-				// Skip other record types
-				skipData := make([]byte, recordDataSize)
-				if _, err := io.ReadFull(r, skipData); err != nil {
-					break
-				}
-			}
-		}
+	encryption, err := parseRAR5Extra(data[baseEnd:], password)
+	if err != nil {
+		return nil
 	}
 
 	return &RARFileEntry{
-		Name:             strings.ToValidUTF8(string(nameBytes), ""),
+		Name:             filename,
 		UncompressedSize: int64(unpackedSize),
 		PackedSize:       packedSize,
 		DataOffset:       dataOffset,
 		IsStored:         isStored,
 		IsDirectory:      isDirectory,
-		IsEncrypted:      isEncrypted,
-		EncryptionKey:    encryptionKey,
-		EncryptionIV:     encryptionIV,
+		IsEncrypted:      encryption.Encrypted,
+		EncryptionKey:    encryption.Key,
+		EncryptionIV:     encryption.IV,
 		CRC32:            crc32,
 		VolumeIndex:      volumeIndex,
 		VolumeParts: []*types.RARVolumePart{{
@@ -1044,7 +978,7 @@ func buildVolumeOffsetMap(volumeInfos []storage.ArchiveVolumeInfo) map[int]int64
 // We need to map this to the actual NNTP segment that contains that byte
 func (p *RARParser) buildSegmentsForFile(
 	rarFile *RARFileEntry,
-	baseSegments []storage.NZBSegment,
+	segmentIndex *segmentLayout,
 	volumeOffsetMap map[int]int64,
 ) ([]storage.NZBSegment, error) {
 	if len(rarFile.VolumeParts) == 0 {
@@ -1083,19 +1017,14 @@ func (p *RARParser) buildSegmentsForFile(
 		// Build segments for this specific part
 		// part.DataOffset = offset within the RAR volume where this file's data starts
 		// part.UnpackedSize = how many bytes of the file are in this part (this is what we stream!)
-		partSegments, err := p.buildSegmentsForVolumePart(part, baseSegments, volumeOffsetMap)
+		partSegments, err := p.buildSegmentsForIndexedVolumePart(part, segmentIndex, volumeOffsetMap)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("map volume part %d of %s: %w", part.PartNumber, rarFile.Name, err)
 		}
 
 		if len(partSegments) == 0 {
-			continue
+			return nil, fmt.Errorf("volume part %d of %s has no source segments", part.PartNumber, rarFile.Name)
 		}
-
-		// Ensure part segments are ordered by their segment number.
-		sort.Slice(partSegments, func(i, j int) bool {
-			return partSegments[i].Number < partSegments[j].Number
-		})
 
 		// Append with correct file offsets
 		for i := range partSegments {
@@ -1137,6 +1066,18 @@ func (p *RARParser) buildSegmentsForVolumePart(
 	baseSegments []storage.NZBSegment,
 	volumeOffsetMap map[int]int64,
 ) ([]storage.NZBSegment, error) {
+	segmentIndex, err := newSegmentLayout(baseSegments)
+	if err != nil {
+		return nil, err
+	}
+	return p.buildSegmentsForIndexedVolumePart(part, segmentIndex, volumeOffsetMap)
+}
+
+func (p *RARParser) buildSegmentsForIndexedVolumePart(
+	part *types.RARVolumePart,
+	segmentIndex *segmentLayout,
+	volumeOffsetMap map[int]int64,
+) ([]storage.NZBSegment, error) {
 	// get the absolute byte offset where this volume starts in the flat segment list
 	volumeStartOffset, ok := volumeOffsetMap[part.PartNumber]
 	if !ok {
@@ -1147,64 +1088,10 @@ func (p *RARParser) buildSegmentsForVolumePart(
 	// volumeStartOffset = cumulative size of all previous volumes
 	// part.DataOffset = offset within THIS volume where the file data starts
 	absoluteStartOffset := volumeStartOffset + part.DataOffset
-	absoluteEndOffset := absoluteStartOffset + part.UnpackedSize - 1
-
-	// Find all segments that overlap with [absoluteStartOffset, absoluteEndOffset]
-	var result []storage.NZBSegment
-	var currentOffset int64
-
-	for _, seg := range baseSegments {
-		segStart := currentOffset
-		segEnd := currentOffset + seg.Bytes - 1
-
-		// Check if this segment overlaps with our data range
-		if segEnd < absoluteStartOffset {
-			// Segment is entirely before our data
-			currentOffset += seg.Bytes
-			continue
-		}
-
-		if segStart > absoluteEndOffset {
-			// Segment is entirely after our data
-			break
-		}
-
-		// Calculate the overlap
-		overlapStart := max(segStart, absoluteStartOffset)
-		overlapEnd := min(segEnd, absoluteEndOffset)
-
-		// Calculate offset within the NNTP segment where we start reading
-		segmentDataStart := overlapStart - segStart
-
-		// Bytes we'll read from this segment
-		bytesToRead := overlapEnd - overlapStart + 1
-
-		// Create a new segment descriptor
-		// StartOffset/EndOffset will be set by buildSegmentsForFile as file output positions
-		slicedSegment := storage.NZBSegment{
-			Number:           seg.Number,
-			MessageID:        seg.MessageID,
-			Bytes:            bytesToRead,
-			SegmentDataStart: segmentDataStart, // Where to start reading within this NNTP segment
-			Group:            seg.Group,
-			// StartOffset/EndOffset left as 0 - will be set by caller
-		}
-
-		result = append(result, slicedSegment)
-
-		if overlapEnd == absoluteEndOffset {
-			// We've covered the entire range
-			break
-		}
-
-		currentOffset += seg.Bytes
+	if absoluteStartOffset < 0 {
+		return nil, fmt.Errorf("invalid volume start offset %d", absoluteStartOffset)
 	}
-
-	if len(result) == 0 {
-		return nil, fmt.Errorf("no segments found for range [%d, %d]", absoluteStartOffset, absoluteEndOffset)
-	}
-
-	return result, nil
+	return segmentIndex.slice(absoluteStartOffset, part.UnpackedSize, false)
 }
 
 // sliceSegmentsForRangeSimple extracts segments covering [offset, offset+length)
@@ -1214,72 +1101,11 @@ func sliceSegmentsForRangeSimple(
 	offset int64,
 	length int64,
 ) ([]storage.NZBSegment, error) {
-	if length <= 0 {
-		return nil, nil
+	layout, err := newSegmentLayout(baseSegments)
+	if err != nil {
+		return nil, err
 	}
-	if offset < 0 {
-		return nil, fmt.Errorf("negative offset: %d", offset)
-	}
-
-	targetStart := offset
-	targetEnd := offset + length - 1
-
-	var result []storage.NZBSegment
-	var currentPos int64
-	var outputPos int64 // Track position in the OUTPUT file (the extracted file)
-
-	// Scan through segments to find overlapping ones
-	for _, seg := range baseSegments {
-		segStart := currentPos
-		segEnd := currentPos + seg.Bytes - 1
-
-		// Check if this segment overlaps with our target range
-		if segEnd < targetStart {
-			// Segment is before our range
-			currentPos += seg.Bytes
-			continue
-		}
-
-		if segStart > targetEnd {
-			// Segment is after our range, we're done
-			break
-		}
-
-		// Calculate the overlap
-		overlapStart := max(segStart, targetStart)
-
-		overlapEnd := min(segEnd, targetEnd)
-
-		// Calculate segment-relative offsets
-		// relStart = where to start reading within this NNTP segment's decoded data
-		relStart := overlapStart - segStart
-
-		// Bytes to read from this segment
-		bytesToRead := overlapEnd - overlapStart + 1
-
-		// Create sliced segment
-		slicedSeg := storage.NZBSegment{
-			Number:           seg.Number,
-			MessageID:        seg.MessageID,
-			Bytes:            bytesToRead,
-			StartOffset:      outputPos,                   // Position in the OUTPUT file
-			EndOffset:        outputPos + bytesToRead - 1, // End position in OUTPUT file
-			Group:            seg.Group,
-			SegmentDataStart: relStart, // Where to start reading within this NNTP segment
-		}
-
-		result = append(result, slicedSeg)
-		outputPos += bytesToRead
-
-		if overlapEnd == targetEnd {
-			// We've covered the entire range
-			return result, nil
-		}
-
-		currentPos += seg.Bytes
-	}
-
-	return result, nil
+	return layout.slice(offset, length, true)
 }
 
 // aggregateFileParts combines file parts across volumes for multi-volume RAR archives

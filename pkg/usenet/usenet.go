@@ -2,6 +2,7 @@ package usenet
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,7 +19,6 @@ import (
 	"github.com/sirrobot01/decypharr/internal/customerror"
 	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/internal/nntp"
-	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/fs"
 	"github.com/sirrobot01/decypharr/pkg/usenet/fs/reader"
@@ -63,6 +63,8 @@ type fsEntry struct {
 	readerCleanup func()                  // Cleanup function for reader
 	readerOnce    sync.Once               // Ensures reader is created exactly once
 	readerErr     error                   // Error from reader creation (if any)
+	retention     Retention
+	lifecycleMu   sync.Mutex // serializes acquire/release/idle teardown
 	refCount      atomic.Int32
 	lastAccessed  atomic.Int64 // Unix timestamp
 }
@@ -83,21 +85,36 @@ func (fe *fsEntry) cleanup() {
 
 // acquire takes a reference unless the entry has been claimed for teardown.
 func (fe *fsEntry) acquire() bool {
-	for {
-		n := fe.refCount.Load()
-		if n < 0 {
-			return false
-		}
-		if fe.refCount.CompareAndSwap(n, n+1) {
-			return true
-		}
+	fe.lifecycleMu.Lock()
+	defer fe.lifecycleMu.Unlock()
+	n := fe.refCount.Load()
+	if n < 0 {
+		return false
 	}
+	fe.refCount.Store(n + 1)
+	return true
 }
 
 // claimForCleanup atomically claims an idle (refCount == 0) entry for
 // teardown, fencing out any future acquire.
 func (fe *fsEntry) claimForCleanup() bool {
+	fe.lifecycleMu.Lock()
+	defer fe.lifecycleMu.Unlock()
 	return fe.refCount.CompareAndSwap(0, fsEntryTombstone)
+}
+
+// release drops one handle reference. Delivery readers shed resident extents
+// when the final downstream handle closes, while keeping metadata warm until
+// the ordinary idle janitor removes the entry.
+func (fe *fsEntry) release() {
+	fe.lifecycleMu.Lock()
+	defer fe.lifecycleMu.Unlock()
+	if fe.refCount.Add(-1) != 0 || fe.retention != RetentionDelivery {
+		return
+	}
+	if releaser, ok := fe.reader.(interface{ ReleaseIdleDelivery() }); ok {
+		releaser.ReleaseIdleDelivery()
+	}
 }
 
 // getOrCreateReader returns the shared reader, creating it lazily on first use.
@@ -230,28 +247,47 @@ func (r *contextSectionReader) Read(p []byte) (int, error) {
 }
 
 type Usenet struct {
+	bufferPools              *reader.Pools
 	nntp                     *nntp.Client
+	analyzer                 *parser.NZBParser
+	fetchScheduler           *reader.FetchScheduler
 	logger                   zerolog.Logger
 	metadataDir              string
 	nzbStorage               *NZBStorage // File-based NZB metadata storage
-	maxConnections           int         // Connections allocated per streaming file
+	maxConnections           int         // Provider-wide streaming scheduler width
 	processingMaxConnections int         // Connections allocated per file for parsing and NZB downloads
 	prefetchSize             int64       // Streaming prefetch size in bytes
 	failedFiles              *xsync.Map[string, error]
+	cleanupStop              chan struct{}
+	cleanupWg                sync.WaitGroup
+	closeOnce                sync.Once
 
 	fs *xsync.Map[string, *fsEntry]
 }
 
-// fsKey builds a cache key for fs map entries efficiently.
-// Uses direct byte slice manipulation to avoid strings.Builder overhead.
+type Retention = reader.Retention
+
+const (
+	RetentionWindow   = reader.RetentionWindow
+	RetentionRewind   = reader.RetentionRewind
+	RetentionDelivery = reader.RetentionDelivery
+)
+
+// fsKey identifies a file independently of its retention tier.
 func fsKey(nzoID, filename string) string {
-	// Single allocation: nzoID + "::" + filename
 	buf := make([]byte, len(nzoID)+2+len(filename))
 	n := copy(buf, nzoID)
 	buf[n] = ':'
 	buf[n+1] = ':'
 	copy(buf[n+2:], filename)
 	return string(buf)
+}
+
+func configuredRetention() Retention {
+	if config.Get().Usenet.UsesDiskBuffer() {
+		return RetentionRewind
+	}
+	return RetentionWindow
 }
 
 // New creates a new usenet instance
@@ -289,6 +325,27 @@ func New() (*Usenet, error) {
 		return nil, err
 	}
 
+	// Disk rewind files are session-scoped; clear any left by an interrupted run.
+	if streamsDir := strings.TrimSpace(usenetConfig.DiskPath); streamsDir != "" {
+		if err := os.MkdirAll(streamsDir, 0o755); err != nil {
+			_ = client.Close()
+			return nil, fmt.Errorf("create Usenet stream cache: %w", err)
+		}
+		staleEntries, err := os.ReadDir(streamsDir)
+		if err != nil {
+			_ = client.Close()
+			return nil, fmt.Errorf("read Usenet stream cache: %w", err)
+		}
+		for _, entry := range staleEntries {
+			if strings.HasPrefix(entry.Name(), "cache-") {
+				if err := os.RemoveAll(filepath.Join(streamsDir, entry.Name())); err != nil {
+					_ = client.Close()
+					return nil, fmt.Errorf("clear stale Usenet stream cache %q: %w", entry.Name(), err)
+				}
+			}
+		}
+	}
+
 	maxConns := usenetConfig.MaxConnections
 	if maxConns <= 0 {
 		maxConns = 10
@@ -304,8 +361,11 @@ func New() (*Usenet, error) {
 	}
 
 	u := &Usenet{
+		bufferPools:              reader.NewPools(usenetConfig.BufferMemoryBytes()),
 		nzbStorage:               nzbStorage,
 		nntp:                     client,
+		analyzer:                 parser.NewParser(client, processingMaxConns, _logger.With().Str("component", "parser").Logger()),
+		fetchScheduler:           reader.NewFetchScheduler(maxConns),
 		logger:                   _logger,
 		metadataDir:              metadataDir,
 		maxConnections:           maxConns,
@@ -313,30 +373,23 @@ func New() (*Usenet, error) {
 		prefetchSize:             prefetchSize,
 		fs:                       xsync.NewMap[string, *fsEntry](),
 		failedFiles:              xsync.NewMap[string, error](),
+		cleanupStop:              make(chan struct{}),
 	}
-
-	// clean streams dir
-	u.initStreamsDir(cfg.Usenet.DiskBufferPath)
 
 	// Start background cleanup for idle sessions
-	go u.cleanupIdleFS()
+	u.cleanupWg.Add(1)
+	go func() {
+		defer u.cleanupWg.Done()
+		u.cleanupIdleFS()
+	}()
 
 	return u, nil
-}
-
-func (u *Usenet) initStreamsDir(streamsDir string) {
-	if err := os.RemoveAll(streamsDir); err != nil && !os.IsNotExist(err) {
-		return
-	}
-	if err := os.MkdirAll(streamsDir, 0755); err != nil {
-		return
-	}
 }
 
 // createEntry builds a standalone fs entry for one file. prefetchSize sets the
 // reader's read-ahead window; pass 0 for one-shot reads (head verification) so
 // a single small read doesn't queue a full window of article downloads.
-func (u *Usenet) createEntry(file *storage.NZBFile, prefetchSize int64) (*fsEntry, error) {
+func (u *Usenet) createEntry(file *storage.NZBFile, prefetchSize int64, retention Retention) (*fsEntry, error) {
 	volumes := GetFileVolumes(file)
 	if len(volumes) == 0 {
 		return nil, fmt.Errorf("no volumes available for file %s", file.Name)
@@ -344,27 +397,45 @@ func (u *Usenet) createEntry(file *storage.NZBFile, prefetchSize int64) (*fsEntr
 
 	fsCtx := context.Background()
 
-	usenetFS, err := fs.NewFS(fsCtx, u.nntp, u.maxConnections, prefetchSize, volumes, u.logger)
+	usenetFS, err := fs.NewFS(
+		fsCtx,
+		u.nntp,
+		u.maxConnections,
+		prefetchSize,
+		volumes,
+		u.logger,
+		fs.WithRetention(retention),
+		fs.WithFetchScheduler(u.fetchScheduler),
+		fs.WithPools(u.bufferPools),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create usenet FS: %w", err)
 	}
 
 	return &fsEntry{
-		fs:      usenetFS,
-		volumes: volumes,
+		fs:        usenetFS,
+		volumes:   volumes,
+		retention: retention,
 	}, nil
 }
 
 // getOrCreateEntry returns the fsEntry and its cache key to avoid redundant key computation.
-func (u *Usenet) getOrCreateEntry(ctx context.Context, nzoID, filename string) (*fsEntry, string, error) {
-	key := fsKey(nzoID, filename)
+func (u *Usenet) getOrCreateEntry(ctx context.Context, nzoID, filename string, retention Retention) (*fsEntry, string, error) {
+	baseKey := fsKey(nzoID, filename)
+	key := baseKey + "::window"
+	switch retention {
+	case RetentionRewind:
+		key = baseKey + "::rewind"
+	case RetentionDelivery:
+		key = baseKey + "::delivery"
+	}
 
 	// Fast path: entry already exists and isn't being torn down. acquire() (a
 	// CAS, not a blind Add) is what closes the race against cleanupIdleFS:
 	// once the janitor claims an idle entry no new reference can be taken, so
 	// a stream can never end up on an entry whose reader is being closed.
 	if entry, ok := u.fs.Load(key); ok && entry.acquire() {
-		entry.lastAccessed.Store(utils.NowUnix())
+		entry.lastAccessed.Store(time.Now().Unix())
 		return entry, key, nil
 	}
 
@@ -379,7 +450,7 @@ func (u *Usenet) getOrCreateEntry(ctx context.Context, nzoID, filename string) (
 		return nil, key, err
 	}
 
-	newEntry, err := u.createEntry(file, u.prefetchSize)
+	newEntry, err := u.createEntry(file, u.prefetchSize, retention)
 	if err != nil {
 		return nil, key, err
 	}
@@ -389,14 +460,16 @@ func (u *Usenet) getOrCreateEntry(ctx context.Context, nzoID, filename string) (
 		actual, loaded := u.fs.LoadOrStore(key, newEntry)
 		if !loaded {
 			// We won the race - use our new entry
-			newEntry.refCount.Add(1)
-			newEntry.lastAccessed.Store(utils.NowUnix())
+			if !newEntry.acquire() {
+				return nil, key, fmt.Errorf("new file-system entry was claimed during creation")
+			}
+			newEntry.lastAccessed.Store(time.Now().Unix())
 			return newEntry, key, nil
 		}
 		// Another goroutine created the entry first - use theirs.
 		// Our newEntry was never used (readers are lazy), GC reclaims it.
 		if actual.acquire() {
-			actual.lastAccessed.Store(utils.NowUnix())
+			actual.lastAccessed.Store(time.Now().Unix())
 			return actual, key, nil
 		}
 		// The mapped entry is claimed for teardown; the janitor removes it
@@ -416,8 +489,8 @@ func (u *Usenet) releaseFS(key string) {
 		return
 	}
 
-	entry.refCount.Add(-1)
-	entry.lastAccessed.Store(utils.NowUnix())
+	entry.lastAccessed.Store(time.Now().Unix())
+	entry.release()
 }
 
 // cleanupIdleFS removes sessions with refCount=0 that haven't been used recently
@@ -429,8 +502,13 @@ func (u *Usenet) cleanupIdleFS() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		now := utils.NowUnix()
+	for {
+		select {
+		case <-u.cleanupStop:
+			return
+		case <-ticker.C:
+		}
+		now := time.Now().Unix()
 
 		u.fs.Range(func(key string, entry *fsEntry) bool {
 			if entry.refCount.Load() == 0 {
@@ -469,13 +547,12 @@ func (u *Usenet) ParseWithID(ctx context.Context, id, name string, content []byt
 		return nil, nil, fmt.Errorf("invalid NZB content: %w", err)
 	}
 
-	// Create parser with the manager
-	prs := parser.NewParser(u.nntp, u.processingMaxConnections, u.logger.With().Str("component", "parser").Logger())
-
-	// Quick parse: defer archive extraction for async processing
-	nzb, groups, err := prs.Parse(ctx, name, content)
+	// Quick parse: defer archive extraction for async processing.
+	// Groups survive a stat failure so the caller can identify the
+	// dead post.
+	nzb, groups, err := u.analyzer.Parse(ctx, name, content)
 	if err != nil {
-		return nil, nil, err
+		return nil, groups, err
 	}
 	if id != "" {
 		nzb.ID = id
@@ -519,16 +596,13 @@ func (u *Usenet) Process(ctx context.Context, nzb *storage.NZB, groups map[strin
 		Str("name", nzb.Name).
 		Msg("Processing archive files in NZB")
 
-	// Create parser with the manager
-	prs := parser.NewParser(u.nntp, u.processingMaxConnections, u.logger.With().Str("component", "parser").Logger())
 	// Process the groups (archives)
-	updatedNZB, err := prs.Process(ctx, nzb, groups)
+	updatedNZB, err := u.analyzer.Process(ctx, nzb, groups)
 	if err != nil {
 		// Mark as failed
 		_ = u.markAsFailed(nzb, err)
 		return nzb, fmt.Errorf("failed to process NZB archives: %w", err)
 	}
-
 	// Post-parse availability gate: probe a sample of each content file's
 	// segments before declaring the NZB complete. Segments can go missing
 	// between the original parse and now; without this gate they slip through
@@ -570,7 +644,7 @@ func (u *Usenet) Process(ctx context.Context, nzb *storage.NZB, groups map[strin
 // checkAvailability samples each content file's segments (via the same
 // repair-bank-gated BatchStat path as CheckFile) and returns an error if any
 // file is definitively unavailable — i.e. a sampled segment is missing on
-// every provider. Recovery/noise files (par2, ignore), deleted files, and
+// every provider. Ignored, deleted, and
 // segment-less entries are skipped so the gate fails only on genuinely missing
 // playable content. Connection-only failures are treated as non-fatal by
 // CheckFileAvailability, so they do not fail the NZB. It returns on the first
@@ -582,8 +656,7 @@ func (u *Usenet) checkNZBAvailability(ctx context.Context, nzb *storage.NZB) err
 		if file.IsDeleted || len(file.Segments) == 0 {
 			continue
 		}
-		switch file.FileType {
-		case storage.NZBFileTypePar2, storage.NZBFileTypeIgnore:
+		if file.FileType == storage.NZBFileTypeIgnore {
 			continue
 		}
 		if ctx.Err() != nil {
@@ -615,9 +688,10 @@ func (u *Usenet) CheckFile(ctx context.Context, nzoID, filename string) error {
 		return fmt.Errorf("failed to sample file segments: %w", err)
 	}
 	if len(messageIDs) == 0 {
-		return fmt.Errorf("file has no Segments: %s", filename)
+		return fmt.Errorf("file has no Segments: %s: %w", filename, customerror.UsenetManifestInvalidError)
 	}
-	return u.checkAvailability(ctx, filename, messageIDs)
+	err = u.checkAvailability(ctx, filename, messageIDs)
+	return err
 }
 
 func (u *Usenet) CheckFileAvailability(ctx context.Context, file *storage.NZBFile, samplePercent int) error {
@@ -628,6 +702,10 @@ func (u *Usenet) CheckFileAvailability(ctx context.Context, file *storage.NZBFil
 // gates each worker through its internal repair bank so concurrent availability
 // checks don't starve streaming connections.
 func (u *Usenet) checkAvailability(ctx context.Context, fileName string, messageIDs []string) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
+	messageIDs = u.analyzer.FilterUnobserved(messageIDs)
 	if len(messageIDs) == 0 {
 		return nil
 	}
@@ -689,68 +767,58 @@ func (u *Usenet) Stop() {
 
 // Close closes all usenet resources including NNTP connections
 func (u *Usenet) Close() error {
-	u.logger.Info().Msg("Closing Usenet NNTP client")
+	var closeErr error
+	u.closeOnce.Do(func() {
+		u.logger.Info().Msg("Closing Usenet NNTP client")
+		close(u.cleanupStop)
+		u.cleanupWg.Wait()
 
-	// Close NNTP client FIRST to force-close all active connections.
-	// This unblocks any in-flight StreamBody/TCP reads in prefetch workers,
-	// allowing SegmentFetcher.Close() (prefetchWg.Wait()) to complete without hanging.
-	if u.nntp != nil {
-		if err := u.nntp.Close(); err != nil {
-			u.logger.Warn().Err(err).Msg("Failed to close NNTP client")
+		entries := make([]*fsEntry, 0, u.fs.Size())
+		u.fs.Range(func(key string, entry *fsEntry) bool {
+			entries = append(entries, entry)
+			return true
+		})
+		u.fs.Clear()
+		var cleanup sync.WaitGroup
+		for _, entry := range entries {
+			cleanup.Add(1)
+			go func() {
+				defer cleanup.Done()
+				entry.cleanup()
+			}()
 		}
-	}
+		cleanup.Wait()
+		if u.fetchScheduler != nil {
+			u.fetchScheduler.Close()
+		}
 
-	// Cleanup all active FS entries (fetcher.Close() now completes quickly
-	// because connections were already force-closed above)
-	u.fs.Range(func(key string, entry *fsEntry) bool {
-		entry.cleanup()
-		return true
+		if u.bufferPools != nil {
+			closeErr = errors.Join(closeErr, u.bufferPools.Close())
+		}
+
+		if u.nntp != nil {
+			if err := u.nntp.Close(); err != nil {
+				closeErr = errors.Join(closeErr, err)
+				u.logger.Warn().Err(err).Msg("Failed to close NNTP client")
+			}
+		}
+		u.logger.Info().Msg("Usenet closed")
 	})
-	u.fs.Clear()
-
-	u.logger.Info().Msg("Usenet closed")
-	return nil
+	return closeErr
 }
 
 func (u *Usenet) getFile(nzoID, filename string) (*storage.NZBFile, error) {
-	files, err := u.getFiles(nzoID, []string{filename})
-	if err != nil {
-		return nil, err
-	}
-	file := files[filename]
-	if file == nil {
-		return nil, fmt.Errorf("file %s not found in NZB %s", filename, nzoID)
-	}
-	return file, nil
-}
-
-func (u *Usenet) getFiles(nzoID string, filenames []string) (map[string]*storage.NZBFile, error) {
-	nzb, err := u.nzbStorage.GetNZB(nzoID)
+	file, err := u.nzbStorage.GetNZBFile(nzoID, filename)
 	if err != nil {
 		return nil, fmt.Errorf("metadata load failed: %w", err)
 	}
-
-	requested := make(map[string]struct{}, len(filenames))
-	for _, filename := range filenames {
-		requested[filename] = struct{}{}
+	if file == nil {
+		return nil, fmt.Errorf("file %s not found in NZB %s: %w", filename, nzoID, customerror.UsenetManifestInvalidError)
 	}
-
-	files := make(map[string]*storage.NZBFile, len(requested))
-	for i := range nzb.Files {
-		source := nzb.Files[i]
-		if source.IsDeleted {
-			continue
-		}
-		if _, ok := requested[source.Name]; !ok {
-			continue
-		}
-		file := source
-		if file.NzbID == "" {
-			file.NzbID = nzoID
-		}
-		files[file.Name] = &file
+	if file.NzbID == "" {
+		file.NzbID = nzoID
 	}
-	return files, nil
+	return file, nil
 }
 
 func (u *Usenet) preStreamChecks(file *storage.NZBFile) error {
@@ -761,6 +829,9 @@ func (u *Usenet) preStreamChecks(file *storage.NZBFile) error {
 
 	// Check if file was marked as failed previously
 	if cause, ok := u.failedFiles.Load(fsKey(file.NzbID, file.Name)); ok {
+		if nntp.IsArticleNotFoundError(cause) || customerror.IsArticleNotFoundError(cause) {
+			return customerror.NewArticleNotFoundError(cause)
+		}
 		return customerror.NewSilentError(cause).Permanent()
 	}
 
@@ -772,19 +843,24 @@ func (u *Usenet) preStreamChecks(file *storage.NZBFile) error {
 // refcount for its lifetime (blocking idle teardown) and releases it on
 // Close.
 type FileHandle struct {
-	u      *Usenet
-	key    string
-	entry  *fsEntry
-	cursor reader.ReadCursor
-	size   int64
-	closed atomic.Bool
+	u          *Usenet
+	entryKey   string
+	failureKey string
+	entry      *fsEntry
+	cursor     reader.ReadCursor
+	size       int64
+	closed     atomic.Bool
 }
 
 // OpenFile opens a pull-based handle for one file of an NZB. The returned
 // handle must be Closed; it pins the underlying fs entry (and its reader)
 // while open.
 func (u *Usenet) OpenFile(ctx context.Context, nzoID, filename string) (*FileHandle, error) {
-	entry, key, err := u.getOrCreateEntry(ctx, nzoID, filename)
+	return u.OpenFileWithRetention(ctx, nzoID, filename, configuredRetention())
+}
+
+func (u *Usenet) OpenFileWithRetention(ctx context.Context, nzoID, filename string, retention Retention) (*FileHandle, error) {
+	entry, key, err := u.getOrCreateEntry(ctx, nzoID, filename, retention)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get or create file system: %w", err)
 	}
@@ -794,11 +870,12 @@ func (u *Usenet) OpenFile(ctx context.Context, nzoID, filename string) (*FileHan
 		return nil, fmt.Errorf("failed to get reader: %w", err)
 	}
 	return &FileHandle{
-		u:      u,
-		key:    key,
-		entry:  entry,
-		cursor: readerAt.OpenCursor(),
-		size:   size,
+		u:          u,
+		entryKey:   key,
+		failureKey: fsKey(nzoID, filename),
+		entry:      entry,
+		cursor:     readerAt.OpenCursor(),
+		size:       size,
 	}, nil
 }
 
@@ -811,13 +888,13 @@ func (h *FileHandle) ReadAtContext(ctx context.Context, p []byte, off int64) (in
 	if h.closed.Load() {
 		return 0, io.ErrClosedPipe
 	}
-	h.entry.lastAccessed.Store(utils.NowUnix())
+	h.entry.lastAccessed.Store(time.Now().Unix())
 	n, err := h.cursor.ReadAtContext(ctx, p, off)
 	if err != nil && ctx != nil && ctx.Err() != nil {
 		return n, ctx.Err()
 	}
 	if err != nil && nntp.IsArticleNotFoundError(err) {
-		h.u.failedFiles.Store(h.key, err)
+		h.u.failedFiles.Store(h.failureKey, err)
 		return n, customerror.NewArticleNotFoundError(err)
 	}
 	return n, err
@@ -834,13 +911,22 @@ func (h *FileHandle) Prefetch(ctx context.Context, off, length int64) {
 	h.cursor.Prefetch(ctx, off, length)
 }
 
+// ReleaseCachedRange acknowledges that a downstream persistent cache has
+// accepted an independent copy. It remains valid during the narrow interval
+// between a body closing and its session publishing the final write.
+func (h *FileHandle) ReleaseCachedRange(off, length int64) {
+	if releaser, ok := h.cursor.(interface{ ReleaseCachedRange(int64, int64) }); ok {
+		releaser.ReleaseCachedRange(off, length)
+	}
+}
+
 // Close releases the cursor and the entry reference. Idempotent.
 func (h *FileHandle) Close() error {
 	if !h.closed.CompareAndSwap(false, true) {
 		return nil
 	}
 	h.cursor.Close()
-	h.u.releaseFS(h.key)
+	h.u.releaseFS(h.entryKey)
 	return nil
 }
 
@@ -855,7 +941,7 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 
 	// Use getOrCreateEntry to get both entry and key in one call,
 	// avoiding redundant key computation in releaseFS.
-	ufsEntry, key, err := u.getOrCreateEntry(ctx, nzoID, filename)
+	ufsEntry, key, err := u.getOrCreateEntry(ctx, nzoID, filename, configuredRetention())
 	if err != nil {
 		return fmt.Errorf("failed to get or create file system: %w", err)
 	}
@@ -919,7 +1005,7 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 
 	// Mark file as failed if article not found (permanent error)
 	if err != nil && nntp.IsArticleNotFoundError(err) {
-		u.failedFiles.Store(key, err) // Reuse pre-computed key
+		u.failedFiles.Store(fsKey(nzoID, filename), err)
 		// Wrap error to mark as permanent
 		return customerror.NewArticleNotFoundError(err)
 	}
@@ -1004,7 +1090,7 @@ func (u *Usenet) Touch(ctx context.Context, nzoID, filename string) error {
 	// get first segment
 	firstSeg := file.Segments[0]
 	// Run STAT command to check if article exists
-	_, _, err = u.nntp.Stat(ctx, firstSeg.MessageID)
+	_, _, err = u.nntp.Stat(ctx, nntp.WorkloadStreamDemand, firstSeg.MessageID)
 	if err != nil {
 		return fmt.Errorf("segment not available: %w", err)
 	}
@@ -1016,7 +1102,7 @@ func (u *Usenet) Touch(ctx context.Context, nzoID, filename string) error {
 // Uses the shared entry/reader so the cache is available for Stream calls.
 func (u *Usenet) PreCache(ctx context.Context, nzoID, filename string) error {
 	// Use shared entry (same as Stream)
-	entry, key, err := u.getOrCreateEntry(ctx, nzoID, filename)
+	entry, key, err := u.getOrCreateEntry(ctx, nzoID, filename, configuredRetention())
 	if err != nil {
 		return fmt.Errorf("failed to get or create entry: %w", err)
 	}
@@ -1059,6 +1145,8 @@ func (u *Usenet) Stats() map[string]any {
 	stats := u.nntp.Stats()
 	stats["readers"] = u.fs.Size()
 	stats["nzb_storage"] = u.nzbStorage.Stats()
+	stats["analyzer"] = u.analyzer.Metrics()
+	stats["buffers"] = u.bufferPools.Stats()
 	return stats
 }
 
@@ -1084,12 +1172,13 @@ func (u *Usenet) NZBStorage() *NZBStorage {
 	return u.nzbStorage
 }
 
-// SpeedTest runs a speed test for a specific NNTP provider
+// SpeedTest runs a speed test for a specific NNTP provider, identified by
+// its canonical ID (host:port/username); a bare host works when unambiguous.
 // It finds a segment from a processed NZB to download for real speed measurement
-func (u *Usenet) SpeedTest(ctx context.Context, providerHost string) nntp.SpeedTestResult {
+func (u *Usenet) SpeedTest(ctx context.Context, providerID string) nntp.SpeedTestResult {
 	// Try to find a segment from any processed NZB for the speed test
 	messageID := u.findTestSegment()
-	return u.nntp.SpeedTest(ctx, providerHost, messageID)
+	return u.nntp.SpeedTest(ctx, providerID, messageID)
 }
 
 // findTestSegment looks for a segment from any processed NZB to use for speed testing
@@ -1165,12 +1254,6 @@ func (u *Usenet) markAsProcessing(nzb *storage.NZB) error {
 func (u *Usenet) markAsCompleted(nzb *storage.NZB) error {
 	nzb.Status = NZBStatusCompleted
 
-	// The parsed segment map (.meta) is the only artifact needed for streaming
-	// and repair, so the raw .nzb source file is dead weight once the NZB
-	// completes — delete it (and its processing marker) immediately. Path is
-	// cleared so a later Delete()/watch scan ignores the now-absent file; with
-	// the source gone there is nothing for ClaimNewNZBs to re-import, so no
-	// .processed marker is needed.
 	if nzb.Path != "" {
 		if err := os.Remove(nzb.Path); err != nil && !os.IsNotExist(err) {
 			u.logger.Warn().Err(err).Str("path", nzb.Path).Msg("Failed to delete NZB source file after completion")

@@ -1,0 +1,70 @@
+name: Go validation
+
+on:
+  push:
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  decide-runner:
+    runs-on: ubuntu-latest
+    outputs:
+      labels: ${{ steps.set.outputs.labels }}
+    steps:
+      - id: set
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo 'labels=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'labels=["self-hosted", "mainframe-vm"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  build-and-test:
+    needs: decide-runner
+    runs-on: ${{ fromJSON(needs.decide-runner.outputs.labels) }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FUSE headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libfuse-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Verify generated JavaScript assets
+        run: |
+          npm run minify-js
+          git diff --exit-code -- pkg/server/assets/build/js
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Build all packages
+        run: go build ./...
+
+      - name: Test critical packages
+        run: >-
+          go test
+          ./pkg/debrid/providers/torbox
+          ./internal/request
+          ./pkg/manager
+          ./pkg/manager/link
+          ./pkg/strm
+          ./pkg/mount/dfs
+          ./pkg/mount/dfs/backend/hanwen
+          ./pkg/mount/dfs/vfs
+          ./pkg/repair

@@ -13,7 +13,7 @@ import (
 // for example, call the processQueuedEntries function once
 func (m *Manager) runInitialCalls(ctx context.Context) {
 	go m.refreshDownloadLinks(ctx)
-	go m.processQueuedEntries()
+	m.startDownloadTask(m.processQueuedEntries)
 	go m.syncAccounts()
 }
 
@@ -62,7 +62,9 @@ func (m *Manager) addQueueProcessorJob(ctx context.Context) error {
 		} else {
 			// Schedule the job
 			if _, err := m.scheduler.NewJob(jd, gocron.NewTask(func() {
-				err := m.queue.DeleteStalled()
+				err := m.queue.DeleteStalled(func(infoHash string) bool {
+					return !m.queueRestored.Load() || m.jobQueue.FindJob(infoHash) != nil
+				})
 				if err != nil {
 					m.logger.Error().Err(err).Msg("Failed to process remove stalled torrents")
 				}
@@ -134,7 +136,10 @@ func (m *Manager) StartWorker(ctx context.Context) error {
 				if err := m.refreshTorrents(ctx, debridName, debridClient); err != nil {
 					m.logger.Error().Err(err).Str("debrid", debridName).Msg("Torrent refresh failed")
 				}
-				m.RefreshEntries(true)
+				m.InvalidateEntryCache()
+				if err := m.RefreshMount(); err != nil {
+					m.logger.Error().Err(err).Msg("Mount refresh failed")
+				}
 			}), gocron.WithContext(ctx), gocron.WithName(jobName)); err != nil {
 				m.logger.Error().Err(err).Str("debrid", debridName).Msg("Failed to create torrent refresh job")
 			} else {
@@ -184,7 +189,7 @@ func (m *Manager) StartWorker(ctx context.Context) error {
 		// Schedule the job
 		if _, err := m.scheduler.NewJob(jd, gocron.NewTask(func() {
 			// Reset invalid download links map at midnight CET
-			m.arr.Monitor()
+			m.arr.CleanupQueues(ctx)
 		}), gocron.WithContext(ctx)); err != nil {
 			m.logger.Error().Err(err).Msg("Failed to create arr monitoring job")
 		} else {

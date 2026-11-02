@@ -11,26 +11,30 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/nntp"
 	"github.com/sirrobot01/decypharr/pkg/usenet/fs/reader"
 	"github.com/sirrobot01/decypharr/pkg/usenet/types"
 )
 
 type File struct {
-	ctx             context.Context
-	volume          *types.Volume
-	info            volumeInfo
-	reader          io.ReadCloser                          // Sequential reader (for Read() method)
-	streamingReader atomic.Pointer[reader.StreamingReader] // Streaming reader for ReadAt()
-	readerOnce      sync.Once                              // Ensures streaming reader created exactly once
-	readerErr       error                                  // Error from streaming reader creation
-	manager         *nntp.Client                           // Connection manager
-	maxConcurrent   int                                    // Max concurrent connections for this file's reader
-	prefetchSize    int64                                  // Prefetch size in bytes
-	pos             atomic.Int64
-	logger          zerolog.Logger
-	closed          atomic.Bool
+	pools             *reader.Pools
+	ctx               context.Context
+	volume            *types.Volume
+	info              volumeInfo
+	reader            io.ReadCloser                          // Sequential reader (for Read() method)
+	streamingReader   atomic.Pointer[reader.StreamingReader] // Streaming reader for ReadAt()
+	readerOnce        sync.Once                              // Ensures streaming reader created exactly once
+	readerErr         error                                  // Error from streaming reader creation
+	manager           *nntp.Client                           // Connection manager
+	maxConcurrent     int                                    // Max concurrent connections for this file's reader
+	prefetchSize      int64                                  // Prefetch size in bytes
+	bodyPipelineDepth int
+	diskPath          string
+	retention         reader.Retention
+	scheduler         *reader.FetchScheduler
+	pos               atomic.Int64
+	logger            zerolog.Logger
+	closed            atomic.Bool
 }
 
 func (vf *File) Read(p []byte) (int, error) {
@@ -165,11 +169,13 @@ func (vf *File) getOrCreateStreamingReader() *reader.StreamingReader {
 		encConfig := reader.EncryptionFromVolume(vf.volume)
 
 		// Configure the reader
-		cfg := config.Get()
 		readerConfig := reader.DefaultConfig()
 		readerConfig.MaxConnections = vf.maxConcurrent
 		readerConfig.PrefetchAhead = reader.PrefetchAheadSegments(vf.prefetchSize, segments)
-		readerConfig.DiskPath = cfg.Usenet.DiskBufferPath
+		readerConfig.BodyPipelineDepth = vf.bodyPipelineDepth
+		readerConfig.DiskPath = vf.diskPath
+		readerConfig.Retention = vf.retention
+		readerConfig.Scheduler = vf.scheduler
 
 		var r *reader.StreamingReader
 		var err error
@@ -180,20 +186,26 @@ func (vf *File) getOrCreateStreamingReader() *reader.StreamingReader {
 				vf.manager,
 				segments,
 				encConfig,
-				reader.WithMaxDisk(readerConfig.MaxDisk),
 				reader.WithMaxConnections(readerConfig.MaxConnections),
 				reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
+				reader.WithBodyPipelineDepth(readerConfig.BodyPipelineDepth),
 				reader.WithDiskPath(readerConfig.DiskPath),
+				reader.WithRetention(readerConfig.Retention),
+				reader.WithFetchScheduler(readerConfig.Scheduler),
+				reader.WithPools(vf.pools),
 			)
 		} else {
 			r, err = reader.NewStreamingReader(
 				vf.ctx,
 				vf.manager,
 				segments,
-				reader.WithMaxDisk(readerConfig.MaxDisk),
 				reader.WithMaxConnections(readerConfig.MaxConnections),
 				reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
+				reader.WithBodyPipelineDepth(readerConfig.BodyPipelineDepth),
 				reader.WithDiskPath(readerConfig.DiskPath),
+				reader.WithRetention(readerConfig.Retention),
+				reader.WithFetchScheduler(readerConfig.Scheduler),
+				reader.WithPools(vf.pools),
 			)
 		}
 
@@ -263,11 +275,13 @@ func (vf *File) newReaderForRange(start, end int64) (io.ReadCloser, error) {
 	encConfig := reader.EncryptionFromVolume(vf.volume)
 
 	// Configure the reader
-	cfg := config.Get()
 	readerConfig := reader.DefaultConfig()
 	readerConfig.MaxConnections = vf.maxConcurrent
 	readerConfig.PrefetchAhead = reader.PrefetchAheadSegments(vf.prefetchSize, segments)
-	readerConfig.DiskPath = cfg.Usenet.DiskBufferPath
+	readerConfig.BodyPipelineDepth = vf.bodyPipelineDepth
+	readerConfig.DiskPath = vf.diskPath
+	readerConfig.Retention = vf.retention
+	readerConfig.Scheduler = vf.scheduler
 
 	var r *reader.StreamingReader
 	var err error
@@ -278,20 +292,26 @@ func (vf *File) newReaderForRange(start, end int64) (io.ReadCloser, error) {
 			vf.manager,
 			segments,
 			encConfig,
-			reader.WithMaxDisk(readerConfig.MaxDisk),
 			reader.WithMaxConnections(readerConfig.MaxConnections),
 			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
+			reader.WithBodyPipelineDepth(readerConfig.BodyPipelineDepth),
 			reader.WithDiskPath(readerConfig.DiskPath),
+			reader.WithRetention(readerConfig.Retention),
+			reader.WithFetchScheduler(readerConfig.Scheduler),
+			reader.WithPools(vf.pools),
 		)
 	} else {
 		r, err = reader.NewStreamingReader(
 			vf.ctx,
 			vf.manager,
 			segments,
-			reader.WithMaxDisk(readerConfig.MaxDisk),
 			reader.WithMaxConnections(readerConfig.MaxConnections),
 			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
+			reader.WithBodyPipelineDepth(readerConfig.BodyPipelineDepth),
 			reader.WithDiskPath(readerConfig.DiskPath),
+			reader.WithRetention(readerConfig.Retention),
+			reader.WithFetchScheduler(readerConfig.Scheduler),
+			reader.WithPools(vf.pools),
 		)
 	}
 

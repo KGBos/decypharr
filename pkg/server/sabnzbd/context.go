@@ -29,26 +29,24 @@ func getMode(ctx context.Context) string {
 
 func (s *SABnzbd) categoryContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		category := r.URL.Query().Get("category")
+		category := r.FormValue("category")
 		if category == "" {
-			// Check form data
-			_ = r.ParseForm()
-			category = r.Form.Get("category")
+			category = r.FormValue("cat")
 		}
-		if category == "" {
-			category = r.FormValue("category")
-		}
+		defer func() {
+			if r.MultipartForm != nil {
+				_ = r.MultipartForm.RemoveAll()
+			}
+		}()
 
 		ctx := context.WithValue(r.Context(), categoryKey, strings.TrimSpace(category))
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-func getArrFromContext(ctx context.Context) *arr.Arr {
-	if a, ok := ctx.Value(arrKey).(*arr.Arr); ok {
-		return a
-	}
-	return nil
+func getArrFromContext(ctx context.Context) arr.Arr {
+	instance, _ := ctx.Value(arrKey).(arr.Arr)
+	return instance
 }
 
 func getCategory(ctx context.Context) string {
@@ -61,25 +59,8 @@ func getCategory(ctx context.Context) string {
 // modeContext extracts the mode parameter from the request
 func (s *SABnzbd) modeContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mode := r.URL.Query().Get("mode")
-		if mode == "" {
-			// Check form data
-			_ = r.ParseForm()
-			mode = r.Form.Get("mode")
-		}
-
-		// Extract category for Arr integration
-		category := r.URL.Query().Get("cat")
-		if category == "" {
-			category = r.Form.Get("cat")
-		}
-
-		// Create a default Arr instance for the category
-		downloadUncached := false
-		a := arr.New(category, "", "", false, &downloadUncached, "", "auto")
-
+		mode := r.FormValue("mode")
 		ctx := context.WithValue(r.Context(), modeKey, strings.TrimSpace(mode))
-		ctx = context.WithValue(ctx, arrKey, a)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -90,10 +71,13 @@ func (s *SABnzbd) modeContext(next http.Handler) http.Handler {
 // Only a valid host and token will be added to the context/config. The rest are manual
 func (s *SABnzbd) authContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host := r.URL.Query().Get("ma_username")
-		token := r.URL.Query().Get("ma_password")
+		host := r.FormValue("ma_username")
+		token := r.FormValue("ma_password")
+		if apiKey := r.FormValue("apikey"); config.Get().UseAuth && config.VerifyToken(apiKey) {
+			host, token = "", apiKey
+		}
 		category := getCategory(r.Context())
-		a, err := s.authenticate(category, host, token)
+		a, err := s.authenticate(r.Context(), category, host, token)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusUnauthorized)
 			return
@@ -103,42 +87,41 @@ func (s *SABnzbd) authContext(next http.Handler) http.Handler {
 	})
 }
 
-func (s *SABnzbd) authenticate(category, username, password string) (*arr.Arr, error) {
+func (s *SABnzbd) authenticate(ctx context.Context, category, username, password string) (arr.Arr, error) {
 	cfg := config.Get()
-	a := s.manager.Arr().Get(category)
-	if a == nil {
-		// Arr is not yet in runtime storage — look for a matching config entry
-		// so we inherit its download_uncached setting. If no config match,
-		// leave nil so SendToDebrid falls back to the debrid provider's setting.
-		var downloadUncached *bool
-		for _, cfgArr := range config.Get().Arrs {
-			if cfgArr.Name == category {
-				downloadUncached = cfgArr.DownloadUncached
+	instance, known := s.manager.Arr().Get(category)
+	if !known {
+		// Not in the registry yet: inherit download_uncached from a matching
+		// config entry so SendToDebrid does not fall back to the provider.
+		instance = arr.Arr{Name: category, Host: username, Token: password, Source: arr.SourceAuto}
+		for _, configured := range cfg.Arrs {
+			if configured.Name == category {
+				instance.DownloadUncached = configured.DownloadUncached
 				break
 			}
 		}
-		a = arr.New(category, username, password, false, downloadUncached, "", "auto")
 	}
-	arrValidated := false // This is a flag to indicate if arr validation was successful
-	if (username == "" || password == "") && cfg.UseAuth {
-		return nil, fmt.Errorf("unauthorized: Host and token are required for authentication(you've enabled authentication)")
+	if cfg.UseAuth {
+		if config.VerifyAuth(username, password) || config.VerifyToken(password) {
+			return instance, nil
+		}
+		if matched, ok := s.manager.Arr().MatchCredentials(category, username, password); ok {
+			return matched, nil
+		}
+		return arr.Arr{}, fmt.Errorf("unauthorized: invalid credentials")
 	}
-	if a.Source == "auto" {
-		a.Host = username
-		a.Token = password
-	}
-	if err := a.Validate(); err == nil {
-		arrValidated = true
+	if instance.Source == arr.SourceAuto {
+		instance.Host = username
+		instance.Token = password
 	}
 
-	if !arrValidated && cfg.UseAuth {
-		// If arr validation failed, try to use user auth validation
-		if !config.VerifyAuth(username, password) {
-			return nil, fmt.Errorf("unauthorized: invalid credentials")
-		}
+	kind, err := s.manager.Arr().Probe(ctx, instance)
+	validated := err == nil
+	if validated {
+		instance.Type = kind
 	}
-	if username != "" && password != "" {
-		s.manager.Arr().AddOrUpdate(a)
+	if validated && username != "" && password != "" {
+		s.manager.Arr().AddOrUpdate(instance)
 	}
-	return a, nil
+	return instance, nil
 }
