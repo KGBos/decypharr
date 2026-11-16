@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/request"
 	"github.com/sirrobot01/decypharr/pkg/notifications"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
@@ -35,6 +36,11 @@ func (r *Service) runSweep(trigger storage.RepairRunTrigger, opts RunOptions) (s
 	}
 
 	runCtx, cancel := context.WithCancel(r.parentCtx)
+	// Repair probes are background work: the shared /requestdl budget serves
+	// them only from leftover capacity, never ahead of playback.
+	// (Ported from the old pkg/manager/repair_sweep.go executeSweep tagging,
+	// which upstream deleted in its repair refactor.)
+	runCtx = request.WithClass(runCtx, request.ClassProbe)
 	stopState := &repairStopState{}
 	sourceParts := []string{string(cfg.Source)}
 	if opts.IgnoreLastChecked {

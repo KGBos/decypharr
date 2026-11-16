@@ -404,8 +404,10 @@ func (s *Service) validateLink(ctx context.Context, link *types.DownloadLink) er
 		if e := request.BackpressureError(err); e != nil {
 			return e
 		}
+		// Strip the URL credentials (the requestdl token query parameter)
+		// before the error is logged anywhere.
 		return NewRetryableError(
-			fmt.Errorf("HEAD request failed: %w", err),
+			fmt.Errorf("HEAD request failed: %w", request.RedactURLError(err)),
 			"network_error",
 		)
 	}
@@ -421,6 +423,70 @@ func (s *Service) validateLink(ctx context.Context, link *types.DownloadLink) er
 	}
 
 	return ErrorCodeToLinkError(errorCode)
+}
+
+// Resolve follows a download link's requestdl redirect through the provider's
+// shared throttle and returns the final CDN URL. Callers that hand a link to an
+// out-of-process consumer (for example the /api/browse download redirect) use
+// it so the requestdl call is charged to the shared budget instead of leaking
+// past Decypharr. It is deliberately provider-agnostic (not TorBox-only):
+// validateLink already HEADs the same URL for every provider, so this adds one
+// hop only on the /api/browse download route, after validation has succeeded.
+func (s *Service) Resolve(ctx context.Context, link types.DownloadLink) (string, error) {
+	if link.Empty() {
+		return "", NewPermanentError(ErrEmptyLink, "empty_link")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, link.DownloadLink, nil)
+	if err != nil {
+		return "", NewPermanentError(
+			fmt.Errorf("failed to create resolve request: %w", err),
+			"request_creation_failed",
+		)
+	}
+	client := s.httpClient
+	if provider, ok := s.clients.Load(link.Debrid); ok {
+		if p, ok := provider.(request.ThrottleProvider); ok && p.RequestThrottle() != nil {
+			resp, err := p.RequestThrottle().Do(client, req)
+			return s.finalURL(resp, err)
+		}
+	}
+	resp, err := client.Do(req)
+	return s.finalURL(resp, err)
+}
+
+// finalURL closes the probe response and returns the last URL in the redirect
+// chain. Backpressure passes through as a typed error.
+func (s *Service) finalURL(resp *http.Response, err error) (string, error) {
+	if err != nil {
+		if e := request.BackpressureError(err); e != nil {
+			return "", e
+		}
+		// Strip the requestdl token query parameter before this can be logged.
+		return "", NewRetryableError(
+			fmt.Errorf("resolve request failed: %w", request.RedactURLError(err)),
+			"network_error",
+		)
+	}
+	if resp == nil {
+		return "", NewRetryableError(fmt.Errorf("resolve returned no response"), "network_error")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Require a followed 2xx: an un-followed 3xx would otherwise hand back
+		// the token-bearing requestdl URL as the "resolved" target.
+		errorCode := resp.Header.Get("X-Error")
+		if errorCode == "" {
+			errorCode = strconv.Itoa(resp.StatusCode)
+		}
+		return "", ErrorCodeToLinkError(errorCode)
+	}
+	if resp.Request != nil && resp.Request.URL != nil && resp.Request.URL.String() != "" {
+		return resp.Request.URL.String(), nil
+	}
+	if location := resp.Header.Get("Location"); location != "" {
+		return location, nil
+	}
+	return "", NewRetryableError(fmt.Errorf("resolve returned no download URL"), "network_error")
 }
 
 // disableLinkAccount handles errors that require disabling an account

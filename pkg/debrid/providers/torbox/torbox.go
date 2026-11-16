@@ -53,6 +53,11 @@ type Torbox struct {
 	downloadPresentLoaded bool
 }
 
+// requestdlPath is the TorBox endpoint that resolves a file into a
+// short-lived CDN URL. It has a much tighter practical ceiling than the rest
+// of the API, so every call to it shares one provider-wide budget.
+const requestdlPath = "/api/torrents/requestdl"
+
 func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, error) {
 	cfg := config.Get()
 	backoffMax, cooldown, readWait, threshold, err := throttleConfig(dc)
@@ -125,6 +130,15 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 		throttle:              throttle,
 		logger:                _log,
 	}
+
+	// One shared /requestdl budget per configured provider, used by every
+	// client and worker (API client, download accounts, streaming reads). The
+	// matcher keys on this provider's host and exact endpoint path so lookalike
+	// paths, redirect hops to the CDN, and unrelated API calls never consume
+	// the budget.
+	limiter := requestdlOptions(dc, backoffMax, _log)
+	throttle.UseRequestdl(limiter, requestdlMatcher(func() string { return tb.Host }))
+
 	return tb, nil
 }
 
@@ -137,6 +151,80 @@ func onlyUsesKey(downloadKeys []string, apiKey string) bool {
 		}
 	}
 	return true
+}
+
+// requestdlMatcher reports whether a request targets this provider's
+// /requestdl endpoint. Scheme, host, and the full path must match exactly, so
+// a lookalike path (for example "/api/torrents/requestdlX") is not gated and
+// redirect hops to the CDN are never charged to the budget. The host is read
+// through a getter because tests point Host at a local server.
+func requestdlMatcher(host func() string) func(*http.Request) bool {
+	var mu sync.Mutex
+	var lastHost, wantScheme, wantHost, wantPath string
+	resolve := func() (string, string, string) {
+		mu.Lock()
+		defer mu.Unlock()
+		h := host()
+		if h != lastHost || wantPath == "" {
+			lastHost = h
+			if u, err := url.Parse(h); err == nil {
+				wantScheme, wantHost = u.Scheme, u.Host
+				wantPath = strings.TrimSuffix(u.Path, "/") + requestdlPath
+			} else {
+				wantScheme, wantHost, wantPath = "", "", ""
+			}
+		}
+		return wantScheme, wantHost, wantPath
+	}
+	return func(r *http.Request) bool {
+		scheme, matchHost, path := resolve()
+		if path == "" || r.URL == nil {
+			return false
+		}
+		return r.URL.Scheme == scheme && r.URL.Host == matchHost && r.URL.Path == path
+	}
+}
+
+// requestdlOptions parses the shared-budget settings, falling back to safe
+// defaults (with a warning) when a value is missing or invalid, so a typo can
+// never remove the limit.
+func requestdlOptions(dc config.Debrid, maxBackoff time.Duration, log zerolog.Logger) *request.RequestdlLimiter {
+	rate := request.DefaultRequestdlBudgetPerMinute
+	if dc.RequestdlBudget != "" {
+		if v, ok := utils.ParseRateValue(dc.RequestdlBudget); ok && v > 0 {
+			rate = v
+		} else {
+			log.Warn().Str("requestdl_budget", dc.RequestdlBudget).Msg("invalid requestdl_budget; using the default")
+		}
+	}
+	if rate > request.MaxRequestdlBudgetPerMinute {
+		log.Warn().Float64("requestdl_budget_per_minute", rate).Float64("max", request.MaxRequestdlBudgetPerMinute).Msg("requestdl_budget capped")
+		rate = request.MaxRequestdlBudgetPerMinute
+	}
+
+	rampSeconds := dc.RequestdlRampSeconds
+	if rampSeconds <= 0 || rampSeconds > 86400 {
+		if dc.RequestdlRampSeconds != 0 {
+			log.Warn().Int("requestdl_ramp_seconds", dc.RequestdlRampSeconds).Msg("invalid requestdl_ramp_seconds; using the default")
+		}
+		rampSeconds = request.DefaultRequestdlRampSeconds
+	}
+
+	freezeMax := request.DefaultRequestdlFreezeMax
+	if dc.RequestdlFreezeMax != "" {
+		if d, err := utils.ParseDuration(dc.RequestdlFreezeMax); err == nil && d > 0 && d <= 48*time.Hour {
+			freezeMax = d
+		} else {
+			log.Warn().Str("requestdl_freeze_max", dc.RequestdlFreezeMax).Msg("invalid requestdl_freeze_max; using the default")
+		}
+	}
+
+	return request.NewRequestdlLimiter(rate, time.Duration(rampSeconds)*time.Second, maxBackoff, freezeMax, log)
+}
+
+// RequestdlStats exposes the shared /requestdl budget for the local API.
+func (tb *Torbox) RequestdlStats() any {
+	return tb.throttle.RequestdlStats()
 }
 
 // RequestThrottle exposes the same provider gate to manager GET/HEAD reads.
@@ -668,7 +756,7 @@ func (tb *Torbox) fetchDownloadLink(ctx context.Context, account *account.Accoun
 	query.Set("file_id", file.Id)
 	query.Set("redirect", "true")
 
-	downloadURL := fmt.Sprintf("%s/api/torrents/requestdl?%s", tb.Host, query.Encode())
+	downloadURL := fmt.Sprintf("%s%s?%s", tb.Host, requestdlPath, query.Encode())
 
 	// Resolve the CDN URL once through the rate-limited client. Streaming the
 	// redirect URL makes every range read a requestdl call against the
@@ -933,6 +1021,10 @@ func (tb *Torbox) DeleteLink(downloadLink types.DownloadLink) error {
 
 // SpeedTest measures API latency and download speed using cached links
 func (tb *Torbox) SpeedTest(ctx context.Context) types.SpeedTestResult {
+	// Speed probes are the lowest priority lane: they must never consume
+	// capacity a playback read needs, and they are suppressed entirely during
+	// a penalty window by the shared budget.
+	ctx = request.WithClass(ctx, request.ClassProbe)
 	result := types.SpeedTestResult{
 		Provider: tb.config.Name,
 		TestedAt: time.Now(),
