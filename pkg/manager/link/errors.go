@@ -108,6 +108,11 @@ var (
 	Err404 = errors.New("HTTP 404 Not Found")
 	Err429 = errors.New("HTTP 429 Too Many Requests")
 	Err503 = errors.New("HTTP 503 Service Unavailable")
+	// Err5xx is a provider/CDN 5xx other than 503 (which has its own sentinel
+	// and also covers the provider's read-proxy timeout code). Transient by
+	// nature: the link itself is not known to be bad, so it is retryable and
+	// survives for a later validation instead of poisoning the link memo.
+	Err5xx = errors.New("HTTP 5xx: provider server error")
 )
 
 // NewLinkError creates a new LinkError with the given error and category
@@ -196,10 +201,22 @@ func ErrorCodeToLinkError(code string) *Error {
 		return NewPermanentError(Err404, code)
 	case "429":
 		return NewRetryableError(Err429, code)
+	// 5xx responses are provider/CDN failures, not evidence about the link:
+	// the same cached link usually validates once the provider recovers. They
+	// must never be memoised as permanent (see fetchAndValidate): a single
+	// transient 502 would otherwise read as a dead file until restart, which
+	// is exactly upstream #369's defect class.
+	case "500", "502", "504":
+		return NewRetryableError(Err5xx, code)
 	case "503", "read_pxy_timeout":
 		return NewRetryableError(Err503, code)
 	default:
-		return NewPermanentError(fmt.Errorf("unknown error code: %s", code), code)
+		// An unrecognised code is not evidence of a permanent failure:
+		// providers add codes over time, and the old default (permanent)
+		// turned one unclassified response into a file that stays dead until
+		// restart. Match ClassifyTransportError's stance — a wrong "retryable"
+		// costs a bounded revalidation, a wrong "permanent" kills playback.
+		return NewRetryableError(fmt.Errorf("unknown error code: %s", code), code)
 	}
 }
 
