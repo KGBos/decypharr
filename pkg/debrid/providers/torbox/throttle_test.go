@@ -1,11 +1,34 @@
 package torbox
 
 import (
-	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/internal/request"
+	"net/http"
 	"testing"
 	"time"
+
+	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/request"
 )
+
+func TestProviderReloadRetainsRateLimitGate(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+	dc := config.Debrid{Name: "torbox-reload", Provider: "torbox", APIKey: "test-reload"}
+	first, err := New(dc, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.throttle.Observe(&http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{"Retry-After": {"2634"}}}, false)
+	dc.Name = "torbox-reload-alias"
+	second, err := New(dc, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.throttle != second.throttle {
+		t.Fatal("provider reload created an independent gate")
+	}
+	if err := second.throttle.Before(); request.BackpressureError(err) == nil {
+		t.Fatalf("provider reload bypassed active ban: %v", err)
+	}
+}
 
 func TestThrottleConfiguration(t *testing.T) {
 	backoff, cooldown, readWait, threshold, err := throttleConfig(config.Debrid{})

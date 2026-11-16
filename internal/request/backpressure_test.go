@@ -52,10 +52,12 @@ func TestThrottleOpensAndRecovers(t *testing.T) {
 	now := time.Now()
 	b := NewThrottle(3, time.Minute, 5*time.Minute, zerolog.Nop())
 	b.now = func() time.Time { return now }
-	resp := &http.Response{StatusCode: 429, Header: make(http.Header)}
+	resp := &http.Response{StatusCode: 429, Header: http.Header{"Retry-After": {"40"}}}
 	for i := 0; i < 3; i++ {
-		if err := b.Before(); err != nil {
-			t.Fatal(err)
+		if i == 0 {
+			if err := b.Before(); err != nil {
+				t.Fatal(err)
+			}
 		}
 		b.Observe(resp, false)
 		if i < 2 {
@@ -115,6 +117,114 @@ func TestThrottleHonorsLongRetryAfter(t *testing.T) {
 	}
 	if b.Before() == nil {
 		t.Fatal("24h ban did not hold the breaker")
+	}
+}
+
+func TestThrottleNeverTruncatesServerRetryAfterToBackoffMax(t *testing.T) {
+	now := time.Now()
+	b := NewThrottle(3, time.Minute, 5*time.Minute, zerolog.Nop())
+	b.now = func() time.Time { return now }
+	b.Observe(&http.Response{StatusCode: 429, Header: http.Header{"Retry-After": {"2634"}}}, false)
+	if got := b.Remaining(); got != 2634*time.Second {
+		t.Fatalf("server ban truncated to configured backoff: %s", got)
+	}
+	now = now.Add(5 * time.Minute)
+	if err := b.Before(); BackpressureError(err) == nil {
+		t.Fatalf("admitted provider call during server ban: %v", err)
+	}
+	now = now.Add(2634*time.Second - 5*time.Minute)
+	if err := b.Before(); err != nil {
+		t.Fatalf("did not resume at server deadline: %v", err)
+	}
+}
+
+func TestThrottleNeverAutomaticallyRetries429(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Retry-After", "2634")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	b := NewThrottle(3, time.Minute, 5*time.Minute, zerolog.Nop())
+	c := New(WithThrottle(b), WithMaxRetries(5))
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests || calls.Load() != 1 {
+		t.Fatalf("status=%d provider_calls=%d; 429 must end the operation", resp.StatusCode, calls.Load())
+	}
+	if got := b.Remaining(); got < 2633*time.Second {
+		t.Fatalf("server ban not held: %s", got)
+	}
+	_, err = c.Get(server.URL)
+	if BackpressureError(err) == nil || calls.Load() != 1 {
+		t.Fatalf("new call bypassed server ban: err=%v provider_calls=%d", err, calls.Load())
+	}
+}
+
+func TestThrottleConcurrentAdmissionStopsAtFirst429(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+	var calls atomic.Int64
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		w.Header().Set("Retry-After", "2634")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	b := NewThrottle(3, time.Minute, 5*time.Minute, zerolog.Nop())
+	c := New(WithThrottle(b), WithMaxRetries(5))
+	first := make(chan error, 1)
+	go func() {
+		resp, err := c.Get(server.URL)
+		if resp != nil {
+			resp.Body.Close()
+		}
+		first <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first wire request did not start")
+	}
+	const n = 32
+	var wg sync.WaitGroup
+	results := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := c.Get(server.URL)
+			if resp != nil {
+				resp.Body.Close()
+			}
+			results <- err
+		}()
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatalf("first 429: %v", err)
+	}
+	wg.Wait()
+	close(results)
+	for err := range results {
+		if BackpressureError(err) == nil {
+			t.Fatalf("concurrent request was not gated: %v", err)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("provider received %d calls after first 429", calls.Load())
 	}
 }
 
@@ -199,13 +309,12 @@ func TestThrottleSharesAPIAndReadBackpressure(t *testing.T) {
 	defer server.Close()
 	b := NewThrottle(3, time.Minute, 5*time.Minute, zerolog.Nop())
 	client := New(WithThrottle(b), WithRetryWait(time.Second, 5*time.Minute), WithMaxRetries(3))
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, "GET", server.URL, nil)
-	_, err := client.Do(req)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("retry wait must be cancellable: %v", err)
+	req, _ := http.NewRequest("GET", server.URL, nil)
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("429 must end API operation: status=%v err=%v", resp, err)
 	}
+	resp.Body.Close()
 	if got := b.Remaining(); got < 115*time.Second || got > 120*time.Second {
 		t.Fatalf("configured retry wait: %s", got)
 	}
@@ -246,18 +355,25 @@ func TestRetryAfter120WallClock(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	elapsed := time.Since(start)
-	if resp.StatusCode != 200 || calls.Load() != 2 || elapsed < 120*time.Second || elapsed > 125*time.Second {
-		t.Fatalf("status=%d calls=%d wait=%s", resp.StatusCode, calls.Load(), elapsed)
+	if resp.StatusCode != 429 || calls.Load() != 1 {
+		t.Fatalf("429 retried automatically: status=%d calls=%d", resp.StatusCode, calls.Load())
 	}
-	t.Logf("Retry-After: 120 measured wait: %s", elapsed)
+	if _, err := c.Get(server.URL); BackpressureError(err) == nil || calls.Load() != 1 {
+		t.Fatalf("provider reached before deadline: %v calls=%d", err, calls.Load())
+	}
+	time.Sleep(120*time.Second - time.Since(start))
+	resp, err = c.Get(server.URL)
+	if err != nil || resp.StatusCode != 200 || calls.Load() != 2 {
+		t.Fatalf("explicit post-deadline call: status=%v err=%v calls=%d", resp, err, calls.Load())
+	}
+	resp.Body.Close()
 }
 
 type countingLimiter struct{ calls atomic.Int64 }
 
 func (l *countingLimiter) Take() time.Time { l.calls.Add(1); return time.Now() }
 
-func TestThrottleCountsAndLimitsEveryRetry(t *testing.T) {
+func TestThrottleStopsRetryAndLimiterAfter429(t *testing.T) {
 	config.SetConfigPath(t.TempDir())
 	var calls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(429) }))
@@ -270,11 +386,11 @@ func TestThrottleCountsAndLimitsEveryRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != 429 || calls.Load() != 3 || limiter.calls.Load() != 3 {
+	if resp.StatusCode != 429 || calls.Load() != 1 || limiter.calls.Load() != 1 {
 		t.Fatalf("status=%d requests=%d limiter=%d", resp.StatusCode, calls.Load(), limiter.calls.Load())
 	}
 	_, err = c.Get(server.URL)
-	if BackpressureError(err) == nil || calls.Load() != 3 || limiter.calls.Load() != 3 {
+	if BackpressureError(err) == nil || calls.Load() != 1 || limiter.calls.Load() != 1 {
 		t.Fatalf("open circuit did not reject before limiter: %v", err)
 	}
 }
@@ -314,72 +430,6 @@ func TestOpenCircuitPolicyPreservesNetworkError(t *testing.T) {
 	}
 }
 
-func TestNetworkFailureWhileAnotherRequestOpensCircuit(t *testing.T) {
-	config.SetConfigPath(t.TempDir())
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	var networkCalls atomic.Int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/throttle" {
-			w.Header().Set("Retry-After", "120")
-			w.WriteHeader(429)
-			return
-		}
-		if networkCalls.Add(1) == 1 {
-			close(entered)
-		}
-		select {
-		case <-release:
-		case <-r.Context().Done():
-			return
-		}
-		conn, _, err := w.(http.Hijacker).Hijack()
-		if err != nil {
-			t.Error(err)
-			return
-		}
-		conn.Close()
-	}))
-	defer server.Close()
-	gate := NewThrottle(1, time.Minute, 5*time.Minute, zerolog.Nop())
-	c := New(WithThrottle(gate), WithMaxRetries(3))
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	type result struct {
-		resp *http.Response
-		err  error
-	}
-	done := make(chan result, 1)
-	go func() {
-		req, _ := http.NewRequestWithContext(ctx, "GET", server.URL+"/network", nil)
-		resp, err := c.Do(req)
-		done <- result{resp, err}
-	}()
-	select {
-	case <-entered:
-	case <-ctx.Done():
-		t.Fatal("network request never started")
-	}
-	req, _ := http.NewRequestWithContext(ctx, "GET", server.URL+"/throttle", nil)
-	resp, err := c.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != 429 || !gate.isOpen() {
-		t.Fatal("parallel request did not open breaker")
-	}
-	close(release)
-	select {
-	case got := <-done:
-		if got.resp != nil || !errors.Is(got.err, io.EOF) || networkCalls.Load() != 1 {
-			t.Fatalf("resp=%v err=%v calls=%d", got.resp, got.err, networkCalls.Load())
-		}
-	case <-ctx.Done():
-		t.Fatal("network failure did not return")
-	}
-}
-
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
@@ -406,7 +456,7 @@ func TestReadWaitsOutShortCooldownThenSucceeds(t *testing.T) {
 		now = now.Add(d)
 		return nil
 	}
-	b.Observe(&http.Response{StatusCode: 429, Header: make(http.Header)}, false)
+	b.Observe(&http.Response{StatusCode: 429, Header: http.Header{"Retry-After": {"60"}}}, false)
 	if got := b.Remaining(); got != time.Minute {
 		t.Fatalf("cooldown: %s", got)
 	}
@@ -463,7 +513,7 @@ func TestReadFailsFastOnLongCooldown(t *testing.T) {
 // The blocking wait must honor request cancellation.
 func TestReadWaitInterruptedByContext(t *testing.T) {
 	b := NewThrottle(1, time.Minute, 5*time.Minute, zerolog.Nop()).WithReadWait(90 * time.Second)
-	b.Observe(&http.Response{StatusCode: 429, Header: make(http.Header)}, false)
+	b.Observe(&http.Response{StatusCode: 429, Header: http.Header{"Retry-After": {"60"}}}, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	b.sleep = func(sleepCtx context.Context, d time.Duration) error {
 		cancel()
@@ -614,7 +664,11 @@ func TestDefaultRetryStatusesOnWire(t *testing.T) {
 				t.Fatal(err)
 			}
 			resp.Body.Close()
-			if resp.StatusCode != 200 || calls.Load() != 2 {
+			wantStatus, wantCalls := 200, int64(2)
+			if status == http.StatusTooManyRequests {
+				wantStatus, wantCalls = http.StatusTooManyRequests, 1
+			}
+			if resp.StatusCode != wantStatus || calls.Load() != wantCalls {
 				t.Fatalf("status=%d calls=%d", resp.StatusCode, calls.Load())
 			}
 		})

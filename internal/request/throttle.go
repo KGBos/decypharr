@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -41,10 +43,14 @@ const (
 )
 
 // ThrottleError ends the current read/chunk attempt without poisoning the file.
-// A later caller can retry automatically after RetryAfter; no repair is needed.
+// A known deadline permits a later call in the same process after RetryAfter;
+// a negative value requires operator recovery.
 type ThrottleError struct{ RetryAfter time.Duration }
 
 func (e *ThrottleError) Error() string {
+	if e.RetryAfter < 0 {
+		return "TorBox rate-limit outcome is uncertain; operator recovery required"
+	}
 	return fmt.Sprintf("TorBox HTTP 429 backpressure: retry after %s", e.RetryAfter.Round(time.Millisecond))
 }
 func (e *ThrottleError) IsRetryable() bool { return false }
@@ -59,6 +65,10 @@ func BackpressureError(err error) *ThrottleError {
 // Throttle is shared by a configured provider's API and streaming clients.
 // Only actual responses count; rejected requests do not extend the cooldown.
 type Throttle struct {
+	// wireMu serializes response-header round trips and their observations.
+	// A caller that acquires it after a 429 cannot start a wire request before
+	// the same gate has recorded the server deadline.
+	wireMu                              sync.Mutex
 	mu                                  sync.Mutex
 	threshold, consecutive              int
 	escalation                          int
@@ -71,6 +81,8 @@ type Throttle struct {
 	now                                 func() time.Time
 	sleep                               func(context.Context, time.Duration) error
 	logger                              zerolog.Logger
+	journal                             *gateJournal
+	uncertain                           bool
 
 	// requestdl is the shared /requestdl budget; requestdlMatch selects the
 	// requests it applies to. Both are set once at provider startup via
@@ -141,6 +153,9 @@ func (b *Throttle) RequestdlStats() RequestdlStats {
 func (b *Throttle) Before() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.uncertain {
+		return &ThrottleError{RetryAfter: -1}
+	}
 	if wait := b.until.Sub(b.now()); wait > 0 {
 		return &ThrottleError{RetryAfter: wait}
 	}
@@ -156,6 +171,108 @@ func (b *Throttle) Remaining() time.Duration {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return max(0, b.until.Sub(b.now()))
+}
+
+// WithPersistentState fails closed after any interrupted or previously blocked
+// session. A restart loses the monotonic clock used to enforce Retry-After, so
+// only an operator can clear a blocked journal after verifying provider state.
+func (b *Throttle) WithPersistentState(path string) error {
+	j, state, err := openGateJournal(path)
+	if err != nil {
+		return err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.journal = j
+	if state.Status == gatePending || state.Status == gateBlocked {
+		b.uncertain = true
+	}
+	return nil
+}
+
+func (b *Throttle) persistPending() error {
+	if b.journal == nil {
+		return nil
+	}
+	if err := b.journal.write(gateDiskState{Status: gatePending}); err != nil {
+		b.mu.Lock()
+		b.uncertain = true
+		b.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (b *Throttle) persistOutcome(resp *http.Response, wireErr error) error {
+	if b.journal == nil {
+		return nil
+	}
+	if resp == nil || wireErr != nil {
+		// A live wire error (e.g. context.Canceled, timeout, network error).
+		// The live process observed the completion/interruption of the wire call without
+		// an HTTP 429 response from the provider. Reset the on-disk journal to idle so
+		// subsequent requests and future restarts are not blocked as uncertain.
+		_ = b.journal.write(gateDiskState{Status: gateIdle})
+		return nil
+	}
+	b.mu.Lock()
+	unknownDeadline := b.uncertain
+	b.mu.Unlock()
+	if unknownDeadline {
+		return fmt.Errorf("provider rate-limit deadline unknown")
+	}
+	state := gateDiskState{Status: gateIdle}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		b.mu.Lock()
+		state = gateDiskState{Status: gateBlocked, Until: b.until.UTC().Format(time.RFC3339Nano)}
+		b.mu.Unlock()
+	}
+	if err := b.journal.write(state); err != nil {
+		b.mu.Lock()
+		b.uncertain = true
+		b.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// wireFailureClass preserves the useful part of an uncertain transport
+// outcome without logging a request URL, API key, or arbitrary error text.
+// It never changes whether the durable gate fails closed.
+func wireFailureClass(err error) string {
+	if err == nil {
+		return "missing_response"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "context_canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "deadline_exceeded"
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return "dns"
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		switch opErr.Op {
+		case "dial", "read", "write":
+			return "network_" + opErr.Op
+		default:
+			return "network_other"
+		}
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "network_timeout"
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return "unexpected_eof"
+	}
+	if errors.Is(err, io.EOF) {
+		return "eof"
+	}
+	return "other"
 }
 
 // WaitRead admits a read through an open circuit. When the remaining cooldown
@@ -232,7 +349,15 @@ func (b *Throttle) Observe(resp *http.Response, read bool) {
 	}
 	b.consecutive++
 	serverWait, hasServerWait := retryAfterWait(resp)
-	wait := retryAfterBackoff(time.Second, b.backoffMax, b.consecutive-1, resp)
+	if !hasServerWait {
+		b.uncertain = true
+		b.open = true
+		b.logger.Error().Msg("TorBox HTTP 429 has no usable retry deadline; operator recovery required")
+		return
+	}
+	// Retry-After is a provider deadline, not a suggested backoff. The local
+	// backoff ceiling must never shorten it.
+	wait := serverWait
 	opening := !b.open && b.consecutive >= b.threshold
 	if b.consecutive >= b.threshold {
 		// A re-trip (consecutive beyond the threshold, no success since the
@@ -388,9 +513,20 @@ func (t *throttleTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		if err := limiter.Take(ctx, class); err != nil {
 			return nil, err
 		}
-		if err := gate(); err != nil {
-			return nil, err
-		}
+	}
+	t.throttle.wireMu.Lock()
+	defer t.throttle.wireMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// This admission and the response observation are serialized. Earlier
+	// checks avoid waiting for the wire lock while an existing ban is known.
+	if err := t.throttle.Before(); err != nil {
+		return nil, err
+	}
+	if err := t.throttle.persistPending(); err != nil {
+		t.throttle.logger.Error().Err(err).Msg("TorBox gate journal unavailable; refusing provider request")
+		return nil, &ThrottleError{RetryAfter: -1}
 	}
 	t.throttle.mu.Lock()
 	t.throttle.requests++
@@ -405,6 +541,13 @@ func (t *throttleTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		// requestdl_freeze_max); the breaker's remaining cooldown is passed as
 		// a floor so an escalated breaker wait also holds the bucket.
 		limiter.Observe(resp, class, t.throttle.Remaining())
+	}
+	if outcomeErr := t.throttle.persistOutcome(resp, err); outcomeErr != nil {
+		t.throttle.logger.Error().Err(outcomeErr).Str("wire_failure", wireFailureClass(err)).Msg("TorBox gate outcome not durable; refusing further requests")
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+		return nil, &ThrottleError{RetryAfter: -1}
 	}
 	if t.read && resp != nil && resp.StatusCode == http.StatusTooManyRequests {
 		// Never drain a rate-limit body: even that can stall the read.

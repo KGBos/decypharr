@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,6 +38,19 @@ var planSlots = map[string]int{
 	"pro":       10,
 }
 
+// A manager reload may construct a second TorBox client while old workers are
+// still alive. Keep their gate (and requestdl budget) shared for the process
+// lifetime so a new client cannot forget an active provider ban.
+var sharedThrottle = struct {
+	sync.Mutex
+	byProvider map[throttleKey]*request.Throttle
+}{byProvider: make(map[throttleKey]*request.Throttle)}
+
+type throttleKey struct {
+	configPath string
+	apiKeyHash [sha256.Size]byte
+}
+
 type Torbox struct {
 	Host                  string `json:"host"`
 	APIKey                string
@@ -64,6 +78,9 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 	if err != nil {
 		return nil, err
 	}
+	key := throttleKey{config.GetMainPath(), sha256.Sum256([]byte(dc.APIKey))}
+	sharedThrottle.Lock()
+	defer sharedThrottle.Unlock()
 	headers := map[string]string{
 		"Authorization": fmt.Sprintf("Bearer %s", dc.APIKey),
 	}
@@ -73,10 +90,17 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 		headers["User-Agent"] = fmt.Sprintf("Decypharr/%s (%s; %s)", version.GetInfo(), runtime.GOOS, runtime.GOARCH)
 	}
 	_log := logger.New(dc.Name)
-	throttle := request.NewThrottle(threshold, cooldown, backoffMax, _log).WithReadWait(readWait)
-	// One ticker per configured provider for the provider's process lifetime;
-	// it exits with the process, so there is nothing to leak per request.
-	throttle.StartCounterLogging(context.Background(), request.CounterLogInterval)
+	throttle, existing := sharedThrottle.byProvider[key]
+	if !existing {
+		throttle = request.NewThrottle(threshold, cooldown, backoffMax, _log).WithReadWait(readWait)
+		if key.configPath == "" {
+			return nil, fmt.Errorf("TorBox gate requires a persistent config path")
+		}
+		statePath := filepath.Join(key.configPath, "torbox-gate", fmt.Sprintf("%x.json", key.apiKeyHash))
+		if err := throttle.WithPersistentState(statePath); err != nil {
+			return nil, fmt.Errorf("TorBox gate state unavailable: %w", err)
+		}
+	}
 
 	// TorBox enforces a hard cap of 300 req/min per API key, applied
 	// synchronously across all servers since v8.4 (Feb 2026, GAP-002).
@@ -136,8 +160,13 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 	// matcher keys on this provider's host and exact endpoint path so lookalike
 	// paths, redirect hops to the CDN, and unrelated API calls never consume
 	// the budget.
-	limiter := requestdlOptions(dc, backoffMax, _log)
-	throttle.UseRequestdl(limiter, requestdlMatcher(func() string { return tb.Host }))
+	if !existing {
+		limiter := requestdlOptions(dc, backoffMax, _log)
+		throttle.UseRequestdl(limiter, requestdlMatcher(func() string { return tb.Host }))
+		// One ticker per provider gate, including across manager reloads.
+		throttle.StartCounterLogging(context.Background(), request.CounterLogInterval)
+		sharedThrottle.byProvider[key] = throttle
+	}
 
 	return tb, nil
 }
@@ -821,14 +850,14 @@ func (tb *Torbox) resolveDownloadLink(ctx context.Context, account *account.Acco
 		return types.DownloadLink{}, &request.ThrottleError{RetryAfter: tb.throttle.Remaining()}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return types.DownloadLink{}, fmt.Errorf("torbox requestdl error: HTTP %d", resp.StatusCode)
+		return types.DownloadLink{}, tb.requestdlFailure(resp)
 	}
 	var result DownloadLinksResponse
 	if err := json.ConfigDefault.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return types.DownloadLink{}, fmt.Errorf("torbox requestdl response: %w", err)
 	}
 	if !result.Success || result.Data == nil || *result.Data == "" {
-		return types.DownloadLink{}, fmt.Errorf("torbox requestdl returned no CDN URL")
+		return types.DownloadLink{}, tb.requestdlFailureResponse(resp.StatusCode, result.Error)
 	}
 	expiry := 3 * time.Hour
 	if tb.autoExpiresLinksAfter > 0 && tb.autoExpiresLinksAfter < expiry {
@@ -841,6 +870,27 @@ func (tb *Torbox) resolveDownloadLink(ctx context.Context, account *account.Acco
 		return types.DownloadLink{}, fmt.Errorf("torbox requestdl returned invalid CDN URL: %w", err)
 	}
 	return dl, nil
+}
+
+// Only TorBox's machine-readable code is safe to put in a log or read error.
+// The detail field and the request URL may contain account tokens or links.
+var torboxErrorCode = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,127}$`)
+
+func (tb *Torbox) requestdlFailure(resp *http.Response) error {
+	var result struct {
+		Error any `json:"error"`
+	}
+	_ = json.ConfigDefault.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&result)
+	return tb.requestdlFailureResponse(resp.StatusCode, result.Error)
+}
+
+func (tb *Torbox) requestdlFailureResponse(status int, providerError any) error {
+	code, _ := providerError.(string)
+	if !torboxErrorCode.MatchString(code) {
+		code = "UNKNOWN"
+	}
+	tb.logger.Warn().Int("http_status", status).Str("provider_error_code", code).Msg("TorBox requestdl failed")
+	return fmt.Errorf("torbox requestdl failed: HTTP %d provider_error_code=%s", status, code)
 }
 
 func (tb *Torbox) fetchDownloadLink(ctx context.Context, account *account.Account, id string, file *types.File) (types.DownloadLink, error) {
