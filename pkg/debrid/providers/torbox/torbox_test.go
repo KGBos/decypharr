@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
@@ -17,6 +18,213 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/debrid/account"
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 )
+
+func TestSubmitMagnetIncludesSanitizedProviderError(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprint(w, `{"success":false,"error":"BAD_REQUEST","detail":"magnet:?xt=urn:btih:SECRET is invalid","data":null}`)
+	}))
+	t.Cleanup(server.Close)
+
+	torrent := &types.Torrent{
+		InfoHash: "AABBCC",
+		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+	}
+	_, err := testTorbox(server.URL).SubmitMagnet(torrent)
+	if err == nil {
+		t.Fatal("SubmitMagnet() error = nil, want provider error")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "BAD_REQUEST") || !strings.Contains(message, "[redacted magnet]") {
+		t.Fatalf("SubmitMagnet() error = %q, want sanitized provider fields", message)
+	}
+	if strings.Contains(message, "SECRET") || strings.Contains(message, "magnet:?") {
+		t.Fatalf("SubmitMagnet() error leaked submitted magnet data: %q", message)
+	}
+}
+
+func TestSubmitMagnetPreservesStatusAndBodyOnExhaustedRetries(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprint(w, `{"success":false,"error":"RATE_LIMITED","detail":"Rate limit exceeded","data":null}`)
+	}))
+	t.Cleanup(server.Close)
+
+	tb := &Torbox{
+		Host: server.URL,
+		client: request.New(
+			request.WithMaxRetries(2),
+			request.WithRetryWait(time.Millisecond, 2*time.Millisecond),
+			request.WithRetryableStatus(http.StatusTooManyRequests),
+		),
+		logger: zerolog.Nop(),
+		config: config.Debrid{Name: "torbox"},
+	}
+
+	torrent := &types.Torrent{
+		InfoHash:         "AABBCC",
+		Magnet:           &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+		DownloadUncached: true,
+	}
+	_, err := tb.SubmitMagnet(torrent)
+	if err == nil {
+		t.Fatal("SubmitMagnet() error = nil, want rate limit error after retries")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "Status: 429") {
+		t.Fatalf("SubmitMagnet() error = %q, want Status: 429", message)
+	}
+	if !strings.Contains(message, "RATE_LIMITED") || !strings.Contains(message, "Rate limit exceeded") {
+		t.Fatalf("SubmitMagnet() error = %q, want provider error details", message)
+	}
+	if !strings.Contains(message, "attempts=3") {
+		t.Fatalf("SubmitMagnet() error = %q, want attempts=3", message)
+	}
+	if !strings.Contains(message, "retry-after=\"5\"") {
+		t.Fatalf("SubmitMagnet() error = %q, want retry-after=\"5\"", message)
+	}
+	if strings.Contains(message, "giving up after") {
+		t.Fatalf("SubmitMagnet() error = %q, should not contain retryablehttp generic giving up message", message)
+	}
+	if attempts != 3 {
+		t.Fatalf("server received %d attempts, want 3", attempts)
+	}
+}
+
+func TestSubmitMagnetHandlesChunkedErrorResponse(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		if flusher, ok := w.(http.Flusher); ok {
+			_, _ = fmt.Fprint(w, `{"success":false,"error":"BAD_REQUEST","detail":"chunked error body"}`)
+			flusher.Flush()
+		} else {
+			_, _ = fmt.Fprint(w, `{"success":false,"error":"BAD_REQUEST","detail":"chunked error body"}`)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	tb := testTorbox(server.URL)
+	torrent := &types.Torrent{
+		InfoHash: "AABBCC",
+		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+	}
+	_, err := tb.SubmitMagnet(torrent)
+	if err == nil {
+		t.Fatal("SubmitMagnet() error = nil, want error")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "BAD_REQUEST") || !strings.Contains(message, "chunked error body") {
+		t.Fatalf("SubmitMagnet() error = %q, want chunked provider details", message)
+	}
+}
+
+func TestSubmitMagnetHandlesEmptyBodyErrorResponse(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(server.Close)
+
+	tb := testTorbox(server.URL)
+	torrent := &types.Torrent{
+		InfoHash: "AABBCC",
+		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+	}
+	_, err := tb.SubmitMagnet(torrent)
+	if err == nil {
+		t.Fatal("SubmitMagnet() error = nil, want error")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "Status: 502") || !strings.Contains(message, "no body returned") {
+		t.Fatalf("SubmitMagnet() error = %q, want Status: 502 with no body returned", message)
+	}
+}
+
+func TestGetTorboxStatusKeepsIncompleteDownloadsRetryable(t *testing.T) {
+	tb := &Torbox{}
+	if got := tb.getTorboxStatus("incomplete", false); got != types.TorrentStatusDownloading {
+		t.Fatalf("getTorboxStatus(incomplete) = %q, want downloading", got)
+	}
+}
+
+func TestUpdateTorrentTreatsPresentStalledDownloadAsCompleted(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"success":true,"data":{"id":17,"name":"Reacher.S02.mkv","size":100,"progress":1,"download_state":"stalled (no seeds)","download_finished":false,"download_present":true,"created_at":"2026-01-02T03:04:05Z","hash":"5004BCC4598206C7C7293353936708BC8288C034","files":[{"id":1,"name":"Reacher.S02.mkv","absolute_path":"Reacher.S02.mkv","size":100}]}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	torrent := &types.Torrent{Id: "17"}
+	if err := testTorbox(server.URL).UpdateTorrent(torrent); err != nil {
+		t.Fatalf("UpdateTorrent() error = %v", err)
+	}
+	if torrent.Status != types.TorrentStatusDownloaded {
+		t.Fatalf("Status = %q, want downloaded", torrent.Status)
+	}
+	file := torrent.Files["Reacher.S02.mkv"]
+	if file.Link != "torbox://17/1" {
+		t.Fatalf("file link = %q, want torbox://17/1", file.Link)
+	}
+}
+
+func TestUpdateTorrentDoesNotCompletePartialPresentDownload(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"success":true,"data":{"id":18,"name":"Partial.Release.mkv","size":100,"progress":0.5,"download_state":"downloading","download_finished":false,"download_present":true,"created_at":"2026-01-02T03:04:05Z","hash":"DDEEFF","files":[{"id":1,"name":"Partial.Release.mkv","absolute_path":"Partial.Release.mkv","size":100}]}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	torrent := &types.Torrent{Id: "18"}
+	if err := testTorbox(server.URL).UpdateTorrent(torrent); err != nil {
+		t.Fatalf("UpdateTorrent() error = %v", err)
+	}
+	if torrent.Status != types.TorrentStatusDownloading {
+		t.Fatalf("Status = %q, want downloading", torrent.Status)
+	}
+	if link := torrent.Files["Partial.Release.mkv"].Link; link != "" {
+		t.Fatalf("file link = %q, want empty until progress reaches 100%%", link)
+	}
+}
+
+func TestCheckStatusPreservesTorboxFailureContext(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"success":true,"data":{"id":23,"name":"Broken.Release.mkv","size":100,"progress":1,"download_state":"failed (processing)","download_finished":false,"download_present":false,"tracker_message":"storage unavailable","created_at":"2026-01-02T03:04:05Z","hash":"AABBCC","files":[]}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	torrent, err := testTorbox(server.URL).CheckStatus(&types.Torrent{Id: "23"})
+	if err == nil {
+		t.Fatal("CheckStatus() error = nil, want provider failure")
+	}
+	for _, want := range []string{"failed (processing)", "storage unavailable", "id 23", "hash AABBCC"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("CheckStatus() error = %q, want %q", err, want)
+		}
+	}
+	if torrent == nil || torrent.InfoHash != "AABBCC" {
+		t.Fatalf("CheckStatus() torrent = %#v, want returned provider hash", torrent)
+	}
+}
 
 func TestSubmissionRequestsUseDedicatedClient(t *testing.T) {
 	config.SetConfigPath(t.TempDir())
@@ -293,5 +501,69 @@ func TestFetchDownloadLinkFallsBackToRedirectURL(t *testing.T) {
 	}
 	if !strings.Contains(dl.DownloadLink, "/api/torrents/requestdl?") || !strings.Contains(dl.DownloadLink, "redirect=true") {
 		t.Fatalf("DownloadLink = %q, want the redirect URL", dl.DownloadLink)
+	}
+}
+
+func TestSubmitMagnetSkipsUncachedWithoutSubmitting(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	var createCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "checkcached"):
+			_, _ = fmt.Fprint(w, `{"success":true,"data":{}}`)
+		case strings.Contains(r.URL.Path, "createtorrent"):
+			createCalls++
+			_, _ = fmt.Fprint(w, `{"success":true,"data":{"torrent_id":1,"hash":"AABBCC"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	torrent := &types.Torrent{
+		Name:     "Uncached.Release",
+		InfoHash: "AABBCC",
+		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+	}
+	_, err := testTorbox(server.URL).SubmitMagnet(torrent)
+	if err == nil || !strings.Contains(err.Error(), "not cached") {
+		t.Fatalf("SubmitMagnet() error = %v, want not-cached skip", err)
+	}
+	if createCalls != 0 {
+		t.Fatalf("createtorrent called %d times, want 0", createCalls)
+	}
+}
+
+func TestSubmitMagnetProceedsWhenCached(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+
+	var createCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "checkcached"):
+			_, _ = fmt.Fprint(w, `{"success":true,"data":{"AABBCC":{"name":"Cached.Release","size":100,"hash":"AABBCC"}}}`)
+		case strings.Contains(r.URL.Path, "createtorrent"):
+			createCalls++
+			_, _ = fmt.Fprint(w, `{"success":true,"data":{"torrent_id":42,"hash":"AABBCC"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	torrent := &types.Torrent{
+		Name:     "Cached.Release",
+		InfoHash: "AABBCC",
+		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
+	}
+	got, err := testTorbox(server.URL).SubmitMagnet(torrent)
+	if err != nil {
+		t.Fatalf("SubmitMagnet() error = %v", err)
+	}
+	if got.Id != "42" || createCalls != 1 {
+		t.Fatalf("id = %q, createCalls = %d; want 42 and 1", got.Id, createCalls)
 	}
 }
