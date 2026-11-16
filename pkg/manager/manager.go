@@ -116,6 +116,13 @@ type Manager struct {
 	downloadTasks    sync.WaitGroup
 	downloadsStopped bool
 	cancelDownloads  context.CancelFunc
+	// cacheWarmGate is a Manager-wide slot limiter so overlapping season packs
+	// cannot each open the configured max cache-warm TorBox reads at once.
+	cacheWarmOnce sync.Once
+	cacheWarmGate *cacheWarmGate
+	// warmOneFileFn, when set, replaces warmOneFile. Tests use it to observe
+	// concurrency without touching the mount.
+	warmOneFileFn func(ctx context.Context, path string) error
 
 	// Notifications service
 	Notifications *notifications.Service
