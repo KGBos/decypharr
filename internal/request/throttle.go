@@ -112,6 +112,19 @@ func (b *Throttle) WithReadWait(d time.Duration) *Throttle {
 	return b
 }
 
+// ReadWait returns the maximum remaining cooldown a read will wait out.
+func (b *Throttle) ReadWait() time.Duration {
+	if b == nil {
+		return DefaultReadWait
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.readWait > 0 {
+		return b.readWait
+	}
+	return DefaultReadWait
+}
+
 // UseRequestdl attaches the shared /requestdl budget and the predicate that
 // selects the requests it governs. It is set once at provider construction
 // before any request is served.
@@ -349,15 +362,12 @@ func (b *Throttle) Observe(resp *http.Response, read bool) {
 	}
 	b.consecutive++
 	serverWait, hasServerWait := retryAfterWait(resp)
-	if !hasServerWait {
-		b.uncertain = true
-		b.open = true
-		b.logger.Error().Msg("TorBox HTTP 429 has no usable retry deadline; operator recovery required")
-		return
+	wait := retryAfterBackoff(time.Second, b.backoffMax, b.consecutive-1, resp)
+	if hasServerWait {
+		// Retry-After is a provider deadline, not a suggested backoff. The local
+		// backoff ceiling must never shorten it.
+		wait = max(wait, serverWait)
 	}
-	// Retry-After is a provider deadline, not a suggested backoff. The local
-	// backoff ceiling must never shorten it.
-	wait := serverWait
 	opening := !b.open && b.consecutive >= b.threshold
 	if b.consecutive >= b.threshold {
 		// A re-trip (consecutive beyond the threshold, no success since the

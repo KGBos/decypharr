@@ -362,7 +362,9 @@ func (pq *PersistentSubmissionQueue) appendJournalEntryLocked(record *JournalRec
 	}
 }
 
-// ReplayJournal scans the journal file on startup to restore uncommitted submissions.
+// ReplayJournal scans the journal file on startup and discards unfinished
+// submissions. The queue has no worker that can resume them, so restoring them
+// would reserve bounded queue capacity indefinitely.
 func (pq *PersistentSubmissionQueue) ReplayJournal() error {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
@@ -399,13 +401,8 @@ func (pq *PersistentSubmissionQueue) ReplayJournal() error {
 		}
 	}
 
-	for _, rec := range activeRecords {
-		rec.Status = StatusPending
-		pq.queue = append(pq.queue, rec)
-	}
-
-	if len(pq.queue) > 0 {
-		pq.logger.Info().Int("recovered", len(pq.queue)).Msg("TorBox mediator: recovered pending submissions from journal")
+	if len(activeRecords) > 0 {
+		pq.logger.Warn().Int("discarded", len(activeRecords)).Msg("TorBox mediator: discarded unfinished submissions from journal; they cannot be resumed")
 	}
 	return scanner.Err()
 }
