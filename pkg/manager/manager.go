@@ -533,6 +533,14 @@ func (m *Manager) Stop() error {
 	}
 	m.downloadMu.Unlock()
 
+	// Stop mount manager first
+	if m.mountManager != nil {
+		m.logger.Info().Msg("Stopping mount manager")
+		if err := m.mountManager.Stop(); err != nil {
+			return fmt.Errorf("failed to stop mount manager: %w", err)
+		}
+	}
+
 	// Stop schedulers
 	if m.scheduler != nil {
 		if err := m.scheduler.Shutdown(); err != nil {
@@ -601,7 +609,7 @@ func (m *Manager) Reset() error {
 
 	// Stop resources before resetting
 	if err := m.Stop(); err != nil {
-		m.logger.Warn().Err(err).Msg("Failed to stop manager during reset")
+		return fmt.Errorf("failed to stop manager during reset: %w", err)
 	}
 
 	// Reopen storage database (it was closed by Stop)
