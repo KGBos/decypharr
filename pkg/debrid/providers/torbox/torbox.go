@@ -413,6 +413,33 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 		"magnet": torrent.Magnet.Link,
 	}
 	if !torrent.DownloadUncached {
+		hash := torrent.InfoHash
+		if hash == "" && torrent.Magnet != nil {
+			hash = torrent.Magnet.InfoHash
+		}
+		if hash == "" {
+			return nil, fmt.Errorf("missing info hash for TorBox cache check")
+		}
+		var availability AvailableResponse
+		check, err := tb.doGet("/api/torrents/checkcached", map[string]string{"hash": hash}, &availability)
+		if err != nil {
+			return nil, fmt.Errorf("TorBox cache check failed: %w", err)
+		}
+		if check.StatusCode < 200 || check.StatusCode >= 300 || !availability.Success {
+			return nil, fmt.Errorf("TorBox cache check failed: Status: %d", check.StatusCode)
+		}
+		cached := false
+		if availability.Data != nil {
+			for candidate, item := range *availability.Data {
+				if strings.EqualFold(candidate, hash) && item.Size > 0 {
+					cached = true
+					break
+				}
+			}
+		}
+		if !cached {
+			return nil, fmt.Errorf("DOWNLOAD_NOT_CACHED")
+		}
 		formData["add_only_if_cached"] = "true"
 	}
 
@@ -749,6 +776,73 @@ func (tb *Torbox) GetDownloadLink(ctx context.Context, id string, file *types.Fi
 	return tb.accountsManager.GetDownloadLink(ctx, id, file, tb.fetchDownloadLink)
 }
 
+// GetDownloadLinkForPlayback resolves the CDN URL only when a consumer will
+// read the file. Repair probes continue to use the network-free GetDownloadLink.
+func (tb *Torbox) GetDownloadLinkForPlayback(ctx context.Context, id string, file *types.File) (types.DownloadLink, error) {
+	dl, err := tb.GetDownloadLink(ctx, id, file)
+	if err != nil || dl.Empty() {
+		return dl, err
+	}
+	if !strings.HasPrefix(dl.DownloadLink, tb.Host+requestdlPath+"?") && (dl.ExpiresAt.IsZero() || time.Now().Before(dl.ExpiresAt)) {
+		return dl, nil
+	}
+	account, err := tb.accountsManager.GetAccount(dl.Token)
+	if err != nil {
+		return types.DownloadLink{}, err
+	}
+	resolved, err := tb.resolveDownloadLink(ctx, account, id, file)
+	if err != nil {
+		// Never leave a requestdl placeholder (or expired CDN URL) in the
+		// account cache after resolution failed.
+		_ = tb.DeleteLink(dl)
+		return types.DownloadLink{}, err
+	}
+	// A repair probe may have cached the cheap placeholder. Replace it only
+	// after a complete, successful response; failures leave no CDN URL stored.
+	tb.accountsManager.StoreDownloadLink(resolved)
+	return resolved, nil
+}
+
+func (tb *Torbox) resolveDownloadLink(ctx context.Context, account *account.Account, id string, file *types.File) (types.DownloadLink, error) {
+	query := url.Values{}
+	query.Set("token", account.Token)
+	query.Set("torrent_id", id)
+	query.Set("file_id", file.Id)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tb.Host+requestdlPath+"?"+query.Encode(), nil)
+	if err != nil {
+		return types.DownloadLink{}, request.RedactURLError(err)
+	}
+	resp, err := tb.client.DoOnce(req)
+	if err != nil {
+		return types.DownloadLink{}, request.RedactURLError(err)
+	}
+	defer request.DrainAndClose(resp.Body)
+	if resp.StatusCode == http.StatusTooManyRequests && tb.throttle != nil {
+		return types.DownloadLink{}, &request.ThrottleError{RetryAfter: tb.throttle.Remaining()}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return types.DownloadLink{}, fmt.Errorf("torbox requestdl error: HTTP %d", resp.StatusCode)
+	}
+	var result DownloadLinksResponse
+	if err := json.ConfigDefault.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return types.DownloadLink{}, fmt.Errorf("torbox requestdl response: %w", err)
+	}
+	if !result.Success || result.Data == nil || *result.Data == "" {
+		return types.DownloadLink{}, fmt.Errorf("torbox requestdl returned no CDN URL")
+	}
+	expiry := 3 * time.Hour
+	if tb.autoExpiresLinksAfter > 0 && tb.autoExpiresLinksAfter < expiry {
+		expiry = tb.autoExpiresLinksAfter
+	}
+	now := time.Now()
+	dl := types.DownloadLink{Filename: file.Name, Size: file.Size, Token: account.Token, Link: file.Link,
+		DownloadLink: *result.Data, Debrid: tb.config.Name, Id: file.Id, Generated: now, ExpiresAt: now.Add(expiry)}
+	if err := dl.Valid(); err != nil {
+		return types.DownloadLink{}, fmt.Errorf("torbox requestdl returned invalid CDN URL: %w", err)
+	}
+	return dl, nil
+}
+
 func (tb *Torbox) fetchDownloadLink(ctx context.Context, account *account.Account, id string, file *types.File) (types.DownloadLink, error) {
 	query := url.Values{}
 	query.Set("token", account.Token)
@@ -758,34 +852,13 @@ func (tb *Torbox) fetchDownloadLink(ctx context.Context, account *account.Accoun
 
 	downloadURL := fmt.Sprintf("%s%s?%s", tb.Host, requestdlPath, query.Encode())
 
-	// Resolve the CDN URL once through the rate-limited client. Streaming the
-	// redirect URL makes every range read a requestdl call against the
-	// account-wide API limit. An expired CDN URL is refetched like any link;
-	// on failure the redirect URL still works.
-	client := account.Client()
-	if client == nil {
-		client = tb.client
-	}
-	var res DownloadLinksResponse
-	resp, err := tb.doGetWithClient(ctx, client, "/api/torrents/requestdl", map[string]string{
-		"token":      account.Token,
-		"torrent_id": id,
-		"file_id":    file.Id,
-		"redirect":   "false",
-	}, &res)
-	if err == nil && resp.StatusCode == http.StatusOK && res.Success && res.Data != nil && strings.HasPrefix(*res.Data, "http") {
-		downloadURL = *res.Data
-	} else {
-		tb.logger.Debug().Err(err).Str("torrent_id", id).Msg("requestdl redirect=false failed, using redirect URL")
-	}
-
 	now := time.Now()
 
 	// Always expires
 	dl := types.DownloadLink{
 		Filename:     file.Name,
 		Size:         file.Size,
-		Token:        tb.APIKey,
+		Token:        account.Token,
 		Link:         file.Link,
 		DownloadLink: downloadURL,
 		Debrid:       tb.config.Name,

@@ -148,6 +148,24 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	return c.client.Do(retryReq)
 }
 
+// DoOnce uses the configured transport, headers, limiter, and throttle without
+// the retry client's status retry loop. It is used for scarce requestdl calls:
+// a retry must not spend another budget admission for the same link attempt.
+func (c *Client) DoOnce(req *http.Request) (*http.Response, error) {
+	c.headersMu.RLock()
+	for key, value := range c.headers {
+		req.Header.Set(key, value)
+	}
+	c.headersMu.RUnlock()
+	if c.rateLimiter != nil && c.throttle == nil {
+		if err := req.Context().Err(); err != nil {
+			return nil, err
+		}
+		c.rateLimiter.Take()
+	}
+	return c.httpClient.Do(req)
+}
+
 // MakeRequest performs an HTTP request and returns the response body as bytes
 func (c *Client) MakeRequest(req *http.Request) ([]byte, error) {
 	res, err := c.Do(req)
