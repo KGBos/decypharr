@@ -44,6 +44,7 @@ type Torbox struct {
 	autoExpiresLinksAfter time.Duration
 	client                *request.Client
 	submitClient          *request.Client
+	throttle              *request.Throttle
 	logger                zerolog.Logger
 	Profile               *types.Profile
 	config                config.Debrid
@@ -54,6 +55,10 @@ type Torbox struct {
 
 func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, error) {
 	cfg := config.Get()
+	backoffMax, cooldown, readWait, threshold, err := throttleConfig(dc)
+	if err != nil {
+		return nil, err
+	}
 	headers := map[string]string{
 		"Authorization": fmt.Sprintf("Bearer %s", dc.APIKey),
 	}
@@ -63,13 +68,17 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 		headers["User-Agent"] = fmt.Sprintf("Decypharr/%s (%s; %s)", version.GetInfo(), runtime.GOOS, runtime.GOARCH)
 	}
 	_log := logger.New(dc.Name)
+	throttle := request.NewThrottle(threshold, cooldown, backoffMax, _log).WithReadWait(readWait)
+	// One ticker per configured provider for the provider's process lifetime;
+	// it exits with the process, so there is nothing to leak per request.
+	throttle.StartCounterLogging(context.Background(), request.CounterLogInterval)
 
 	// TorBox enforces a hard cap of 300 req/min per API key, applied
 	// synchronously across all servers since v8.4 (Feb 2026, GAP-002).
 	// Default to that limit if the user has not configured one explicitly.
 	mainRL := ratelimits["main"]
 	if mainRL == nil {
-		mainRL = ratelimit.New(300, ratelimit.Per(time.Minute), ratelimit.WithSlack(30))
+		mainRL = ratelimit.New(300, ratelimit.Per(time.Minute), ratelimit.WithoutSlack)
 	}
 	// The cap counts per key, not per workload, so list traffic and submit
 	// traffic authenticated with the same key have to share one bucket. Giving
@@ -90,6 +99,8 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 			request.WithRateLimiter(rateLimiter),
 			request.WithMaxRetries(cfg.Retries),
 			request.WithRetryableStatus(http.StatusTooManyRequests, http.StatusBadGateway),
+			request.WithRetryWait(time.Second, backoffMax),
+			request.WithThrottle(throttle),
 			request.WithLogger(_log),
 		}
 		if dc.Proxy != "" {
@@ -106,11 +117,12 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 	tb := &Torbox{
 		Host:                  "https://api.torbox.app/v1",
 		APIKey:                dc.APIKey,
-		accountsManager:       account.NewManager(dc, submitRL, _log),
+		accountsManager:       account.NewManager(dc, submitRL, _log, request.WithThrottle(throttle), request.WithRetryWait(time.Second, backoffMax)),
 		config:                dc,
 		autoExpiresLinksAfter: autoExpiresLinksAfter,
 		client:                newClient(mainRL),
 		submitClient:          newClient(submitRL),
+		throttle:              throttle,
 		logger:                _log,
 	}
 	return tb, nil
@@ -125,6 +137,48 @@ func onlyUsesKey(downloadKeys []string, apiKey string) bool {
 		}
 	}
 	return true
+}
+
+// RequestThrottle exposes the same provider gate to manager GET/HEAD reads.
+func (tb *Torbox) RequestThrottle() *request.Throttle { return tb.throttle }
+
+// maxThrottleDuration bounds even malformed server advice while allowing a
+// genuine multi-hour TorBox ban (observed up to >24h) to be honored.
+const maxThrottleDuration = 48 * time.Hour
+
+// Durations may be configured up to 48h so a long ban can be honored rather
+// than truncated to the previous 15m ceiling. The read-wait threshold is
+// bounded much lower: it is how long a read blocks, not how long a ban lasts.
+func throttleConfig(dc config.Debrid) (time.Duration, time.Duration, time.Duration, int, error) {
+	backoffMax, cooldown, threshold := 5*time.Minute, time.Minute, 3
+	readWait := request.DefaultReadWait
+	for _, item := range []struct {
+		name, value string
+		dest        *time.Duration
+	}{
+		{"torbox_backoff_max", dc.TorboxBackoffMax, &backoffMax},
+		{"torbox_breaker_cooldown", dc.TorboxBreakerCooldown, &cooldown},
+		{"torbox_read_wait_max", dc.TorboxReadWaitMax, &readWait},
+	} {
+		if item.value == "" {
+			continue
+		}
+		d, err := time.ParseDuration(item.value)
+		if err != nil || d <= 0 || d > maxThrottleDuration {
+			return 0, 0, 0, 0, fmt.Errorf("%s must be a positive duration no greater than 48h", item.name)
+		}
+		*item.dest = d
+	}
+	if readWait < request.MinReadWait || readWait > request.MaxReadWait {
+		return 0, 0, 0, 0, fmt.Errorf("torbox_read_wait_max must be between 1s and 5m")
+	}
+	if dc.TorboxBreakerThreshold != 0 {
+		threshold = dc.TorboxBreakerThreshold
+	}
+	if threshold < 1 || threshold > 100 {
+		return 0, 0, 0, 0, fmt.Errorf("torbox_breaker_threshold must be between 1 and 100")
+	}
+	return backoffMax, cooldown, readWait, threshold, nil
 }
 
 func (tb *Torbox) Config() config.Debrid {
@@ -264,20 +318,6 @@ func (tb *Torbox) IsAvailable(hashes []string) (map[string]bool, error) {
 	return result, nil
 }
 
-func (tb *Torbox) isCachedHash(hash string) (cached bool, ok bool) {
-	var res AvailableResponse
-	resp, err := tb.doGet("/api/torrents/checkcached", map[string]string{"hash": hash}, &res)
-	if err != nil || resp == nil || resp.StatusCode < 200 || resp.StatusCode >= 300 || res.Data == nil {
-		return false, false
-	}
-	for h, c := range *res.Data {
-		if strings.EqualFold(h, hash) && c.Size > 0 {
-			return true, true
-		}
-	}
-	return false, true
-}
-
 func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 	var data AddMagnetResponse
 
@@ -285,23 +325,6 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 		"magnet": torrent.Magnet.Link,
 	}
 	if !torrent.DownloadUncached {
-		hash := torrent.InfoHash
-		if hash == "" && torrent.Magnet != nil {
-			hash = torrent.Magnet.InfoHash
-		}
-		// Never spend TorBox's 60/hour uncached createtorrent budget on content
-		// we would not accept: check the cache first and skip the create call
-		// entirely when the hash is not cached. If the cache check itself
-		// cannot be completed, fall through to the guarded create call.
-		if hash != "" {
-			if cached, ok := tb.isCachedHash(hash); ok && !cached {
-				name := torrent.Name
-				if name == "" {
-					name = hash
-				}
-				return nil, fmt.Errorf("torrent %s is not cached; skipped without submitting (download_uncached=false)", name)
-			}
-		}
 		formData["add_only_if_cached"] = "true"
 	}
 
