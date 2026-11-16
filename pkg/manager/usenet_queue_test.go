@@ -131,3 +131,7 @@ func TestAddNewNZBQueuesBeforeNetworkParsing(t *testing.T) {
 		t.Fatalf("invalid NZB state = %q, want error", failed.State)
 	}
 }
+func TestReportNZBAvailabilityIsSafeWhenHearsayDisabled(t *testing.T) {
+	m := &Manager{}
+	m.reportNZBAvailability("subject", true)
+}

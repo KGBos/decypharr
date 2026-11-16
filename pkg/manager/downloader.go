@@ -794,9 +794,11 @@ func (d *Downloader) localDownloadAttempt(ctx context.Context, download types.Do
 	client := grab.NewClient()
 	client.BufferSize = 1 << 20
 	client.HTTPClient = d.manager.streamClient
-	if provider, ok := d.manager.clients.Load(download.Debrid); ok {
-		if p, ok := provider.(request.ThrottleProvider); ok && p.RequestThrottle() != nil {
-			client.HTTPClient = throttledDownloadClient{client: d.manager.streamClient, gate: p.RequestThrottle()}
+	if d.manager.clients != nil {
+		if provider, ok := d.manager.clients.Load(download.Debrid); ok {
+			if p, ok := provider.(request.ThrottleProvider); ok && p.RequestThrottle() != nil {
+				client.HTTPClient = throttledDownloadClient{client: d.manager.streamClient, gate: p.RequestThrottle()}
+			}
 		}
 	}
 
@@ -836,7 +838,7 @@ func (d *Downloader) localDownloadAttempt(ctx context.Context, download types.Do
 					return e
 				}
 				if grab.IsStatusCodeError(err) && resp.HTTPResponse != nil {
-					return fmt.Errorf("unexpected status %d for %s", resp.HTTPResponse.StatusCode, downloadURL)
+					return fmt.Errorf("unexpected status %d for %s: %w", resp.HTTPResponse.StatusCode, downloadURL, err)
 				}
 				return err
 			}

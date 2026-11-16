@@ -31,6 +31,10 @@ type AddMagnetResponse struct {
 	Error   any            `json:"error"`
 	Detail  string         `json:"detail"`
 	Data    []addedTorrent `json:"data"`
+	// DataWasArray records whether the provider returned an array (true)
+	// or a single object (false). Array responses must match the submitted
+	// hash; a single object response is the torrent itself.
+	DataWasArray bool `json:"-"`
 }
 
 // UnmarshalJSON accepts both the documented object response and the array
@@ -57,6 +61,7 @@ func (r *AddMagnetResponse) UnmarshalJSON(data []byte) error {
 	}
 
 	if raw[0] == '[' {
+		r.DataWasArray = true
 		if err := json.Unmarshal(raw, &r.Data); err != nil {
 			return fmt.Errorf("decode TorBox created torrent array: %w", err)
 		}

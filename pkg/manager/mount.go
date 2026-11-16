@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sourcegraph/conc/pool"
 )

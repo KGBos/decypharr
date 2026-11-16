@@ -338,18 +338,19 @@ func New(options ...ClientOption) *Client {
 		}
 	}
 
-	// Preserve the final HTTP response on exhausted retries instead of discarding it.
+	// On exhausted retries, keep the final response (with its attempts
+	// header) alongside a real error. The old fork behavior returned the
+	// response with a nil error, which broke the generic contract that a
+	// retryable final response is an error; callers that need the body
+	// (TorBox create) handle the response-plus-error pair themselves.
 	retryClient.ErrorHandler = func(resp *http.Response, err error, numTries int) (*http.Response, error) {
-		if resp != nil {
-			if resp.Header != nil && numTries > 0 {
-				resp.Header.Set("X-Decypharr-Attempts", strconv.Itoa(numTries))
-			}
-			return resp, err
+		if resp != nil && resp.Header != nil && numTries > 0 {
+			resp.Header.Set("X-Decypharr-Attempts", strconv.Itoa(numTries))
 		}
 		if err == nil {
-			return nil, fmt.Errorf("giving up after %d attempt(s)", numTries)
+			return resp, fmt.Errorf("giving up after %d attempt(s)", numTries)
 		}
-		return nil, fmt.Errorf("giving up after %d attempt(s): %w", numTries, err)
+		return resp, fmt.Errorf("giving up after %d attempt(s): %w", numTries, err)
 	}
 
 	// Custom retry policy based on retryable status codes
@@ -372,21 +373,15 @@ func New(options ...ClientOption) *Client {
 			return false, err
 		}
 
-		// First use the default retry policy for error handling
-		// This handles the case when resp is nil (network errors)
-		shouldRetry, defaultErr := retryablehttp.DefaultRetryPolicy(ctx, resp, err)
-		if defaultErr != nil {
-			return false, defaultErr
+		// Transport errors (no response) use the default policy. HTTP
+		// responses use ONLY the configured status list, so a provider
+		// status that is not listed (e.g. TorBox 509) is preserved as a
+		// response instead of being retried by the default 5xx rule.
+		if err != nil || resp == nil {
+			return retryablehttp.DefaultRetryPolicy(ctx, resp, err)
 		}
-		if shouldRetry {
+		if _, ok := client.retryableStatus[resp.StatusCode]; ok {
 			return true, nil
-		}
-
-		// Check for retryable status codes (only if resp is not nil)
-		if resp != nil {
-			if _, ok := client.retryableStatus[resp.StatusCode]; ok {
-				return true, nil
-			}
 		}
 
 		return false, nil

@@ -169,6 +169,15 @@ func (m *Manager) processNZB(ctx context.Context, entry *storage.Entry, metadata
 	return nil
 }
 
+// reportNZBAvailability records an NZB result when Hearsay is available.
+// Hearsay is optional and may be nil when it is disabled or failed to initialize.
+func (m *Manager) reportNZBAvailability(subject string, complete bool) {
+	if m.hearsay == nil {
+		return
+	}
+	m.hearsay.ReportNZB(subject, complete)
+}
+
 // processNewNzb processes a new NZB entry after it has been added to the usenet client
 func (m *Manager) processNewNzb(parentCtx context.Context, entry *storage.Entry, metadata *storage.NZB, groups map[string]*parser.FileGroup) error {
 	// Create context with timeout for processing
@@ -189,11 +198,11 @@ func (m *Manager) processNewNzb(parentCtx context.Context, entry *storage.Entry,
 			return fmt.Errorf("usenet processing timed out after %s: %w", m.usenetTimeout, err)
 		}
 		if errors.Is(err, customerror.UsenetSegmentMissingError) {
-			m.hearsay.ReportNZB(hearsaySubject, false)
+			m.reportNZBAvailability(hearsaySubject, false)
 		}
 		return fmt.Errorf("failed to process nzb: %w", err)
 	}
-	m.hearsay.ReportNZB(hearsaySubject, true)
+	m.reportNZBAvailability(hearsaySubject, true)
 
 	metadata = updatedNZB
 	return m.processNZB(ctx, entry, metadata)

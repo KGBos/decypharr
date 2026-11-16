@@ -388,7 +388,8 @@ func TestSubmissionRequestsUseDedicatedClient(t *testing.T) {
 	)
 
 	torrent := &types.Torrent{
-		Magnet: &utils.Magnet{Link: "magnet:?xt=urn:btih:ABC"},
+		DownloadUncached: true,
+		Magnet:           &utils.Magnet{Link: "magnet:?xt=urn:btih:ABC"},
 	}
 	added, err := tb.SubmitMagnet(torrent)
 	if err != nil {
@@ -651,8 +652,9 @@ func TestSubmitMagnetAcceptsObjectAndArrayResponses(t *testing.T) {
 			t.Cleanup(server.Close)
 
 			torrent, err := testTorbox(server.URL).SubmitMagnet(&types.Torrent{
-				InfoHash: "abc",
-				Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:abc"},
+				InfoHash:         "abc",
+				DownloadUncached: true,
+				Magnet:           &utils.Magnet{Link: "magnet:?xt=urn:btih:abc"},
 			})
 			if err != nil {
 				t.Fatalf("SubmitMagnet() error = %v", err)
@@ -688,7 +690,7 @@ func TestSubmitMagnetSkipsUncachedWithoutSubmitting(t *testing.T) {
 		Magnet:   &utils.Magnet{Link: "magnet:?xt=urn:btih:AABBCC"},
 	}
 	_, err := testTorbox(server.URL).SubmitMagnet(torrent)
-	if err == nil || !strings.Contains(err.Error(), "not cached") {
+	if err == nil || !strings.Contains(err.Error(), "DOWNLOAD_NOT_CACHED") {
 		t.Fatalf("SubmitMagnet() error = %v, want not-cached skip", err)
 	}
 	if createCalls != 0 {
