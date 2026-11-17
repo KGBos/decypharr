@@ -49,12 +49,12 @@ func TestLocalDownloadSharesProviderGate(t *testing.T) {
 	d := &Downloader{manager: &Manager{ctx: context.Background(), clients: clients, streamClient: server.Client()}, logger: zerolog.Nop()}
 	dl := types.DownloadLink{Debrid: "torbox", DownloadLink: server.URL}
 	destination := filepath.Join(t.TempDir(), "file")
-	err = d.localDownloader(dl, destination, nil, nil)
+	err = d.localDownloader(context.Background(), dl, destination, nil, nil)
 	if request.BackpressureError(err) == nil {
 		t.Fatalf("local GET did not report throttle: %v", err)
 	}
 	before := calls.Load()
-	err = d.localDownloader(dl, destination, nil, nil)
+	err = d.localDownloader(context.Background(), dl, destination, nil, nil)
 	// A short cooldown is now waited out on the read path, so this re-enters
 	// the provider (proving it shares the gate rather than bypassing it) and
 	// reports the fresh 429 while the server is still failing.
@@ -63,7 +63,7 @@ func TestLocalDownloadSharesProviderGate(t *testing.T) {
 	}
 	time.Sleep(1100 * time.Millisecond)
 	fail.Store(false)
-	if err = d.localDownloader(dl, destination, nil, nil); err != nil {
+	if err = d.localDownloader(context.Background(), dl, destination, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(destination)

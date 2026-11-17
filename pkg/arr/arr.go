@@ -15,11 +15,12 @@ import (
 type Type string
 
 const (
-	Sonarr  Type = "sonarr"
-	Radarr  Type = "radarr"
-	Lidarr  Type = "lidarr"
-	Readarr Type = "readarr"
-	Others  Type = "others"
+	Sonarr   Type = "sonarr"
+	Radarr   Type = "radarr"
+	Lidarr   Type = "lidarr"
+	Readarr  Type = "readarr"
+	Prowlarr Type = "prowlarr"
+	Others   Type = "others"
 )
 
 type Source string
@@ -129,6 +130,7 @@ func (a Arr) toConfig() config.Arr {
 
 // inferType guesses from the name and host. Probe resolves it for certain.
 func inferType(host, name string) Type {
+	host, name = strings.ToLower(host), strings.ToLower(name)
 	switch {
 	case strings.Contains(host, "sonarr") || strings.Contains(name, "sonarr"):
 		return Sonarr
@@ -138,6 +140,8 @@ func inferType(host, name string) Type {
 		return Lidarr
 	case strings.Contains(host, "readarr") || strings.Contains(name, "readarr"):
 		return Readarr
+	case strings.Contains(host, "prowlarr") || strings.Contains(name, "prowlarr"):
+		return Prowlarr
 	default:
 		return Others
 	}
@@ -153,6 +157,8 @@ func typeFromAppName(appName string) Type {
 		return Lidarr
 	case "readarr":
 		return Readarr
+	case "prowlarr":
+		return Prowlarr
 	default:
 		return Others
 	}

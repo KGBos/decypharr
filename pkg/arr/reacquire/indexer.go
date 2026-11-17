@@ -38,6 +38,8 @@ type ManagedCatalog interface {
 type bindingWriter interface {
 	UpsertBinding(Binding) error
 	ReplaceArrGeneration(string, uint64, []Binding) error
+	// BindingOwner returns the Arr that holds the managed file, if any.
+	BindingOwner(entryID, fileID string) (string, bool)
 }
 
 type indexRequest struct {
@@ -265,6 +267,11 @@ func (i *Indexer) handleRefresh(ctx context.Context, request indexRequest) {
 	failed := false
 	indexed, arrs := 0, 0
 	for _, instance := range i.arrs.All() {
+		// A name or host that does not reveal the app leaves the type
+		// unknown until the Arr is asked.
+		if instance.Type == arr.Others {
+			instance.Type = i.arrs.ResolveType(ctx, instance.Name)
+		}
 		if instance.Type != arr.Sonarr && instance.Type != arr.Radarr {
 			continue
 		}
@@ -305,6 +312,9 @@ func (i *Indexer) handleArrRefresh(ctx context.Context, request indexRequest) {
 	if !ok {
 		i.logger.Warn().Str("arr", request.arrName).Msg("Arr index refresh skipped: instance not found")
 		return
+	}
+	if instance.Type == arr.Others {
+		instance.Type = i.arrs.ResolveType(ctx, instance.Name)
 	}
 	if instance.Type != arr.Sonarr && instance.Type != arr.Radarr {
 		return
@@ -426,6 +436,16 @@ func (i *Indexer) reconcile(ctx context.Context, instance arr.Arr, request index
 	generation := uint64(time.Now().UnixMilli()) + i.generationSequence.Add(1)
 	matches, stats := matchLibraryFiles(library, managed, i.managedRoot)
 	bindings := bindingsFromMatches(instance, generation, matches)
+	// A managed file bound to another Arr (a renamed instance, or two
+	// instances on one server) is skipped instead of failing the generation.
+	bindings = slices.DeleteFunc(bindings, func(binding Binding) bool {
+		owner, ok := i.writer.BindingOwner(binding.EntryID, binding.EntryFileID)
+		if ok && owner != instance.Name {
+			stats.foreignOwner++
+			return true
+		}
+		return false
+	})
 	if entryID == "" {
 		if err := i.writer.ReplaceArrGeneration(instance.Name, generation, bindings); err != nil {
 			return stats, err

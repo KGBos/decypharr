@@ -104,6 +104,7 @@ var (
 
 // HTTP error sentinels
 var (
+	Err400 = errors.New("HTTP 400 Bad Request")
 	Err404 = errors.New("HTTP 404 Not Found")
 	Err429 = errors.New("HTTP 429 Too Many Requests")
 	Err503 = errors.New("HTTP 503 Service Unavailable")
@@ -112,9 +113,6 @@ var (
 	// nature: the link itself is not known to be bad, so it is retryable and
 	// survives for a later validation instead of poisoning the link memo.
 	Err5xx = errors.New("HTTP 5xx: provider server error")
-	// ErrLinkRejected is a 400 from the provider/CDN, which in practice means
-	// the presigned link expired or rotated rather than a malformed request.
-	ErrLinkRejected = errors.New("HTTP 400: link rejected")
 )
 
 // NewLinkError creates a new LinkError with the given error and category
@@ -192,18 +190,17 @@ func ErrorCodeToLinkError(code string) *Error {
 		return NewRefetchableError(ErrInvalidDownloadCode, code)
 	case "401", "unauthorized":
 		return NewPermanentError(ErrUnauthorized, code)
+	case "400":
+		// TorBox answers 400 for a link that is not ready yet.
+		return NewRefetchableError(Err400, code)
+	case "403", "410":
+		// Signed CDN links (e.g. Premiumize) expire with 403/410; a fresh
+		// link for the same file works.
+		return NewRefetchableError(ErrLinkExpired, code)
 	case "404":
 		return NewPermanentError(Err404, code)
 	case "429":
 		return NewRetryableError(Err429, code)
-	// Some providers (TorBox) return a bare 400 for a presigned link that has
-	// expired or rotated. ClassifyStreamStatus already treats 400 at the CDN
-	// layer as refetchable; the provider-API path must agree, otherwise a stale
-	// link is classified permanent, fast-trips the VFS circuit breaker
-	// (errorCount = maxErrorCount) and the file reads 0 bytes until cooldown
-	// instead of simply refetching the link.
-	case "400":
-		return NewRefetchableError(ErrLinkRejected, code)
 	// 5xx responses are provider/CDN failures, not evidence about the link:
 	// the same cached link usually validates once the provider recovers. They
 	// must never be memoised as permanent (see fetchAndValidate): a single

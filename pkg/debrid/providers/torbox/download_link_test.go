@@ -134,3 +134,98 @@ func TestPlaybackRedactsTransportURL(t *testing.T) {
 		t.Fatalf("transport error leaked token: %v", err)
 	}
 }
+
+// cdnServer answers every requestdl call with a CDN URL and counts the calls.
+func cdnServer(t *testing.T, calls *atomic.Int64) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = fmt.Fprint(w, `{"success":true,"data":"https://cdn.example.test/movie"}`)
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// budgetTorbox is playbackTorbox with a budget generous enough that the
+// default call spacing does not slow tests that make several resolutions.
+func budgetTorbox(t *testing.T, host string, expiry time.Duration) *Torbox {
+	t.Helper()
+	config.SetConfigPath(t.TempDir())
+	tb, err := New(config.Debrid{Name: "torbox-test", Provider: "torbox", APIKey: "main-key", DownloadAPIKeys: []string{"private-download-token"}, RequestdlBudget: "6000/minute", TorboxBackoffMax: "20ms", RequestdlFreezeMax: "20ms"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb.Host = host
+	tb.autoExpiresLinksAfter = expiry
+	return tb
+}
+
+func lanes(tb *Torbox) request.RequestdlStats { return tb.RequestdlStats().(request.RequestdlStats) }
+
+// Repair and health probes call GetDownloadLink. They must get the cheap
+// placeholder without touching the network or the requestdl budget.
+func TestProbeLookupsSpendNoRequestdlBudget(t *testing.T) {
+	var calls atomic.Int64
+	server := cdnServer(t, &calls)
+	tb := playbackTorbox(t, server.URL, time.Hour)
+	for _, id := range []string{"2", "3"} {
+		file := &types.File{Id: id, Link: "torbox://1/" + id, Name: "movie" + id}
+		for range 3 {
+			dl, err := tb.GetDownloadLink(context.Background(), "1", file)
+			if err != nil || !strings.HasPrefix(dl.DownloadLink, server.URL+requestdlPath+"?") || !strings.Contains(dl.DownloadLink, "redirect=true") {
+				t.Fatalf("probe link=%q err=%v, want the redirect placeholder", dl.DownloadLink, err)
+			}
+		}
+	}
+	if s := lanes(tb); calls.Load() != 0 || s.RequestsPlayback != 0 || s.RequestsBackground != 0 {
+		t.Fatalf("probe spent requestdl: wire=%d stats=%+v", calls.Load(), s)
+	}
+}
+
+// The admission lane follows the caller's class: playback is charged to the
+// playback lane, unclassified (bulk) work to the background lane.
+func TestPlaybackResolutionIsChargedToTheCallersLane(t *testing.T) {
+	var calls atomic.Int64
+	server := cdnServer(t, &calls)
+	tb := budgetTorbox(t, server.URL, time.Hour)
+	if _, err := tb.GetDownloadLinkForPlayback(request.WithClass(context.Background(), request.ClassPlayback), "1", &types.File{Id: "2", Link: "torbox://1/2", Name: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	if s := lanes(tb); s.RequestsPlayback != 1 || s.RequestsBackground != 0 {
+		t.Fatalf("playback call: %+v", s)
+	}
+	if _, err := tb.GetDownloadLinkForPlayback(context.Background(), "1", &types.File{Id: "3", Link: "torbox://1/3", Name: "b"}); err != nil {
+		t.Fatal(err)
+	}
+	if s := lanes(tb); s.RequestsPlayback != 1 || s.RequestsBackground != 1 || calls.Load() != 2 {
+		t.Fatalf("unclassified call: wire=%d stats=%+v", calls.Load(), s)
+	}
+}
+
+// An expired cached CDN URL is replaced by exactly one new budgeted
+// resolution, which is then cached again.
+func TestPlaybackReresolvesOnceAfterCDNExpiry(t *testing.T) {
+	var calls atomic.Int64
+	server := cdnServer(t, &calls)
+	tb := budgetTorbox(t, server.URL, time.Hour)
+	file := &types.File{Id: "2", Link: "torbox://1/2", Name: "movie", Size: 20}
+	play := request.WithClass(context.Background(), request.ClassPlayback)
+
+	dl, err := tb.GetDownloadLinkForPlayback(play, "1", file)
+	if err != nil || calls.Load() != 1 {
+		t.Fatalf("first resolve: %v, calls=%d", err, calls.Load())
+	}
+	dl.ExpiresAt = time.Now().Add(-time.Minute)
+	tb.accountsManager.StoreDownloadLink(dl)
+
+	fresh, err := tb.GetDownloadLinkForPlayback(play, "1", file)
+	if err != nil || fresh.DownloadLink != "https://cdn.example.test/movie" || !fresh.ExpiresAt.After(time.Now()) {
+		t.Fatalf("after expiry: link=%q expires=%v err=%v", fresh.DownloadLink, fresh.ExpiresAt, err)
+	}
+	if calls.Load() != 2 || lanes(tb).RequestsPlayback != 2 {
+		t.Fatalf("expiry cost: wire=%d stats=%+v, want exactly one more resolution", calls.Load(), lanes(tb))
+	}
+	if _, err := tb.GetDownloadLinkForPlayback(play, "1", file); err != nil || calls.Load() != 2 {
+		t.Fatalf("fresh link not cached: %v, calls=%d", err, calls.Load())
+	}
+}
