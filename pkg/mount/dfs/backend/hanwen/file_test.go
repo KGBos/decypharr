@@ -33,6 +33,36 @@ func TestNewFileChoosesStableFallbackTime(t *testing.T) {
 	}
 }
 
+func TestNewFileFallbackTimeIsStableAcrossRebuilds(t *testing.T) {
+	// A scan re-probes a file when the mtime it reads differs from the stored
+	// one, and the FUSE node is rebuilt whenever the kernel drops the inode.
+	// Rebuilding the node must therefore never change the mtime (#1027).
+	info := &manager.FileInfo{}
+	first := NewFile(nil, &config.FuseConfig{}, info, &logger.RateLimitedLogger{})
+	time.Sleep(2 * time.Second)
+	second := NewFile(nil, &config.FuseConfig{}, info, &logger.RateLimitedLogger{})
+
+	if !first.createdAt.Equal(second.createdAt) {
+		t.Fatalf("rebuilt node mtime = %v, want stable %v",
+			second.createdAt, first.createdAt)
+	}
+	if !first.createdAt.Equal(fallbackModTime) {
+		t.Fatalf("fallback mtime = %v, want fixed %v", first.createdAt, fallbackModTime)
+	}
+
+	var firstAttr, secondAttr fuse.AttrOut
+	if errno := first.Getattr(context.Background(), nil, &firstAttr); errno != 0 {
+		t.Fatalf("first Getattr failed: %v", errno)
+	}
+	if errno := second.Getattr(context.Background(), nil, &secondAttr); errno != 0 {
+		t.Fatalf("second Getattr failed: %v", errno)
+	}
+	if firstAttr.Mtime != secondAttr.Mtime || firstAttr.Mtime != uint64(fallbackModTime.Unix()) {
+		t.Fatalf("Getattr mtime = %d then %d, want %d both times",
+			firstAttr.Mtime, secondAttr.Mtime, fallbackModTime.Unix())
+	}
+}
+
 func TestHandleKeepsMetadataSnapshot(t *testing.T) {
 	initial := testRemoteFileInfo(t, 128, time.Now().Add(-time.Hour))
 	replacement := testRemoteFileInfo(t, 256, time.Now())

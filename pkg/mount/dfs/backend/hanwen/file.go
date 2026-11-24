@@ -33,13 +33,20 @@ var (
 	_ = (fs.NodeGetattrer)((*File)(nil))
 )
 
+// fallbackModTime is the mtime a file gets when the provider reports none.
+// It is a fixed instant on purpose. The FUSE node is rebuilt whenever the
+// kernel drops the inode (attribute-cache expiry, a Decypharr restart, a
+// replacement), so a fallback of time.Now() gave such a file a new mtime on
+// every rebuild; Jellyfin then saw it as changed, discarded the extracted
+// media info and re-probed it, and a full scan of those re-probes saturated
+// the shared /requestdl budget (incident #1027).
+var fallbackModTime = time.Unix(0, 0).UTC()
+
 // NewFile creates a new file
 func NewFile(vfsManager *vfs.Manager, config *config.FuseConfig, info *manager.FileInfo, rl *logger.RateLimitedLogger) *File {
 	createdAt := info.ModTime()
 	if createdAt.IsZero() {
-		// Choose the fallback once when the node is created. Recomputing it in
-		// Getattr would change ctime and mtime whenever the attr cache expires.
-		createdAt = time.Now()
+		createdAt = fallbackModTime
 	}
 
 	file := &File{
