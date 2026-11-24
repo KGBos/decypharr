@@ -82,6 +82,20 @@ func WithClass(ctx context.Context, class Class) context.Context {
 	return context.WithValue(ctx, classContextKey{}, class.normalized())
 }
 
+// WithDefaultClass tags ctx as class only when it carries no lane yet. Use it
+// where a layer would otherwise stamp its own lane over a caller that already
+// knows better: the mount tags each read from the process that issued it, and
+// the session and link layers must not turn an ffprobe read back into playback
+// (incident #1027).
+func WithDefaultClass(ctx context.Context, class Class) context.Context {
+	if ctx != nil {
+		if _, ok := ctx.Value(classContextKey{}).(Class); ok {
+			return ctx
+		}
+	}
+	return WithClass(ctx, class)
+}
+
 // ClassOf returns the priority lane tagged on ctx, defaulting to background.
 func ClassOf(ctx context.Context) Class {
 	if ctx != nil {

@@ -811,8 +811,8 @@ func (m *Manager) OpenStreamForFile(ctx context.Context, info *FileInfo, offset 
 }
 
 func (m *Manager) openSession(ctx context.Context, entry *storage.Entry, filename string, offset int64, owner RewindOwner) (*session, string, string, error) {
-	// Every stream opening serves a media reader, so it is tagged playback: the shared /requestdl budget admits it ahead of background work.
-	ctx = request.WithClass(ctx, request.ClassPlayback)
+	// A stream opening serves a media reader, so it defaults to playback: the shared /requestdl budget admits it ahead of background work. The mount tags a read from the process that issued it first, and that tag is kept as-is so an ffprobe read stays a probe (#1027).
+	ctx = request.WithDefaultClass(ctx, request.ClassPlayback)
 	file, ok := entry.Files[filename]
 	if !ok {
 		return nil, "", "", fmt.Errorf("file %s not found in entry %s", filename, entry.Name)
