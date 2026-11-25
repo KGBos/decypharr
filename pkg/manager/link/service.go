@@ -321,12 +321,14 @@ func (s *Service) fetchLink(ctx context.Context, entry *storage.Entry, filename 
 	}
 
 	// TorBox resolves its requestdl placeholder with the caller's playback
-	// context. Its plain GetDownloadLink remains free of network calls for repair.
+	// context, unless the caller already tagged its lane (the mount tags
+	// ffprobe reads as probe work). Its plain GetDownloadLink remains free of
+	// network calls for repair.
 	var downloadLink types.DownloadLink
 	if playback, ok := client.(interface {
 		GetDownloadLinkForPlayback(context.Context, string, *types.File) (types.DownloadLink, error)
 	}); ok {
-		downloadLink, err = playback.GetDownloadLinkForPlayback(request.WithClass(ctx, request.ClassPlayback), placement.ID, debridFile)
+		downloadLink, err = playback.GetDownloadLinkForPlayback(request.WithDefaultClass(ctx, request.ClassPlayback), placement.ID, debridFile)
 	} else {
 		downloadLink, err = client.GetDownloadLink(ctx, placement.ID, debridFile)
 	}

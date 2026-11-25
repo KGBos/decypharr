@@ -40,6 +40,25 @@ func TestClassContextTagging(t *testing.T) {
 	}
 }
 
+func TestWithDefaultClassKeepsExplicitClass(t *testing.T) {
+	// Layers that default to playback must not overwrite a lane a caller set.
+	probe := WithDefaultClass(WithClass(context.Background(), ClassProbe), ClassPlayback)
+	if got := ClassOf(probe); got != ClassProbe {
+		t.Fatalf("explicit probe class became %v under a playback default", got)
+	}
+	background := WithDefaultClass(WithClass(context.Background(), ClassBackground), ClassPlayback)
+	if got := ClassOf(background); got != ClassBackground {
+		t.Fatalf("explicit background class became %v under a playback default", got)
+	}
+	untagged := WithDefaultClass(context.Background(), ClassPlayback)
+	if got := ClassOf(untagged); got != ClassPlayback {
+		t.Fatalf("untagged context defaulted to %v, want playback", got)
+	}
+	if WithDefaultClass(nil, ClassPlayback) == nil {
+		t.Fatal("WithDefaultClass(nil) returned nil context")
+	}
+}
+
 func newTestLimiter(t *testing.T, ratePerMinute float64, ramp, maxBackoff time.Duration, now *time.Time) *RequestdlLimiter {
 	t.Helper()
 	l := NewRequestdlLimiter(ratePerMinute, ramp, maxBackoff, DefaultRequestdlFreezeMax, zerolog.Nop())
@@ -292,6 +311,55 @@ func TestRequestdlPriorityPlaybackWins(t *testing.T) {
 
 	wg.Wait()
 	if stats := l.Snapshot(); stats.RequestsPlayback != 1 || stats.RequestsBackground != background {
+		t.Fatalf("class counters wrong: %+v", stats)
+	}
+}
+
+func TestRequestdlProbeLaneYieldsToPlayback(t *testing.T) {
+	// The incident #1027 shape: a library scan saturates the budget with
+	// probes (60 queued), and a viewer's read must still be admitted within
+	// one token interval instead of behind all of them.
+	l := NewRequestdlLimiter(600, 0, time.Minute, DefaultRequestdlFreezeMax, zerolog.Nop())
+	l.mu.Lock()
+	l.burst = 1
+	l.tokens = 0
+	l.last = time.Now()
+	l.mu.Unlock()
+
+	const probes = 60
+	var probeDone atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < probes; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := l.Take(context.Background(), ClassProbe); err == nil {
+				probeDone.Add(1)
+			}
+		}()
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	playbackStart := time.Now()
+	playbackErr := make(chan error, 1)
+	go func() { playbackErr <- l.Take(context.Background(), ClassPlayback) }()
+	select {
+	case err := <-playbackErr:
+		if err != nil {
+			t.Fatalf("playback admission: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("playback starved by probe work")
+	}
+	if elapsed := time.Since(playbackStart); elapsed > 400*time.Millisecond {
+		t.Fatalf("playback waited %s behind probe work", elapsed)
+	}
+	if served := probeDone.Load(); served >= probes {
+		t.Fatalf("probes drained (%d) before playback was served", served)
+	}
+
+	wg.Wait()
+	if stats := l.Snapshot(); stats.RequestsPlayback != 1 || stats.RequestsProbe != probes {
 		t.Fatalf("class counters wrong: %+v", stats)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/sirrobot01/decypharr/internal/logger"
+	"github.com/sirrobot01/decypharr/internal/request"
 	"github.com/sirrobot01/decypharr/pkg/manager"
 	"github.com/sirrobot01/decypharr/pkg/mount/dfs/vfs"
 )
@@ -50,6 +51,12 @@ func (fh *Handle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadRe
 	if fh.streamFile == nil {
 		return nil, syscall.EIO
 	}
+
+	// A read that has to fetch a download link takes a token from the shared
+	// /requestdl budget. Tag it with the lane of the process that issued it:
+	// Jellyfin's scan ffprobes are probe work and must queue behind a viewer,
+	// not in front of one (incident #1027).
+	ctx = request.WithClass(ctx, readClass(ctx))
 
 	if off >= fh.streamFile.Size() {
 		return fuse.ReadResultData([]byte{}), 0
