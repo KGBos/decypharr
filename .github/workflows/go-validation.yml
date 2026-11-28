@@ -16,10 +16,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install FUSE headers
+      - name: Install FUSE dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y libfuse-dev
+          sudo apt-get install --no-install-recommends -y libfuse-dev fuse3
 
       - uses: actions/setup-node@v4
         with:
@@ -42,15 +42,27 @@ jobs:
       - name: Build all packages
         run: go build ./...
 
-      - name: Test critical packages
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test all packages
+        run: go test -timeout 10m ./...
+
+      - name: Race-test provider admission and playback
         run: >-
-          go test
-          ./pkg/debrid/providers/torbox
+          go test -race -timeout 10m
           ./internal/request
-          ./pkg/manager
+          ./pkg/debrid/account
+          ./pkg/debrid/providers/torbox
           ./pkg/manager/link
-          ./pkg/strm
-          ./pkg/mount/dfs
           ./pkg/mount/dfs/backend/hanwen
-          ./pkg/mount/dfs/vfs
-          ./pkg/repair
+
+      - name: Isolated FUSE lifecycle test
+        run: |
+          if [[ ! -c /dev/fuse ]]; then
+            echo "::warning::Real FUSE lifecycle acceptance skipped: runner has no /dev/fuse."
+            exit 0
+          fi
+          go test -c -o "$RUNNER_TEMP/hanwen.test" ./pkg/mount/dfs/backend/hanwen
+          sudo env DECYPHARR_FUSE_TEST=1 unshare --mount --propagation private \
+            "$RUNNER_TEMP/hanwen.test" -test.run '^TestFUSEDelayedCleanupPreservesReplacement$' -test.v

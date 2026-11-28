@@ -19,7 +19,7 @@ Merge upstream main `3a0e0e23de153c70b2d441e14a7828b29f6e8391` into fork master 
 | Torrent-list freshness/pagination | Superseded | Upstream equivalent fresh paginated list implementation. |
 | Provider/cache-check errors | Fixed | HTTP/provider/null/decode failures remain errors, omit unknown verdicts and cannot populate negative cache; typed deterministic miss replaces string matching. |
 | STRM action | Superseded | Upstream removes the old action and exports through the dedicated STRM reconciliation service. |
-| Configuration and image publishing | Retained | Fork keys/defaults and release workflows remain; new Validate workflow does not publish. |
+| Configuration and image publishing | Retained | Fork keys/defaults and release workflows remain; the Go validation workflow does not publish. |
 
 ## Validation
 
@@ -34,4 +34,4 @@ On macOS with the repository-supported Go 1.26.5:
 
 Regression coverage includes matching/nonmatching create arrays, stale completion flags, refreshed queued files, expired CDN links, transient failures, long and deadline-less 429s, shared admission, cancellation, slow streams, cache-warm limits, and delayed mount ownership cleanup.
 
-The Linux Validate job runs the full suite, targeted race tests, vet, both binary builds and isolated FUSE lifecycle acceptance when `/dev/fuse` exists. A skipped real-FUSE test is a limitation, not live mount acceptance. No production action or deployment is included. No formal reviewer approval is claimed while the PR is draft.
+The Linux Go validation job runs the full suite, targeted race tests, vet, the package builds and isolated FUSE lifecycle acceptance when `/dev/fuse` exists. A skipped real-FUSE test is a limitation, not live mount acceptance. No production action or deployment is included. No formal reviewer approval is claimed while the PR is draft.
