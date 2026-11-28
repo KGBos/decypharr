@@ -837,6 +837,10 @@ func (d *Downloader) localDownloadAttempt(ctx context.Context, download types.Do
 				if e := request.BackpressureError(err); e != nil {
 					return e
 				}
+				if gated, ok := client.HTTPClient.(throttledDownloadClient); ok &&
+					resp.HTTPResponse != nil && resp.HTTPResponse.StatusCode == http.StatusTooManyRequests {
+					return &request.ThrottleError{RetryAfter: gated.gate.Remaining()}
+				}
 				if grab.IsStatusCodeError(err) && resp.HTTPResponse != nil {
 					return fmt.Errorf("unexpected status %d for %s: %w", resp.HTTPResponse.StatusCode, downloadURL, err)
 				}
@@ -848,6 +852,11 @@ func (d *Downloader) localDownloadAttempt(ctx context.Context, download types.Do
 }
 
 func isRetryableDownloadError(err error) bool {
+	// The shared gate owns provider backpressure. A local retry loop must not
+	// wait and re-submit independently during the provider's penalty window.
+	if request.BackpressureError(err) != nil {
+		return false
+	}
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}

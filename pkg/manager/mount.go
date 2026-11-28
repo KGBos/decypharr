@@ -2,13 +2,13 @@ package manager
 
 import (
 	"context"
-	"github.com/sirrobot01/decypharr/internal/config"
 	"io"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sourcegraph/conc/pool"
 )
@@ -63,8 +63,8 @@ func (m *Manager) RefreshMount() error {
 // cacheWarmMaxWorkers returns the process-wide cache-warm slot cap from
 // config, falling back to DefaultCacheWarmWorkers when unset.
 func (m *Manager) cacheWarmMaxWorkers() int {
-	if m != nil && m.config != nil && m.config.MaxCacheWarmWorkers > 0 {
-		return m.config.MaxCacheWarmWorkers
+	if workers := config.Get().MaxCacheWarmWorkers; workers > 0 {
+		return workers
 	}
 	return config.DefaultCacheWarmWorkers
 }
@@ -159,7 +159,7 @@ func (m *Manager) WarmFileCache(filePaths []string) error {
 
 	for _, fp := range media {
 		p.Go(func() {
-			gate.acquire(max)
+			gate.acquire(m.cacheWarmMaxWorkers())
 			defer gate.release()
 			ctx, cancel := context.WithTimeout(context.Background(), CacheWarmTimeout)
 			defer cancel()

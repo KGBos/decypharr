@@ -233,7 +233,7 @@ func TestSubmitMagnetCachePreflight(t *testing.T) {
 		wantError        string
 	}{
 		{name: "uncached", checkBody: `{"success":true,"data":{}}`, wantError: "DOWNLOAD_NOT_CACHED", wantChecks: 1},
-		{name: "uncached null", checkBody: `{"success":true,"data":null}`, wantError: "DOWNLOAD_NOT_CACHED", wantChecks: 1},
+		{name: "missing cache data", checkBody: `{"success":true,"data":null}`, wantError: "no data", wantChecks: 1},
 		{name: "cached", checkBody: `{"success":true,"data":{"aabbcc":{"hash":"AABBCC","size":100}}}`, wantChecks: 1, wantCreates: 1},
 		{name: "cache check unavailable", checkStatus: http.StatusBadGateway, wantChecks: 1, wantError: "cache check failed"},
 		{name: "invalid cache result", checkBody: `{"success":false,"data":null}`, wantChecks: 1, wantError: "cache check failed"},

@@ -8,6 +8,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/request"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
@@ -22,6 +23,7 @@ type fileResult struct {
 }
 
 func (r *Service) executeSweep(ctx context.Context, run *storage.RepairRun, opts RunOptions, stopState *repairStopState) {
+	ctx = request.WithClass(ctx, request.ClassProbe)
 	cfg := r.cfg()
 	log := r.logger.With().Str("run_id", run.ID).Logger()
 

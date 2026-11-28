@@ -121,7 +121,7 @@ func TestWarmFileCacheShortPackUsesConfiguredWorkers(t *testing.T) {
 	closeWarmBlock(t, tr)
 	m := &Manager{
 		logger:        zerolog.Nop(),
-		config:        &config.Config{MaxCacheWarmWorkers: 2},
+		config:        cacheWarmTestConfig(t, 2),
 		warmOneFileFn: tr.fn,
 	}
 
@@ -153,7 +153,7 @@ func TestWarmFileCacheSeasonPackIsSerial(t *testing.T) {
 	closeWarmBlock(t, tr)
 	m := &Manager{
 		logger:        zerolog.Nop(),
-		config:        &config.Config{MaxCacheWarmWorkers: 10},
+		config:        cacheWarmTestConfig(t, 10),
 		warmOneFileFn: tr.fn,
 	}
 
@@ -186,7 +186,7 @@ func TestWarmFileCacheSharesBudgetAcrossOverlappingPacks(t *testing.T) {
 	closeWarmBlock(t, tr)
 	m := &Manager{
 		logger:        zerolog.Nop(),
-		config:        &config.Config{MaxCacheWarmWorkers: 2},
+		config:        cacheWarmTestConfig(t, 2),
 		warmOneFileFn: tr.fn,
 	}
 
@@ -236,7 +236,7 @@ func TestWarmFileCacheSkipsNonMedia(t *testing.T) {
 	var warmed atomic.Int32
 	m := &Manager{
 		logger: zerolog.Nop(),
-		config: &config.Config{MaxCacheWarmWorkers: 2},
+		config: cacheWarmTestConfig(t, 2),
 		warmOneFileFn: func(ctx context.Context, path string) error {
 			warmed.Add(1)
 			if path != mkv {
@@ -254,10 +254,37 @@ func TestWarmFileCacheSkipsNonMedia(t *testing.T) {
 }
 
 func TestWarmFileCacheDefaultWorkersWhenConfigUnset(t *testing.T) {
+	cacheWarmTestConfig(t, 0)
 	if got := (&Manager{}).cacheWarmMaxWorkers(); got != config.DefaultCacheWarmWorkers {
 		t.Fatalf("nil config workers = %d, want %d", got, config.DefaultCacheWarmWorkers)
 	}
 	if got := (&Manager{config: &config.Config{}}).cacheWarmMaxWorkers(); got != config.DefaultCacheWarmWorkers {
 		t.Fatalf("zero config workers = %d, want %d", got, config.DefaultCacheWarmWorkers)
+	}
+}
+
+func cacheWarmTestConfig(t *testing.T, workers int) *config.Config {
+	t.Helper()
+	config.Reset()
+	config.SetConfigPath(t.TempDir())
+	t.Cleanup(config.Reset)
+	cfg, err := config.Update(func(cfg *config.Config) error { cfg.MaxCacheWarmWorkers = workers; return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+func TestCacheWarmWorkersReadPublishedSnapshot(t *testing.T) {
+	initial := cacheWarmTestConfig(t, 2)
+	m := &Manager{config: initial}
+	if _, err := config.Update(func(cfg *config.Config) error { cfg.MaxCacheWarmWorkers = 1; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.cacheWarmMaxWorkers(); got != 1 {
+		t.Fatalf("workers=%d; want current snapshot's 1", got)
+	}
+	if initial.MaxCacheWarmWorkers != 2 {
+		t.Fatal("hot update mutated manager's old snapshot")
 	}
 }
