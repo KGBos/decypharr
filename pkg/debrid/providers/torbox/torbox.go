@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/sha256"
+	stdjson "encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -154,7 +155,7 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 	if !onlyUsesKey(dc.DownloadAPIKeys, dc.APIKey) {
 		submitRL = ratelimits["download"]
 		if submitRL == nil {
-			submitRL = ratelimit.New(300, ratelimit.Per(time.Minute), ratelimit.WithSlack(30))
+			submitRL = ratelimit.New(300, ratelimit.Per(time.Minute), ratelimit.WithoutSlack)
 		}
 	}
 
@@ -364,19 +365,19 @@ func (tb *Torbox) getNegativeCache() *NegativeCache {
 	return tb.negativeCache
 }
 
+func (tb *Torbox) submissionClient() *request.Client {
+	if tb.submitClient != nil {
+		return tb.submitClient
+	}
+	return tb.client
+}
+
 func (tb *Torbox) Config() config.Debrid {
 	return tb.config
 }
 
 func (tb *Torbox) Logger() zerolog.Logger {
 	return tb.logger
-}
-
-func (tb *Torbox) submissionClient() *request.Client {
-	if tb.submitClient != nil {
-		return tb.submitClient
-	}
-	return tb.client
 }
 
 // doGet performs a GET request and unmarshals the response
@@ -406,13 +407,14 @@ func (tb *Torbox) doGetWithClient(ctx context.Context, client *request.Client, e
 	return client.DoJSON(req, result)
 }
 
-func (tb *Torbox) doPostFormWithClient(client *request.Client, endpoint string, formData map[string]string, result any) (*http.Response, error) {
+// doPostForm performs a POST request with form data
+func (tb *Torbox) doPostFormWithClient(ctx context.Context, client *request.Client, endpoint string, formData map[string]string, result any) (*http.Response, error) {
 	form := url.Values{}
 	for k, v := range formData {
 		form.Set(k, v)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, tb.Host+endpoint, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tb.Host+endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
 	}
@@ -433,13 +435,17 @@ func (tb *Torbox) doPostFormWithClient(client *request.Client, endpoint string, 
 	defer request.DrainAndClose(resp.Body)
 
 	if result != nil {
-		bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		if readErr == nil && len(bodyBytes) > 0 {
-			if err := json.ConfigDefault.Unmarshal(bodyBytes, result); err != nil {
-				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-					return resp, err
-				}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if err := request.DecodeJSON(resp, result); err != nil {
+				return resp, err
 			}
+		} else {
+			// Preserve the provider error envelope without retaining unbounded bodies.
+			bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			if readErr != nil {
+				return resp, readErr
+			}
+			_ = stdjson.Unmarshal(bodyBytes, result)
 		}
 	}
 
@@ -472,8 +478,9 @@ func (tb *Torbox) IsAvailable(hashes []string) (map[string]bool, error) {
 		if err == nil {
 			return res, nil
 		}
+		return nil, err
 	}
-	return tb.executeCheckCached(hashes)
+	return tb.executeCheckCached(context.Background(), hashes)
 }
 
 func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
@@ -488,42 +495,41 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 	if hash == "" && torrent.Magnet != nil && torrent.Magnet.Link != "" {
 		hash = utils.ExtractInfoHash(torrent.Magnet.Link)
 	}
-	return tb.executeSubmission(torrent, hash)
+	return tb.executeSubmission(context.Background(), torrent, hash)
 }
 
-func (tb *Torbox) executeCheckCached(hashes []string) (map[string]bool, error) {
+func (tb *Torbox) executeCheckCached(ctx context.Context, hashes []string) (map[string]bool, error) {
 	result := make(map[string]bool)
 	negCache := tb.getNegativeCache()
-
 	for i := 0; i < len(hashes); i += 100 {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
 		end := min(i+100, len(hashes))
-
 		validHashes := make([]string, 0, end-i)
 		for _, hash := range hashes[i:end] {
-			if hash != "" {
-				if _, found := negCache.Get(hash); found {
-					continue
-				}
+			if hash == "" {
+				continue
+			}
+			if _, found := negCache.Get(hash); found {
+				result[hash] = false
+			} else {
 				validHashes = append(validHashes, hash)
 			}
 		}
-
 		if len(validHashes) == 0 {
 			continue
 		}
-
-		hashStr := strings.Join(validHashes, ",")
 		var res AvailableResponse
-
-		resp, err := tb.doGet("/api/torrents/checkcached", map[string]string{"hash": hashStr}, &res)
+		resp, err := tb.doGetWithClient(ctx, tb.client, "/api/torrents/checkcached", map[string]string{"hash": strings.Join(validHashes, ",")}, &res)
 		if err != nil {
-			return result, fmt.Errorf("check availability: %w", err)
+			return result, fmt.Errorf("check availability: %w", request.RedactURLError(err))
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return result, fmt.Errorf("check availability: HTTP %d", resp.StatusCode)
 		}
 		if !res.Success {
-			return result, fmt.Errorf("check availability: %v", res.Error)
+			return result, tb.requestdlFailureResponse(resp.StatusCode, res.Error)
 		}
 		cached := make(map[string]bool)
 		if res.Data != nil {
@@ -532,18 +538,18 @@ func (tb *Torbox) executeCheckCached(hashes []string) (map[string]bool, error) {
 			}
 		}
 		for _, h := range validHashes {
-			if cached[strings.ToLower(h)] {
+			result[h] = cached[strings.ToLower(h)]
+			if result[h] {
 				negCache.Evict(h)
 			} else {
 				negCache.Put(h, "DOWNLOAD_NOT_CACHED", 0)
 			}
-			result[h] = cached[strings.ToLower(h)]
 		}
 	}
 	return result, nil
 }
 
-func (tb *Torbox) executeSubmission(torrent *types.Torrent, hash string) (*types.Torrent, error) {
+func (tb *Torbox) executeSubmission(ctx context.Context, torrent *types.Torrent, hash string) (*types.Torrent, error) {
 	var data AddMagnetResponse
 
 	formData := map[string]string{
@@ -561,11 +567,11 @@ func (tb *Torbox) executeSubmission(torrent *types.Torrent, hash string) (*types
 				Str("reason", verdict.Reason).
 				Time("expires_at", verdict.ExpiresAt).
 				Msg("TorBox negative cache hit; rejecting locally without wire call")
-			return nil, fmt.Errorf("DOWNLOAD_NOT_CACHED")
+			return nil, notCachedVerdict{}
 		}
 
 		var availability AvailableResponse
-		check, err := tb.doGet("/api/torrents/checkcached", map[string]string{"hash": hash}, &availability)
+		check, err := tb.doGetWithClient(ctx, tb.submissionClient(), "/api/torrents/checkcached", map[string]string{"hash": hash}, &availability)
 		if err != nil {
 			return nil, fmt.Errorf("TorBox cache check failed: %w", err)
 		}
@@ -583,18 +589,21 @@ func (tb *Torbox) executeSubmission(torrent *types.Torrent, hash string) (*types
 		}
 		if !cached {
 			tb.getNegativeCache().Put(hash, "DOWNLOAD_NOT_CACHED", 0)
-			return nil, fmt.Errorf("DOWNLOAD_NOT_CACHED")
+			return nil, notCachedVerdict{}
 		}
 		tb.getNegativeCache().Evict(hash)
 		formData["add_only_if_cached"] = "true"
 	}
 
-	resp, err := tb.doPostFormWithClient(tb.submissionClient(), "/api/torrents/createtorrent", formData, &data)
+	resp, err := tb.doPostFormWithClient(ctx, tb.submissionClient(), "/api/torrents/createtorrent", formData, &data)
 	if err != nil {
 		return nil, err
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, torboxAPIError(resp, data.Error, data.Detail)
+	}
+	if !data.Success {
 		return nil, torboxAPIError(resp, data.Error, data.Detail)
 	}
 	// Select the created torrent. Fork safety, kept over upstream's
@@ -851,7 +860,6 @@ func (tb *Torbox) updateTorrentWithClient(client *request.Client, t *types.Torre
 
 	for _, f := range data.Files {
 		fileName := filepath.Base(f.Name)
-
 		pathToCheck := f.AbsolutePath
 		if pathToCheck == "" {
 			pathToCheck = f.Name
