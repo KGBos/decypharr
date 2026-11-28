@@ -531,9 +531,6 @@ func (tb *Torbox) executeCheckCached(ctx context.Context, hashes []string) (map[
 		if !res.Success {
 			return result, tb.requestdlFailureResponse(resp.StatusCode, res.Error)
 		}
-		if res.Data == nil {
-			return result, fmt.Errorf("check availability: missing cache data")
-		}
 		cached := make(map[string]bool)
 		if res.Data != nil {
 			for h, item := range *res.Data {
@@ -582,9 +579,6 @@ func (tb *Torbox) executeSubmission(ctx context.Context, torrent *types.Torrent,
 			return nil, fmt.Errorf("TorBox cache check failed: Status: %d", check.StatusCode)
 		}
 		cached := false
-		if availability.Data == nil {
-			return nil, fmt.Errorf("TorBox cache check returned no data")
-		}
 		if availability.Data != nil {
 			for candidate, item := range *availability.Data {
 				if strings.EqualFold(candidate, hash) && item.Size > 0 {
@@ -915,7 +909,7 @@ func (tb *Torbox) CheckStatus(torrent *types.Torrent) (*types.Torrent, error) {
 			return torrent, nil
 		case types.TorrentStatusDownloading:
 			if !torrent.DownloadUncached {
-				return torrent, fmt.Errorf("torrent: %s not cached", torrent.Name)
+				return torrent, fmt.Errorf("torrent %s: %w", torrent.Name, customerror.TorrentNotCachedError)
 			}
 			return torrent, nil
 		default:

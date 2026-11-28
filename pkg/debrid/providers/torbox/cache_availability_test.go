@@ -30,7 +30,6 @@ func TestFailedAvailabilityNeverCachesMissOrFallsBack(t *testing.T) {
 		}{
 			{"http failure", 502, `{"success":false,"error":"DOWNLOAD_NOT_CACHED","data":null}`},
 			{"provider failure", 200, `{"success":false,"error":"DOWNLOAD_NOT_CACHED","data":{}}`},
-			{"missing data", 200, `{"success":true,"data":null}`},
 			{"invalid response", 200, `not json`},
 		} {
 			t.Run(fmt.Sprintf("mediated=%t/%s", mediated, tc.name), func(t *testing.T) {
@@ -69,10 +68,40 @@ func TestFailedAvailabilityNeverCachesMissOrFallsBack(t *testing.T) {
 	}
 }
 
+// TorBox answers a real all-miss check with data:null. Treating that shape as a
+// provider failure regressed the master behavior and suppressed the negative
+// cache entry that makes the next attempt free.
+func TestNullAvailabilityIsDefinitiveMiss(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+	t.Cleanup(config.Reset)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		fmt.Fprint(w, `{"success":true,"data":null}`)
+	}))
+	defer server.Close()
+	tb := testTorbox(server.URL)
+	for range 2 {
+		result, err := tb.IsAvailable([]string{"AbC"})
+		if err != nil {
+			t.Fatalf("null data must be a miss, got %v", err)
+		}
+		if result["AbC"] {
+			t.Fatal("null data reported cached")
+		}
+	}
+	if _, ok := tb.getNegativeCache().Get("abc"); !ok {
+		t.Fatal("null miss did not populate the negative cache")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("wire calls=%d; want one after the negative cache entry", got)
+	}
+}
+
 func TestFailedSubmissionPreflightNeverCachesMiss(t *testing.T) {
 	config.SetConfigPath(t.TempDir())
 	t.Cleanup(config.Reset)
-	for _, body := range []string{`{"success":false,"error":"DOWNLOAD_NOT_CACHED","data":null}`, `{"success":true,"data":null}`} {
+	for _, body := range []string{`{"success":false,"error":"DOWNLOAD_NOT_CACHED","data":null}`} {
 		t.Run(body, func(t *testing.T) {
 			var checks, creates atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
